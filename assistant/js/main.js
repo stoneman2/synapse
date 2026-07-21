@@ -7436,30 +7436,46 @@ async function syncFetchGistState(cfg, conditional = false) {
   };
 }
 
-async function fetchGistRawText(url, token = '') {
-  const headers = token ? { Authorization: 'Bearer ' + token } : {};
-  const response = await fetch(url, { cache: 'no-store', headers });
+async function fetchGistRawText(url) {
+  const response = await fetch(url, { cache: 'no-store' });
   if (!response.ok) throw new Error(syncFormatGistError(response, await response.text()));
   return response.text();
 }
 
-async function syncGetGistFileContent(gist, filename, token = '') {
+async function syncGetGistFileContent(gist, filename) {
   const file = gist?.files?.[filename];
   if (!file) throw new Error('Missing Gist file: ' + filename);
   if (!file.truncated && typeof file.content === 'string') return file.content;
-  if (file.raw_url) return fetchGistRawText(file.raw_url, token);
+  if (file.raw_url) return fetchGistRawText(file.raw_url);
   throw new Error('Gist file is truncated and has no raw URL: ' + filename);
 }
 
-async function syncReadManifest(gist, token) {
+async function syncReadManifest(gist) {
+  let content;
+  try {
+    content = await syncGetGistFileContent(gist, 'manifest.json');
+  } catch (error) {
+    const manifestError = new Error('Could not read the Synapse sync manifest: ' + error.message + ' The Gist was not changed.');
+    manifestError.name = 'SyncManifestError';
+    throw manifestError;
+  }
   let manifest;
   try {
-    manifest = JSON.parse(await syncGetGistFileContent(gist, 'manifest.json', token));
+    manifest = JSON.parse(content);
   } catch (error) {
-    throw new Error('This Gist is not an encrypted Synapse sync snapshot. It was not changed.');
+    const manifestError = new Error('The Synapse sync manifest contains invalid JSON. The Gist was not changed.');
+    manifestError.name = 'SyncManifestError';
+    throw manifestError;
   }
-  if (!manifest || manifest.app !== 'Synapse' || !['gist-sync-v1', 'gist-sync-v2'].includes(manifest.schema)) {
-    throw new Error('This Gist is not an encrypted Synapse sync snapshot. It was not changed.');
+  if (!manifest || manifest.app !== 'Synapse') {
+    const manifestError = new Error('The Gist manifest does not identify a Synapse sync snapshot. The Gist was not changed.');
+    manifestError.name = 'SyncManifestError';
+    throw manifestError;
+  }
+  if (!['gist-sync-v1', 'gist-sync-v2'].includes(manifest.schema)) {
+    const manifestError = new Error('Unsupported Synapse sync schema: ' + (manifest.schema || 'missing') + '. The Gist was not changed.');
+    manifestError.name = 'SyncManifestError';
+    throw manifestError;
   }
   return manifest;
 }
@@ -7510,7 +7526,7 @@ async function syncReadRemoteSnapshot(gist, manifest, cfg) {
   let remoteMemories = [];
   const memoriesFile = manifest.files?.memories || 'memories.json.enc';
   if (gist.files?.[memoriesFile]) {
-    const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, memoriesFile, cfg.token), cfg.passphrase, keyCache);
+    const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, memoriesFile), cfg.passphrase, keyCache);
     remoteMemories = payload?.memories || [];
   }
 
@@ -7518,7 +7534,7 @@ async function syncReadRemoteSnapshot(gist, manifest, cfg) {
   const entries = Array.isArray(manifest.files?.conversations) ? manifest.files.conversations : [];
   for (const entry of entries) {
     if (!entry?.file) continue;
-    const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, entry.file, cfg.token), cfg.passphrase, keyCache);
+    const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, entry.file), cfg.passphrase, keyCache);
     if (payload?.conversation) remoteConversations.push(payload.conversation);
   }
   return syncNormalizeSnapshot({ conversations: remoteConversations, memories: remoteMemories });
@@ -7993,7 +8009,7 @@ async function syncPerformSync(manual = false) {
       let remoteSnapshot = { version: 2, conversations: [], memories: [] };
       if (cfg.gistId) {
         latest = await syncFetchGistState(cfg, false);
-        manifest = await syncReadManifest(latest.gist, cfg.token);
+        manifest = await syncReadManifest(latest.gist);
         remoteSnapshot = await syncReadRemoteSnapshot(latest.gist, manifest, cfg);
       }
 
@@ -8040,7 +8056,7 @@ async function syncPerformSync(manual = false) {
       }
 
       const verifiedState = await syncFetchGistState(cfg, false);
-      const verifiedManifest = await syncReadManifest(verifiedState.gist, cfg.token);
+      const verifiedManifest = await syncReadManifest(verifiedState.gist);
       const verifiedSnapshot = await syncReadRemoteSnapshot(verifiedState.gist, verifiedManifest, cfg);
       if (!syncSnapshotContains(verifiedSnapshot, localBefore)) throw new Error('Another device changed the Gist during verification.');
 
@@ -8103,6 +8119,7 @@ async function syncPerformSync(manual = false) {
         ? 'Could not decrypt sync data. Check the passphrase.'
         : (error.message || 'Sync failed.');
       const nonRetryable = error.name === 'OperationError'
+        || error.name === 'SyncManifestError'
         || /not an encrypted Synapse|GitHub token|Gist not found|Unsupported sync encryption/i.test(message);
       if (nonRetryable || attempt === SYNC_MAX_WRITE_RETRIES) break;
       syncSetStatus('checking', 'Syncing', 'Remote changed during sync, retrying safely.');
@@ -8154,7 +8171,7 @@ async function syncCheckRemote() {
     }
     syncSetStatus('dirty', 'Remote changes available', 'Merging encrypted changes from another device.');
     if (streaming) return;
-    const manifest = await syncReadManifest(remoteState.gist, cfg.token);
+    const manifest = await syncReadManifest(remoteState.gist);
     const remoteSnapshot = await syncReadRemoteSnapshot(remoteState.gist, manifest, cfg);
     const localSnapshot = await syncGetLocalSnapshot();
     const generationAtMerge = syncLocalGeneration;
@@ -8185,7 +8202,7 @@ async function syncCheckRemote() {
   }).catch(error => {
     console.warn('Remote sync check failed:', error);
     const message = error.name === 'OperationError' ? 'Could not decrypt sync data. Check the passphrase.' : (error.message || 'Remote check failed.');
-    if (error.name === 'OperationError' || /not an encrypted Synapse|GitHub token|Gist not found/i.test(message)) {
+    if (error.name === 'OperationError' || error.name === 'SyncManifestError' || /not an encrypted Synapse|GitHub token|Gist not found/i.test(message)) {
       syncState.paused = true;
       syncState.pauseReason = message + ' Your local data was not changed.';
       syncPersistState();
