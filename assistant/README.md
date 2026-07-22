@@ -52,6 +52,7 @@ Use it from GitHub Pages, run it from a local server, or download the standalone
 - Built-in themes, custom color picker, and light/dark/system toggle.
 - Custom font, message width, font size, and border radius settings.
 - Syntax highlighting, LaTeX, Mermaid diagrams, tables, code blocks, spoilers, and generated image display.
+- Optional local emotion sprites for Claude, GPT, and Gemini output tags, with automatic or manual sprite-set selection.
 - Mobile layout with touch-friendly controls.
 
 ## Keyboard Shortcuts
@@ -155,6 +156,8 @@ assistant/
   synapse.html        Standalone build with CSS and JS inlined
   version.json        Build metadata for local update checks
   favicon.ico
+  assets/
+    emotion-sprites/  CC0 emotion sprite images from N8python/claudesona
   js/
     main.js           App logic
     lib/
@@ -174,3 +177,5 @@ Synapse targets current Chrome, Firefox, Safari, and Edge. Some features depend 
 ## Credit
 
 Made by [purachina](https://platberlitz.github.io/).
+
+Emotion sprites are from [N8python/claudesona](https://github.com/N8python/claudesona) under CC0 1.0 Universal.
