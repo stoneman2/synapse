@@ -1,0 +1,3 @@
+Source: https://github.com/N8python/claudesona
+License: CC0 1.0 Universal
+Upstream version at integration: 1.1.1
