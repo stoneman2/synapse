@@ -1865,7 +1865,7 @@ async function handleManualSearch(query, conv) {
 
   if (conv) conv.updatedAt = Date.now();
   saveConversations();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -1884,7 +1884,7 @@ async function handleFileSearch(query, conv) {
   saveConversations();
   if (conv) conv.updatedAt = Date.now();
   saveConversations();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -2244,10 +2244,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   const msgsArea = document.getElementById('messagesArea');
   const scrollFab = document.getElementById('scrollFab');
   msgsArea.addEventListener('scroll', () => {
-    const atBottom = msgsArea.scrollHeight - msgsArea.scrollTop - msgsArea.clientHeight < 100;
-    scrollFab.classList.toggle('visible', !atBottom);
+    const distanceFromBottom = msgsArea.scrollHeight - msgsArea.scrollTop - msgsArea.clientHeight;
+    scrollFab.classList.toggle('visible', distanceFromBottom >= 100);
     if (streaming && !_suppressScrollFlag) {
-      userScrolledAway = !atBottom;
+      userScrolledAway = distanceFromBottom > 4;
     }
   });
 
@@ -2984,7 +2984,7 @@ function idbPutAll(store, items) {
 }
 
 function isResponseCacheEnabled() {
-  return localStorage.getItem('llmCacheEnabled') !== 'false';
+  return localStorage.getItem('llmCacheEnabled') === 'true';
 }
 
 function normalizeForCache(value) {
@@ -3015,12 +3015,12 @@ function fallbackHash(text) {
   return 'fallback_' + (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0');
 }
 
-async function generateCacheKey(userMessage, model, systemMessages) {
+async function generateCacheKey(apiMessages, model, requestOptions = {}) {
   const payload = stableCacheJson({
-    version: 1,
+    version: 2,
     model: model || '',
-    userMessage,
-    systemMessages: systemMessages || []
+    apiMessages: apiMessages || [],
+    requestOptions
   });
   if (!window.crypto?.subtle) return fallbackHash(payload);
   const digest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
@@ -4380,7 +4380,6 @@ function renderPromptEntries() {
     const div = document.createElement('div');
     div.className = 'prompt-entry' + (entry.enabled ? '' : ' disabled');
     div.dataset.peId = entry.id;
-    div.draggable = true;
 
     // Drag-and-drop
     div.addEventListener('dragstart', (e) => {
@@ -4412,6 +4411,7 @@ function renderPromptEntries() {
     const drag = document.createElement('span');
     drag.className = 'drag-handle';
     drag.textContent = '☰';
+    drag.draggable = true;
 
     const toggle = document.createElement('input');
     toggle.type = 'checkbox';
@@ -4580,9 +4580,11 @@ function maybeAddAvatar(wrapper) {
   }
 }
 
-function renderMessages() {
+function renderMessages({ preserveScroll = false } = {}) {
   closeChatSearch();
   const area = document.getElementById('messagesArea');
+  const wasAtBottom = area.scrollHeight - area.scrollTop - area.clientHeight <= 4;
+  const savedScrollTop = preserveScroll && !wasAtBottom ? area.scrollTop : null;
   area.innerHTML = '';
 
   if (messages.length === 0) {
@@ -4809,7 +4811,7 @@ function renderMessages() {
     area.appendChild(wrapper);
   });
 
-  area.scrollTop = area.scrollHeight;
+  area.scrollTop = savedScrollTop === null ? area.scrollHeight : savedScrollTop;
   updateSendBtnState();
 
   // Restore select mode state if active
@@ -4901,7 +4903,7 @@ function renderEditMode(area, msg, idx) {
     const newBranch = JSON.parse(JSON.stringify(messages.slice(idx)));
     msg.branches[msg.branchIndex] = newBranch;
     saveConversations();
-    renderMessages();
+    renderMessages({ preserveScroll: true });
   };
 
   editActions.appendChild(cancelBtn);
@@ -4943,7 +4945,7 @@ async function resendAfterEdit() {
   }
   if (conv) conv.updatedAt = Date.now();
   saveConversations();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -5508,7 +5510,7 @@ function formatUrlFetchResultForModel(content, error, url) {
 // ============================================
 // Streaming
 // ============================================
-async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, overrideModel, prefixText) {
+async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, overrideModel, prefixText, options = {}) {
   const baseUrl = (localStorage.getItem('llmProxyUrl') || '').replace(/\/+$/, '');
   const apiKey = localStorage.getItem('llmApiKey');
   const model = overrideModel || localStorage.getItem('llmModel') || 'gpt-4o';
@@ -5523,13 +5525,22 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
   let responseCacheKey = '';
   let responseCacheUserMessage = null;
   let responseCacheSystemMessages = [];
-  if (isResponseCacheEnabled() && !prefixText) {
+  if (isResponseCacheEnabled() && !prefixText && !options.bypassCache) {
     try {
       const cacheParts = getResponseCacheRequestParts(apiMessages);
       responseCacheUserMessage = cacheParts.userMessage;
       responseCacheSystemMessages = cacheParts.systemMessages;
       if (responseCacheUserMessage) {
-        responseCacheKey = await generateCacheKey(responseCacheUserMessage, model, responseCacheSystemMessages);
+        responseCacheKey = await generateCacheKey(apiMessages, model, {
+          baseUrl,
+          format,
+          extra,
+          exclude,
+          temperature: localStorage.getItem('llmTemperature') || '',
+          prefill: localStorage.getItem('llmPrefill') || '',
+          webSearch: localStorage.getItem('llmWebSearch') || '',
+          forceSearch: localStorage.getItem('llmForceSearch') || ''
+        });
         const cached = await cacheLookup(responseCacheKey);
         if (cached) {
           restoreCachedResponse(cached, assistantMsg, swipeIdx, bubbleEl);
@@ -6926,7 +6937,7 @@ async function sendMessage() {
   }
   if (conv) conv.updatedAt = Date.now();
   saveConversations();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -6961,12 +6972,12 @@ async function regenerate() {
     if (messages[i].role !== 'system') apiMessages.push({ role: messages[i].role, content: buildApiContent(messages[i]) });
   }
 
-  await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, null);
+  await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, null, { bypassCache: true });
   if (msg._responseCacheHit) delete msg._responseCacheHit;
 
   if (conv) conv.updatedAt = Date.now();
   saveConversations();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -7003,7 +7014,7 @@ async function continueMessage() {
 
   if (conv) conv.updatedAt = Date.now();
   saveConversations();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -7872,6 +7883,7 @@ function syncRestoreLocalOnlyData(snapshot) {
 }
 
 async function syncApplySnapshot(snapshot) {
+  const previousActiveConvId = activeConvId;
   const normalized = syncRestoreLocalOnlyData(syncNormalizeSnapshot(snapshot));
   syncApplyingRemote = true;
   let createdFallback = false;
@@ -7912,7 +7924,7 @@ async function syncApplySnapshot(snapshot) {
     localStorage.setItem('assistantMemories', JSON.stringify(memoryRecords));
   }
   renderSidebar();
-  renderMessages();
+  renderMessages({ preserveScroll: activeConvId === previousActiveConvId });
   updateTokenInfo();
   updateCharacterUI();
   syncRenderReviewStatus();
