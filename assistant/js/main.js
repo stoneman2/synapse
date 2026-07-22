@@ -971,7 +971,7 @@ function syncGenerateRecordId(prefix) {
 }
 
 function syncLegacyRecordId(prefix, seed) {
-  return prefix + '_' + fallbackHash(stableCacheJson(seed)).replace(/^fallback_/, '');
+  return prefix + '_' + fallbackHash(stableJson(seed)).replace(/^fallback_/, '');
 }
 
 function syncRecordTimestamp(record) {
@@ -1006,7 +1006,7 @@ function syncStripLocalOnlyData(value) {
   }
   const out = {};
   Object.entries(value).forEach(([key, childValue]) => {
-    if (['docs', 'characterAvatar', 'images', 'swipeImages', '_editing', '_responseCacheHit'].includes(key)) return;
+    if (['docs', 'characterAvatar', 'images', 'swipeImages', '_editing'].includes(key)) return;
     const cleaned = syncStripLocalOnlyData(childValue);
     if (cleaned !== undefined) out[key] = cleaned;
   });
@@ -1061,7 +1061,7 @@ function syncComparableRecord(record, kind) {
 }
 
 function syncRecordHash(record, kind) {
-  return fallbackHash(stableCacheJson(syncComparableRecord(record, kind)));
+  return fallbackHash(stableJson(syncComparableRecord(record, kind)));
 }
 
 function syncNormalizeMessageRecord(raw, conversation, index, seed = '') {
@@ -2085,12 +2085,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     console.warn('IndexedDB unavailable, using localStorage fallback:', error);
   }
   await syncLoadState();
-  try {
-    const deleted = await cacheCleanupExpired();
-    if (deleted > 0) console.log('Cleaned up ' + deleted + ' expired cache entries');
-  } catch (e) {
-    console.warn('Cache cleanup failed:', e);
-  }
   migrateToPromptEntries();
   await loadConversations();
   await loadMemories();
@@ -2897,8 +2891,6 @@ function updateTokenInfo() {
 // ============================================
 const DB_NAME = 'assistantDB';
 const DB_VERSION = 2;
-const RESPONSE_CACHE_STORE = 'responseCache';
-const RESPONSE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 let db = null;
 
 function openDB() {
@@ -2910,13 +2902,6 @@ function openDB() {
       if (!d.objectStoreNames.contains('conversations')) d.createObjectStore('conversations', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('memories')) d.createObjectStore('memories', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('meta')) d.createObjectStore('meta', { keyPath: 'key' });
-      if (oldVersion < 2 || !d.objectStoreNames.contains(RESPONSE_CACHE_STORE)) {
-        const cacheObjectStore = d.objectStoreNames.contains(RESPONSE_CACHE_STORE)
-          ? e.target.transaction.objectStore(RESPONSE_CACHE_STORE)
-          : d.createObjectStore(RESPONSE_CACHE_STORE, { keyPath: 'cacheKey' });
-        if (!cacheObjectStore.indexNames.contains('cachedAt')) cacheObjectStore.createIndex('cachedAt', 'cachedAt', { unique: false });
-        if (!cacheObjectStore.indexNames.contains('model')) cacheObjectStore.createIndex('model', 'model', { unique: false });
-      }
     };
     req.onsuccess = (e) => { db = e.target.result; resolve(db); };
     req.onerror = (e) => reject(e.target.error);
@@ -2983,23 +2968,19 @@ function idbPutAll(store, items) {
   });
 }
 
-function isResponseCacheEnabled() {
-  return localStorage.getItem('llmCacheEnabled') === 'true';
-}
-
-function normalizeForCache(value) {
+function normalizeStableValue(value) {
   if (value === undefined || typeof value === 'function' || typeof value === 'symbol') return null;
   if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map(normalizeForCache);
+  if (Array.isArray(value)) return value.map(normalizeStableValue);
   const out = {};
   Object.keys(value).sort().forEach(key => {
-    out[key] = normalizeForCache(value[key]);
+    out[key] = normalizeStableValue(value[key]);
   });
   return out;
 }
 
-function stableCacheJson(value) {
-  return JSON.stringify(normalizeForCache(value));
+function stableJson(value) {
+  return JSON.stringify(normalizeStableValue(value));
 }
 
 function fallbackHash(text) {
@@ -3015,86 +2996,7 @@ function fallbackHash(text) {
   return 'fallback_' + (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0');
 }
 
-async function generateCacheKey(apiMessages, model, requestOptions = {}) {
-  const payload = stableCacheJson({
-    version: 2,
-    model: model || '',
-    apiMessages: apiMessages || [],
-    requestOptions
-  });
-  if (!window.crypto?.subtle) return fallbackHash(payload);
-  const digest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
-  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-function getResponseCacheRequestParts(apiMessages) {
-  const systemMessages = [];
-  let userMessage = null;
-  (apiMessages || []).forEach(message => {
-    if (!message || !message.role) return;
-    if (message.role === 'system') {
-      systemMessages.push({ role: 'system', content: message.content || '' });
-    } else if (message.role === 'user') {
-      userMessage = { role: 'user', content: normalizeForCache(message.content) };
-    }
-  });
-  return { userMessage, systemMessages };
-}
-
-async function cacheLookup(cacheKey) {
-  if (!db || !cacheKey) return null;
-  const entry = await idbGet(RESPONSE_CACHE_STORE, cacheKey);
-  if (!entry) return null;
-  const now = Date.now();
-  if (entry.expiresAt && entry.expiresAt <= now) {
-    await cacheDelete(cacheKey);
-    return null;
-  }
-  entry.hitCount = (entry.hitCount || 0) + 1;
-  entry.lastHitAt = now;
-  try { await idbPut(RESPONSE_CACHE_STORE, entry); } catch(e) { console.warn('Cache hit update failed:', e); }
-  return entry;
-}
-
-async function cacheStore(entry) {
-  if (!db || !entry?.cacheKey) return;
-  const existing = await idbGet(RESPONSE_CACHE_STORE, entry.cacheKey).catch(() => null);
-  const now = Date.now();
-  const normalized = {
-    ...entry,
-    cachedAt: entry.cachedAt || now,
-    expiresAt: entry.expiresAt || (now + RESPONSE_CACHE_TTL_MS),
-    hitCount: existing?.hitCount || 0,
-    lastHitAt: existing?.lastHitAt || null
-  };
-  await idbPut(RESPONSE_CACHE_STORE, normalized);
-}
-
-async function cacheDelete(cacheKey) {
-  if (!db || !cacheKey) return;
-  await idbDelete(RESPONSE_CACHE_STORE, cacheKey);
-}
-
-async function cacheClear() {
-  if (!db) return;
-  await idbClear(RESPONSE_CACHE_STORE);
-}
-
-async function cacheCleanupExpired() {
-  if (!db) return 0;
-  const now = Date.now();
-  const entries = await idbGetAll(RESPONSE_CACHE_STORE);
-  let deleted = 0;
-  for (const entry of entries) {
-    if (entry.expiresAt && entry.expiresAt <= now) {
-      await idbDelete(RESPONSE_CACHE_STORE, entry.cacheKey);
-      deleted++;
-    }
-  }
-  return deleted;
-}
-
-function formatCacheBytes(bytes) {
+function formatBytes(bytes) {
   if (!bytes) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB'];
   let value = bytes;
@@ -3104,76 +3006,6 @@ function formatCacheBytes(bytes) {
     unit++;
   }
   return (unit === 0 ? value : value.toFixed(value >= 10 ? 1 : 2)) + ' ' + units[unit];
-}
-
-async function cacheGetStats() {
-  if (!db) return { count: 0, sizeBytes: 0, hits: 0, expired: 0 };
-  const entries = await idbGetAll(RESPONSE_CACHE_STORE);
-  const now = Date.now();
-  return entries.reduce((stats, entry) => {
-    stats.count++;
-    stats.sizeBytes += stableCacheJson(entry).length * 2;
-    stats.hits += entry.hitCount || 0;
-    if (entry.expiresAt && entry.expiresAt <= now) stats.expired++;
-    return stats;
-  }, { count: 0, sizeBytes: 0, hits: 0, expired: 0 });
-}
-
-function buildResponseCacheEntry(cacheKey, userMessage, systemMessages, model, format, fullText, thinkingText, toolBlocks, assistantMsg, swipeIdx) {
-  const now = Date.now();
-  const images = assistantMsg.swipeImages?.[swipeIdx] || assistantMsg.images || [];
-  return {
-    cacheKey,
-    cachedAt: now,
-    expiresAt: now + RESPONSE_CACHE_TTL_MS,
-    model,
-    format,
-    userMessage,
-    systemMessages,
-    response: {
-      content: fullText || '',
-      thinking: thinkingText || '',
-      toolUse: normalizeForCache(toolBlocks || []),
-      images: normalizeForCache(images || []),
-      metadata: { model, format, timestamp: now }
-    },
-    hitCount: 0
-  };
-}
-
-function restoreCachedResponse(entry, assistantMsg, swipeIdx, bubbleEl) {
-  const response = entry?.response || {};
-  const content = response.content || '';
-  const thinking = response.thinking || '';
-  const toolUse = Array.isArray(response.toolUse) ? response.toolUse : [];
-  const images = Array.isArray(response.images) ? response.images : [];
-  assistantMsg._responseCacheHit = true;
-  assistantMsg.swipes = assistantMsg.swipes || [];
-  assistantMsg.swipes[swipeIdx] = content;
-  assistantMsg.content = content;
-  if (thinking) {
-    assistantMsg.swipeThinking = assistantMsg.swipeThinking || [];
-    assistantMsg.swipeThinking[swipeIdx] = thinking;
-  }
-  if (toolUse.length > 0) {
-    assistantMsg.swipeToolUse = assistantMsg.swipeToolUse || [];
-    assistantMsg.swipeToolUse[swipeIdx] = toolUse;
-  }
-  if (images.length > 0) {
-    assistantMsg.swipeImages = assistantMsg.swipeImages || [];
-    assistantMsg.swipeImages[swipeIdx] = images;
-    assistantMsg.images = images;
-  }
-  bubbleEl.innerHTML = renderThinkingHTML(thinking) + renderToolBlocksHTML(toolUse) + renderMarkdown(content) + renderGenImages(images);
-  postRenderProcessing(bubbleEl);
-  const msgsArea = document.getElementById('messagesArea');
-  if (msgsArea) msgsArea.scrollTop = msgsArea.scrollHeight;
-  updateMessageTokenMetadata(assistantMsg, swipeIdx);
-  debugLog('Response cache hit', {
-    model: entry.model,
-    hits: entry.hitCount || 0,
-    cachedAt: entry.cachedAt ? new Date(entry.cachedAt).toISOString() : ''
-  });
 }
 
 // ============================================
@@ -3306,7 +3138,7 @@ async function loadConversations() {
   try {
     const storedConversations = await idbGetAll('conversations');
     if (storedConversations.length > 0) {
-      const before = stableCacheJson(storedConversations);
+      const before = stableJson(storedConversations);
       storedConversations.forEach((conversation, index) => syncNormalizeConversationRecord(conversation, index));
       conversations = storedConversations.filter(conversation => !conversation.deletedAt);
       conversationTombstones = storedConversations.filter(conversation => conversation.deletedAt);
@@ -3338,7 +3170,7 @@ async function loadConversations() {
       updateTokenInfo();
       updateCharacterUI();
       syncCaptureObservedConversations();
-      if (before !== stableCacheJson([...conversations, ...conversationTombstones])) {
+      if (before !== stableJson([...conversations, ...conversationTombstones])) {
         await idbPutAll('conversations', [...conversations, ...conversationTombstones]);
         syncMarkDirty('conversation migration');
       }
@@ -3756,55 +3588,6 @@ function switchSettingsTab(tabName, btn) {
   }
 }
 
-function toggleCache(enabled) {
-  localStorage.setItem('llmCacheEnabled', enabled ? 'true' : 'false');
-  updateCacheStats();
-  showToast(enabled ? 'Response cache enabled.' : 'Response cache disabled.', 'info');
-}
-
-async function clearResponseCache() {
-  if (!confirm('Clear all cached responses?')) return;
-  try {
-    await cacheClear();
-    await updateCacheStats();
-    showToast('Response cache cleared.', 'success');
-  } catch (err) {
-    showToast('Could not clear cache: ' + (err.message || err), 'error');
-  }
-}
-
-async function cleanupExpiredCache() {
-  try {
-    const deleted = await cacheCleanupExpired();
-    await updateCacheStats();
-    showToast(deleted ? ('Removed ' + deleted + ' expired cache ' + (deleted === 1 ? 'entry.' : 'entries.')) : 'No expired cache entries.', 'info');
-  } catch (err) {
-    showToast('Cache cleanup failed: ' + (err.message || err), 'error');
-  }
-}
-
-async function updateCacheStats() {
-  const el = document.getElementById('cacheStats');
-  if (!el) return;
-  if (!db) {
-    el.textContent = 'Unavailable';
-    return;
-  }
-  el.textContent = 'Loading...';
-  try {
-    const stats = await cacheGetStats();
-    const parts = [
-      stats.count + ' ' + (stats.count === 1 ? 'entry' : 'entries'),
-      formatCacheBytes(stats.sizeBytes),
-      stats.hits + ' ' + (stats.hits === 1 ? 'hit' : 'hits')
-    ];
-    if (stats.expired) parts.push(stats.expired + ' expired');
-    el.textContent = parts.join(' | ');
-  } catch (err) {
-    el.textContent = 'Could not load';
-  }
-}
-
 function openSettings() {
   document.getElementById('setProxy').value = localStorage.getItem('llmProxyUrl') || '';
   document.getElementById('setKey').value = localStorage.getItem('llmApiKey') || '';
@@ -3848,9 +3631,6 @@ function openSettings() {
   if (debugIncludeText) debugIncludeText.checked = isDebugTextIncluded();
   renderDebugLogPreview();
   renderLocalUpdateStatus();
-  const cacheEnabled = document.getElementById('cacheEnabled');
-  if (cacheEnabled) cacheEnabled.checked = isResponseCacheEnabled();
-  updateCacheStats();
   renderSyncSettings();
 
   // Presets
@@ -4938,11 +4718,7 @@ async function resendAfterEdit() {
 
   await streamResponse(apiMessages, assistantMsg, 0, bubble, null, null);
 
-  if (assistantMsg._responseCacheHit) {
-    delete assistantMsg._responseCacheHit;
-  } else {
-    extractMemories(apiMessages);
-  }
+  extractMemories(apiMessages);
   if (conv) conv.updatedAt = Date.now();
   saveConversations();
   renderMessages({ preserveScroll: true });
@@ -5510,7 +5286,7 @@ function formatUrlFetchResultForModel(content, error, url) {
 // ============================================
 // Streaming
 // ============================================
-async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, overrideModel, prefixText, options = {}) {
+async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, overrideModel, prefixText) {
   const baseUrl = (localStorage.getItem('llmProxyUrl') || '').replace(/\/+$/, '');
   const apiKey = localStorage.getItem('llmApiKey');
   const model = overrideModel || localStorage.getItem('llmModel') || 'gpt-4o';
@@ -5521,38 +5297,6 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
   let extra = {};
   try { extra = JSON.parse(localStorage.getItem('llmExtraParams') || '{}'); } catch(e) { console.warn('Extra params parse error:', e); }
   const exclude = (localStorage.getItem('llmExcludeParams') || '').split(',').map(s => s.trim()).filter(Boolean);
-
-  let responseCacheKey = '';
-  let responseCacheUserMessage = null;
-  let responseCacheSystemMessages = [];
-  if (isResponseCacheEnabled() && !prefixText && !options.bypassCache) {
-    try {
-      const cacheParts = getResponseCacheRequestParts(apiMessages);
-      responseCacheUserMessage = cacheParts.userMessage;
-      responseCacheSystemMessages = cacheParts.systemMessages;
-      if (responseCacheUserMessage) {
-        responseCacheKey = await generateCacheKey(apiMessages, model, {
-          baseUrl,
-          format,
-          extra,
-          exclude,
-          temperature: localStorage.getItem('llmTemperature') || '',
-          prefill: localStorage.getItem('llmPrefill') || '',
-          webSearch: localStorage.getItem('llmWebSearch') || '',
-          forceSearch: localStorage.getItem('llmForceSearch') || ''
-        });
-        const cached = await cacheLookup(responseCacheKey);
-        if (cached) {
-          restoreCachedResponse(cached, assistantMsg, swipeIdx, bubbleEl);
-          showToast('Loaded cached response.', 'success');
-          return;
-        }
-      }
-    } catch (cacheErr) {
-      console.warn('Response cache lookup failed:', cacheErr);
-      responseCacheKey = '';
-    }
-  }
 
   abortController = new AbortController();
   streaming = true;
@@ -6735,25 +6479,6 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       }
       _suppressScrollFlag = false;
     }
-    if (responseCacheKey && fullText && !abortController?.signal?.aborted) {
-      try {
-        await cacheStore(buildResponseCacheEntry(
-          responseCacheKey,
-          responseCacheUserMessage,
-          responseCacheSystemMessages,
-          model,
-          format,
-          fullText,
-          thinkingText,
-          toolBlocks,
-          assistantMsg,
-          swipeIdx
-        ));
-        debugLog('Response cached', { model, format, cacheKey: responseCacheKey });
-      } catch (cacheErr) {
-        console.warn('Response cache storage failed:', cacheErr);
-      }
-    }
   } catch (e) {
     if (e.name === 'AbortError') {
       if (!fullText) fullText = '(stopped)';
@@ -6930,11 +6655,7 @@ async function sendMessage() {
 
   await streamResponse(apiMessages, assistantMsg, 0, bubble, overrideModel, null);
 
-  if (assistantMsg._responseCacheHit) {
-    delete assistantMsg._responseCacheHit;
-  } else {
-    extractMemories(apiMessages);
-  }
+  extractMemories(apiMessages);
   if (conv) conv.updatedAt = Date.now();
   saveConversations();
   renderMessages({ preserveScroll: true });
@@ -6972,8 +6693,7 @@ async function regenerate() {
     if (messages[i].role !== 'system') apiMessages.push({ role: messages[i].role, content: buildApiContent(messages[i]) });
   }
 
-  await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, null, { bypassCache: true });
-  if (msg._responseCacheHit) delete msg._responseCacheHit;
+  await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, null);
 
   if (conv) conv.updatedAt = Date.now();
   saveConversations();
@@ -7010,7 +6730,6 @@ async function continueMessage() {
   const bubble = lastWrapper.querySelector('.msg-bubble');
 
   await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, existingText);
-  if (msg._responseCacheHit) delete msg._responseCacheHit;
 
   if (conv) conv.updatedAt = Date.now();
   saveConversations();
@@ -7243,7 +6962,7 @@ function syncRenderReviewStatus() {
 
 function syncSizeWarningText() {
   return syncState.lastSizeBytes >= SYNC_SIZE_WARNING_BYTES
-    ? ' Encrypted sync data is ' + formatCacheBytes(syncState.lastSizeBytes) + ', approaching the practical Gist limit.'
+    ? ' Encrypted sync data is ' + formatBytes(syncState.lastSizeBytes) + ', approaching the practical Gist limit.'
     : '';
 }
 
@@ -7560,7 +7279,7 @@ function syncBaseRecordHash(record, kind) {
   delete comparable.conflictVersions;
   delete comparable.reviewLater;
   if (kind === 'conversation') comparable.deletedAt = Number(record?.deletedAt) || null;
-  return fallbackHash(stableCacheJson(comparable));
+  return fallbackHash(stableJson(comparable));
 }
 
 function syncRecordBodyHash(record, kind) {
@@ -7569,7 +7288,7 @@ function syncRecordBodyHash(record, kind) {
     : (kind === 'message' ? syncSanitizeMessageForRemote(record) : syncStripLocalOnlyData(syncCloneJson(record || {})));
   ['updatedAt', 'lastChangedBy', 'conflictVersions', 'reviewLater', 'resolvedConflictHashes', 'conflictResolvedAt'].forEach(key => delete comparable[key]);
   if (kind === 'conversation') comparable.deletedAt = Number(record?.deletedAt) || null;
-  return fallbackHash(stableCacheJson(comparable));
+  return fallbackHash(stableJson(comparable));
 }
 
 function syncBuildBaseHashes(snapshot) {
@@ -8015,7 +7734,7 @@ async function syncPerformSync(manual = false) {
     try {
       const localBefore = await syncGetLocalSnapshot();
       const generationAtStart = syncLocalGeneration;
-      const configAtStart = stableCacheJson(syncGetStoredConfig());
+      const configAtStart = stableJson(syncGetStoredConfig());
       let latest = null;
       let manifest = null;
       let remoteSnapshot = { version: 2, conversations: [], memories: [] };
@@ -8025,7 +7744,7 @@ async function syncPerformSync(manual = false) {
         remoteSnapshot = await syncReadRemoteSnapshot(latest.gist, manifest, cfg);
       }
 
-      if (syncLocalGeneration !== generationAtStart || streaming || stableCacheJson(syncGetStoredConfig()) !== configAtStart) {
+      if (syncLocalGeneration !== generationAtStart || streaming || stableJson(syncGetStoredConfig()) !== configAtStart) {
         const deferred = new Error('Local data changed while sync was preparing.');
         deferred.name = 'SyncDeferredError';
         throw deferred;
@@ -8036,10 +7755,10 @@ async function syncPerformSync(manual = false) {
       syncState.lastSizeBytes = built.sizeBytes;
       syncPersistState();
       const sizeWarning = built.sizeBytes >= SYNC_SIZE_WARNING_BYTES
-        ? ' Encrypted sync data is ' + formatCacheBytes(built.sizeBytes) + ', approaching the practical Gist limit.'
+        ? ' Encrypted sync data is ' + formatBytes(built.sizeBytes) + ', approaching the practical Gist limit.'
         : '';
 
-      if (syncLocalGeneration !== generationAtStart || streaming || stableCacheJson(syncGetStoredConfig()) !== configAtStart) {
+      if (syncLocalGeneration !== generationAtStart || streaming || stableJson(syncGetStoredConfig()) !== configAtStart) {
         const deferred = new Error('Local data changed while sync was encrypting.');
         deferred.name = 'SyncDeferredError';
         throw deferred;
@@ -9601,17 +9320,6 @@ const __windowBridge = {
   idbDelete,
   idbClear,
   idbPutAll,
-  generateCacheKey,
-  cacheLookup,
-  cacheStore,
-  cacheDelete,
-  cacheClear,
-  cacheCleanupExpired,
-  cacheGetStats,
-  toggleCache,
-  clearResponseCache,
-  cleanupExpiredCache,
-  updateCacheStats,
   genId,
   saveConversations,
   debouncedSave,

@@ -402,19 +402,6 @@
         <button class="btn btn-secondary debug-inline-btn" type="button" onclick="checkLocalUpdateStatus(true)">Check</button>
       </div>
       <div class="settings-note" id="localUpdateDetails">Update checks only appear while Synapse is running locally.</div>
-      <div class="modal-section">Response Caching</div>
-      <label class="toggle-row">
-        <input type="checkbox" id="cacheEnabled" onchange="toggleCache(this.checked)">
-        Enable Response Cache
-        <span class="toggle-hint">7 day TTL</span>
-      </label>
-      <div class="debug-status-row">
-        <span class="settings-stat" id="cacheStats">Loading...</span>
-      </div>
-      <div class="debug-actions">
-        <button class="btn btn-secondary" type="button" onclick="clearResponseCache()">Clear cache</button>
-        <button class="btn btn-secondary" type="button" onclick="cleanupExpiredCache()">Cleanup expired</button>
-      </div>
       <div class="modal-section">Recent Logs</div>
       <pre class="debug-log-preview" id="debugLogPreview">No debug events yet.</pre>
       <div class="debug-actions">
