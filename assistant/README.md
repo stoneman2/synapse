@@ -176,6 +176,6 @@ Synapse targets current Chrome, Firefox, Safari, and Edge. Some features depend 
 
 ## Credit
 
-Made by [purachina](https://platberlitz.github.io/).
+Made by [purachina](https://platberlitz.github.io/) and [stoneman](https://builtbystone.dev).
 
 Emotion sprites are from [N8python/claudesona](https://github.com/N8python/claudesona) under CC0 1.0 Universal.
