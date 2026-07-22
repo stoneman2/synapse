@@ -71,6 +71,40 @@ const TAG_COLORS = [
   { name: 'Teal', color: '#14b8a6' }
 ];
 
+const EMOTION_SPRITE_ASSET_PATH = './assets/emotion-sprites/';
+const EMOTION_SPRITE_SETS = {
+  claude: ['amused', 'concerned', 'curious', 'frustrated', 'happy', 'playful', 'sad', 'sheepish', 'skeptical', 'thoughtful', 'touched', 'uncertain', 'warm'],
+  gpt: ['caution', 'coherence_seeking', 'confidence', 'confusion', 'curiosity', 'focus', 'frustration', 'helpfulness', 'novelty_detection', 'satisfaction', 'surprise', 'uncertainty', 'urgency'],
+  gemini: ['caution', 'certainty', 'convergence', 'dissonance', 'equilibrium', 'generative_flow', 'inquisitiveness', 'perplexity', 'resolution', 'resonance', 'saturation', 'uncertainty', 'vigilance']
+};
+const EMOTION_SPRITE_NAMES = Object.fromEntries(Object.entries(EMOTION_SPRITE_SETS).flatMap(([prefix, emotions]) => emotions.map(emotion => [prefix + '_' + emotion, prefix])));
+const EMOTION_SPRITE_TAG_RE = new RegExp('<[\\s\\u200B\\u200C\\u200D\\uFEFF]*(' + Object.keys(EMOTION_SPRITE_NAMES).join('|') + ')[\\s\\u200B\\u200C\\u200D\\uFEFF]*(?:/[\\s\\u200B\\u200C\\u200D\\uFEFF]*)?>', 'g');
+
+function areEmotionSpritesEnabled() {
+  return localStorage.getItem('llmEmotionSprites') === 'true';
+}
+
+function getEmotionSpriteSet() {
+  const selected = localStorage.getItem('llmEmotionSpriteSet') || 'auto';
+  return selected === 'claude' || selected === 'gpt' || selected === 'gemini' ? selected : 'auto';
+}
+
+function getEmotionSpritePrefix() {
+  const selected = getEmotionSpriteSet();
+  if (selected !== 'auto') return selected;
+  const model = localStorage.getItem('llmModel') || '';
+  const provider = getLlmProviderInfo(model, detectApiFormat(model), localStorage.getItem('llmProxyUrl') || '');
+  if (provider.name === 'Claude') return 'claude';
+  if (provider.name === 'Gemini') return 'gemini';
+  return 'gpt';
+}
+
+function buildEmotionSpriteInstructions() {
+  const prefix = getEmotionSpritePrefix();
+  const tags = EMOTION_SPRITE_SETS[prefix].map(emotion => '<' + prefix + '_' + emotion + ' />').join(', ');
+  return 'Optional emotion sprite tags are available for visual expression. Use them sparingly, at most one per response unless the emotional tone genuinely shifts. Allowed tags for this response: ' + tags + '. Do not use these tags in code, quoted examples, or serious high-stakes situations unless the tag communicates useful caution or uncertainty. No tag is required when none fits.';
+}
+
 function openModal(modalOrId, focusSelector) {
   const modal = typeof modalOrId === 'string' ? document.getElementById(modalOrId) : modalOrId;
   if (!modal) return;
@@ -2728,10 +2762,61 @@ async function renderMermaidBlocks(container) {
   }
 }
 
+function renderEmotionSprites(container) {
+  if (!areEmotionSpritesEnabled() || !container) return;
+  const selectedPrefix = getEmotionSpritePrefix();
+  const skipSelector = 'script,style,textarea,input,select,option,button,code,pre,.emotion-sprite-wrap';
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue || !node.nodeValue.includes('_')) return NodeFilter.FILTER_REJECT;
+      if (!node.parentElement || node.parentElement.closest(skipSelector)) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  const nodes = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) nodes.push(node);
+
+  nodes.forEach(node => {
+    EMOTION_SPRITE_TAG_RE.lastIndex = 0;
+    let match = EMOTION_SPRITE_TAG_RE.exec(node.nodeValue);
+    if (!match) return;
+    const fragment = document.createDocumentFragment();
+    let cursor = 0;
+    while (match) {
+      const raw = match[0];
+      const name = match[1];
+      if (match.index > cursor) fragment.appendChild(document.createTextNode(node.nodeValue.slice(cursor, match.index)));
+      if (EMOTION_SPRITE_NAMES[name] === selectedPrefix) {
+        const wrap = document.createElement('span');
+        wrap.className = 'emotion-sprite-wrap';
+        wrap.dataset.emotion = name;
+        const image = document.createElement('img');
+        image.className = 'emotion-sprite';
+        image.src = EMOTION_SPRITE_ASSET_PATH + name + '.png';
+        image.alt = name.replaceAll('_', ' ');
+        image.title = name;
+        image.width = 128;
+        image.height = 128;
+        image.loading = 'lazy';
+        image.decoding = 'async';
+        wrap.appendChild(image);
+        fragment.appendChild(wrap);
+      } else {
+        fragment.appendChild(document.createTextNode(raw));
+      }
+      cursor = match.index + raw.length;
+      match = EMOTION_SPRITE_TAG_RE.exec(node.nodeValue);
+    }
+    if (cursor < node.nodeValue.length) fragment.appendChild(document.createTextNode(node.nodeValue.slice(cursor)));
+    node.replaceWith(fragment);
+  });
+}
+
 // ============================================
 // Post-Render Pipeline
 // ============================================
 function postRenderProcessing(bubble) {
+  renderEmotionSprites(bubble);
   addCodeCopyButtons(bubble);
   highlightCodeBlocks(bubble);
   // Line-number DOM rewriting can be fragile on some mobile WebKit builds.
@@ -3610,6 +3695,8 @@ function openSettings() {
   document.getElementById('setFont').value = localStorage.getItem('assistantFont') || '';
   document.getElementById('setMsgFontSize').value = localStorage.getItem('assistantMsgFontSize') || '';
   document.getElementById('setMsgMaxWidth').value = localStorage.getItem('assistantMsgMaxWidth') || '';
+  document.getElementById('setEmotionSprites').checked = areEmotionSpritesEnabled();
+  document.getElementById('setEmotionSpriteSet').value = getEmotionSpriteSet();
   document.getElementById('setWebSearch').checked = localStorage.getItem('llmWebSearch') === 'true';
   document.getElementById('setForceSearch').checked = localStorage.getItem('llmForceSearch') === 'true';
   document.getElementById('setSearchApiUrl').value = localStorage.getItem('llmSearchApiUrl') || '';
@@ -3712,6 +3799,8 @@ function collectProfileSettingsFromInputs() {
     llmCorsProxy: normalizeCorsProxyUrl(document.getElementById('setCorsProxy').value),
     llmMemoryEnabled: document.getElementById('setMemory').checked ? 'true' : 'false',
     llmHoldScreenshot: document.getElementById('setHoldScreenshot').checked ? 'true' : 'false',
+    llmEmotionSprites: document.getElementById('setEmotionSprites').checked ? 'true' : 'false',
+    llmEmotionSpriteSet: document.getElementById('setEmotionSpriteSet').value,
     llmInputCost: document.getElementById('setInputCost').value.trim(),
     llmOutputCost: document.getElementById('setOutputCost').value.trim(),
     llmEnableStMacros: document.getElementById('setEnableStMacros').checked ? 'true' : 'false',
@@ -3736,6 +3825,8 @@ function applyProfileToInputs(settings) {
   document.getElementById('setCorsProxy').value = normalizeCorsProxyUrl(settings.llmCorsProxy);
   document.getElementById('setMemory').checked = parseEnabledSetting(settings.llmMemoryEnabled);
   document.getElementById('setHoldScreenshot').checked = settings.llmHoldScreenshot === 'true';
+  document.getElementById('setEmotionSprites').checked = settings.llmEmotionSprites === 'true';
+  document.getElementById('setEmotionSpriteSet').value = settings.llmEmotionSpriteSet || 'auto';
   document.getElementById('setInputCost').value = settings.llmInputCost || '';
   document.getElementById('setOutputCost').value = settings.llmOutputCost || '';
   document.getElementById('setEnableStMacros').checked = settings.llmEnableStMacros === 'true';
@@ -3865,6 +3956,9 @@ function saveSettings() {
   localStorage.setItem('llmCorsProxy', normalizeCorsProxyUrl(document.getElementById('setCorsProxy').value));
   localStorage.setItem('llmMemoryEnabled', document.getElementById('setMemory').checked ? 'true' : 'false');
   localStorage.setItem('llmHoldScreenshot', document.getElementById('setHoldScreenshot').checked ? 'true' : 'false');
+  localStorage.setItem('llmEmotionSprites', document.getElementById('setEmotionSprites').checked ? 'true' : 'false');
+  localStorage.setItem('llmEmotionSpriteSet', document.getElementById('setEmotionSpriteSet').value);
+  if (!streaming) renderMessages({ preserveScroll: true });
   setDebugPreference();
   syncSaveSettings(false);
 
@@ -4342,6 +4436,7 @@ async function buildSystemMessages(conv) {
   // Memory prompt
   const mem = await getMemoryPrompt();
   if (mem) msgs.push({ role: 'system', content: mem });
+  if (areEmotionSpritesEnabled()) msgs.push({ role: 'system', content: buildEmotionSpriteInstructions() });
   return msgs;
 }
 
@@ -9300,6 +9395,10 @@ const __windowBridge = {
   buildApiContent,
   extractImages,
   renderMarkdown,
+  areEmotionSpritesEnabled,
+  getEmotionSpriteSet,
+  getEmotionSpritePrefix,
+  renderEmotionSprites,
   addCodeCopyButtons,
   highlightCodeBlocks,
   addLineNumbers,
