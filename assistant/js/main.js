@@ -4,7 +4,11 @@ import { escapeHTML, isLightColor } from './lib/text-utils.js';
 // State
 // ============================================
 let conversations = [];
+let projects = [];
 let activeConvId = null;
+// True when the page is showing someone else's shared conversation via ?share=.
+// Load and save of local data are both suppressed in that mode — see saveConversations.
+let readOnlyShare = false;
 let messages = [];
 let abortController = null;
 let streaming = false;
@@ -25,40 +29,24 @@ let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-05-20',
+  buildDate: '2026-08-11',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
 const SYNC_GIST_API_URL = 'https://api.github.com/gists';
 const SYNC_KDF_ITERATIONS = 120000;
-const SYNC_DEBOUNCE_MS = 15000;
-const SYNC_POLL_MS = 90000;
-const SYNC_DIRTY_RETRY_MS = 5 * 60 * 1000;
-const SYNC_SIZE_WARNING_BYTES = 750 * 1024;
-const SYNC_MAX_WRITE_RETRIES = 3;
-
-let conversationTombstones = [];
-let memoryRecords = [];
-let memoryRecordsLoaded = false;
-let syncObservedConversations = new Map();
-let syncObservedMessages = new Map();
-let syncObservedMemories = new Map();
-let syncApplyingRemote = false;
-let syncState = {
-  dirty: false,
-  paused: false,
-  pauseReason: '',
-  lastRevision: '',
-  lastEtag: '',
-  lastSyncedAt: 0,
-  lastSizeBytes: 0,
-  baseHashes: null
-};
-let syncQueue = Promise.resolve();
-let syncDebounceTimer = null;
-let syncPollTimer = null;
-let syncDirtyRetryTimer = null;
-let syncLocalGeneration = 0;
+const SYNC_SETTINGS_KEYS = [
+  'llmModel', 'llmApiFormat', 'llmStreaming', 'llmEnterSend', 'llmTemperature',
+  'llmMaxTokens', 'llmPromptCache', 'llmThinking', 'llmThinkingEffort',
+  'llmExtraParams', 'llmExcludeParams', 'llmPrefill', 'llmPersona',
+  'llmEnableStMacros', 'llmRpUserName', 'llmInputCost', 'llmOutputCost',
+  'llmWebSearch', 'llmForceSearch', 'llmMemoryEnabled', 'llmHoldScreenshot',
+  'llmCacheEnabled', 'llmPromptEntries', 'assistantPresets', 'assistantProfiles', 'assistantTheme',
+  'assistantCustomTheme', 'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth'
+];
+const SYNC_PROFILE_SECRET_KEYS = [
+  'llmApiKey', 'llmSearchApiKey', 'llmProxyUrl', 'llmCorsProxy', 'llmSearchApiUrl'
+];
 
 const TAG_COLORS = [
   { name: 'Red', color: '#ef4444' },
@@ -70,40 +58,6 @@ const TAG_COLORS = [
   { name: 'Pink', color: '#ec4899' },
   { name: 'Teal', color: '#14b8a6' }
 ];
-
-const EMOTION_SPRITE_ASSET_PATH = './assets/emotion-sprites/';
-const EMOTION_SPRITE_SETS = {
-  claude: ['amused', 'concerned', 'curious', 'frustrated', 'happy', 'playful', 'sad', 'sheepish', 'skeptical', 'thoughtful', 'touched', 'uncertain', 'warm'],
-  gpt: ['caution', 'coherence_seeking', 'confidence', 'confusion', 'curiosity', 'focus', 'frustration', 'helpfulness', 'novelty_detection', 'satisfaction', 'surprise', 'uncertainty', 'urgency'],
-  gemini: ['caution', 'certainty', 'convergence', 'dissonance', 'equilibrium', 'generative_flow', 'inquisitiveness', 'perplexity', 'resolution', 'resonance', 'saturation', 'uncertainty', 'vigilance']
-};
-const EMOTION_SPRITE_NAMES = Object.fromEntries(Object.entries(EMOTION_SPRITE_SETS).flatMap(([prefix, emotions]) => emotions.map(emotion => [prefix + '_' + emotion, prefix])));
-const EMOTION_SPRITE_TAG_RE = new RegExp('<[\\s\\u200B\\u200C\\u200D\\uFEFF]*(' + Object.keys(EMOTION_SPRITE_NAMES).join('|') + ')[\\s\\u200B\\u200C\\u200D\\uFEFF]*(?:/[\\s\\u200B\\u200C\\u200D\\uFEFF]*)?>', 'g');
-
-function areEmotionSpritesEnabled() {
-  return localStorage.getItem('llmEmotionSprites') === 'true';
-}
-
-function getEmotionSpriteSet() {
-  const selected = localStorage.getItem('llmEmotionSpriteSet') || 'auto';
-  return selected === 'claude' || selected === 'gpt' || selected === 'gemini' ? selected : 'auto';
-}
-
-function getEmotionSpritePrefix() {
-  const selected = getEmotionSpriteSet();
-  if (selected !== 'auto') return selected;
-  const model = localStorage.getItem('llmModel') || '';
-  const provider = getLlmProviderInfo(model, detectApiFormat(model), localStorage.getItem('llmProxyUrl') || '');
-  if (provider.name === 'Claude') return 'claude';
-  if (provider.name === 'Gemini') return 'gemini';
-  return 'gpt';
-}
-
-function buildEmotionSpriteInstructions() {
-  const prefix = getEmotionSpritePrefix();
-  const tags = EMOTION_SPRITE_SETS[prefix].map(emotion => '<' + prefix + '_' + emotion + ' />').join(', ');
-  return 'Optional emotion sprite tags are available for visual expression. Use them sparingly, at most one per response unless the emotional tone genuinely shifts. Allowed tags for this response: ' + tags + '. Do not use these tags in code, quoted examples, or serious high-stakes situations unless the tag communicates useful caution or uncertainty. No tag is required when none fits.';
-}
 
 function openModal(modalOrId, focusSelector) {
   const modal = typeof modalOrId === 'string' ? document.getElementById(modalOrId) : modalOrId;
@@ -270,13 +224,20 @@ function summarizeMessageForDebug(message, includeText) {
 
 function summarizeLlmPayloadForDebug(payload, includeText = isDebugTextIncluded()) {
   const summary = {};
-  ['model', 'stream', 'temperature', 'max_tokens', 'tool_choice'].forEach(key => {
+  ['model', 'stream', 'temperature', 'max_tokens', 'tool_choice', 'thinking', 'output_config'].forEach(key => {
     if (payload && key in payload) summary[key] = payload[key];
   });
   if (payload?.system) {
+    // system is a plain string on OpenAI-compatible calls and a content-block array
+    // when Anthropic prompt caching is on — flatten so the debug view stays readable.
+    const cached = Array.isArray(payload.system) && payload.system.some(b => b && b.cache_control);
+    const systemText = Array.isArray(payload.system)
+      ? payload.system.map(b => (typeof b === 'string' ? b : b?.text || '')).join('\n\n')
+      : String(payload.system);
     summary.system = {
-      chars: String(payload.system).length,
-      text: includeText ? payload.system : shortenForDebug(payload.system)
+      chars: systemText.length,
+      cached,
+      text: includeText ? systemText : shortenForDebug(systemText)
     };
   }
   if (Array.isArray(payload?.messages)) {
@@ -997,191 +958,6 @@ function loadCachedModels(target) {
 // ============================================
 // Memory System
 // ============================================
-function syncGenerateRecordId(prefix) {
-  const suffix = window.crypto?.randomUUID
-    ? window.crypto.randomUUID()
-    : Date.now() + '_' + Math.random().toString(36).slice(2, 12);
-  return prefix + '_' + suffix;
-}
-
-function syncLegacyRecordId(prefix, seed) {
-  return prefix + '_' + fallbackHash(stableJson(seed)).replace(/^fallback_/, '');
-}
-
-function syncRecordTimestamp(record) {
-  return Math.max(Number(record?.updatedAt) || 0, Number(record?.deletedAt) || 0, Number(record?.createdAt) || 0);
-}
-
-function syncTouchRecord(record, timestamp = Date.now()) {
-  if (!record || typeof record !== 'object') return record;
-  record.updatedAt = timestamp;
-  record.deletedAt = null;
-  record.lastChangedBy = syncGetDeviceId();
-  return record;
-}
-
-function syncTombstoneRecord(record, timestamp = Date.now()) {
-  const tombstone = {
-    id: record.id,
-    createdAt: Number(record.createdAt) || timestamp,
-    updatedAt: timestamp,
-    deletedAt: timestamp,
-    lastChangedBy: syncGetDeviceId()
-  };
-  if (record.role) tombstone.role = record.role;
-  return tombstone;
-}
-
-function syncStripLocalOnlyData(value) {
-  if (typeof value === 'string') return value.startsWith('data:') ? undefined : value;
-  if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) {
-    return value.map(item => syncStripLocalOnlyData(item)).filter(item => item !== undefined);
-  }
-  const out = {};
-  Object.entries(value).forEach(([key, childValue]) => {
-    if (['docs', 'characterAvatar', 'images', 'swipeImages', '_editing'].includes(key)) return;
-    const cleaned = syncStripLocalOnlyData(childValue);
-    if (cleaned !== undefined) out[key] = cleaned;
-  });
-  return out;
-}
-
-function syncSanitizeMessageForRemote(message) {
-  const cleaned = syncStripLocalOnlyData(syncCloneJson(message || {}));
-  if (Array.isArray(message?.content)) {
-    const textParts = message.content
-      .filter(part => part?.type === 'text')
-      .map(part => ({ type: 'text', text: String(part.text || '') }));
-    cleaned.content = textParts.length === 1 ? textParts[0].text : textParts;
-  }
-  if (Array.isArray(message?.branches)) {
-    cleaned.branches = message.branches.map(branch =>
-      Array.isArray(branch) ? branch.map(syncSanitizeMessageForRemote) : []
-    );
-  }
-  return cleaned;
-}
-
-function syncSanitizeConversationForRemote(conversation) {
-  const cleaned = syncStripLocalOnlyData(syncCloneJson(conversation || {}));
-  cleaned.messages = (conversation?.messages || []).map(syncSanitizeMessageForRemote);
-  cleaned.messageTombstones = (conversation?.messageTombstones || []).map(tombstone => ({
-    id: tombstone.id,
-    role: tombstone.role || '',
-    createdAt: Number(tombstone.createdAt) || 0,
-    updatedAt: Number(tombstone.updatedAt) || 0,
-    deletedAt: Number(tombstone.deletedAt) || null,
-    lastChangedBy: tombstone.lastChangedBy || ''
-  }));
-  delete cleaned.docs;
-  delete cleaned.characterAvatar;
-  return cleaned;
-}
-
-function syncComparableRecord(record, kind) {
-  let comparable;
-  if (kind === 'conversation') {
-    comparable = syncSanitizeConversationForRemote(record);
-    delete comparable.messages;
-    delete comparable.messageTombstones;
-  } else if (kind === 'message') {
-    comparable = syncSanitizeMessageForRemote(record);
-  } else {
-    comparable = syncStripLocalOnlyData(syncCloneJson(record || {}));
-  }
-  ['updatedAt', 'deletedAt', 'lastChangedBy', 'conflictVersions', 'reviewLater'].forEach(key => delete comparable[key]);
-  return comparable;
-}
-
-function syncRecordHash(record, kind) {
-  return fallbackHash(stableJson(syncComparableRecord(record, kind)));
-}
-
-function syncNormalizeMessageRecord(raw, conversation, index, seed = '') {
-  const message = raw && typeof raw === 'object' ? raw : { role: 'assistant', content: String(raw || '') };
-  const legacyTimestamp = Number(message.createdAt) || Number(message.timestamp) || (Number(conversation.createdAt) || 1) + index;
-  if (!message.id) {
-    message.id = syncLegacyRecordId('msg', {
-      conversationId: conversation.id,
-      seed,
-      index,
-      role: message.role || '',
-      timestamp: Number(message.timestamp) || 0,
-      content: syncSanitizeMessageForRemote(message).content
-    });
-  }
-  message.createdAt = legacyTimestamp;
-  message.updatedAt = Number(message.updatedAt) || legacyTimestamp;
-  message.deletedAt = Number(message.deletedAt) || null;
-  message.lastChangedBy = message.lastChangedBy || syncGetDeviceId();
-  if (!message.timestamp) message.timestamp = message.createdAt;
-  if (message.role === 'assistant' && !Array.isArray(message.swipes)) {
-    message.swipes = [typeof message.content === 'string' ? message.content : ''];
-    message.swipeIndex = 0;
-  }
-  if (Array.isArray(message.branches)) {
-    message.branches.forEach((branch, branchIndex) => {
-      if (!Array.isArray(branch)) return;
-      branch.forEach((branchMessage, branchMessageIndex) => {
-        syncNormalizeMessageRecord(branchMessage, conversation, branchMessageIndex, seed + ':branch:' + branchIndex);
-      });
-    });
-  }
-  return message;
-}
-
-function syncNextMessageTimestamp(minimum = Date.now()) {
-  const previous = messages[messages.length - 1];
-  return Math.max(minimum, (Number(previous?.createdAt) || Number(previous?.timestamp) || 0) + 1);
-}
-
-function syncCreateMessage(role, fields = {}, createdAt = syncNextMessageTimestamp()) {
-  return {
-    ...fields,
-    id: fields.id || syncGenerateRecordId('msg'),
-    role,
-    timestamp: Number(fields.timestamp) || createdAt,
-    createdAt,
-    updatedAt: createdAt,
-    deletedAt: null,
-    lastChangedBy: syncGetDeviceId()
-  };
-}
-
-function syncNormalizeConversationRecord(raw, index = 0) {
-  const conversation = raw && typeof raw === 'object' ? raw : {};
-  conversation.id = conversation.id || syncGenerateRecordId('conv');
-  conversation.title = conversation.title || 'Untitled Chat';
-  conversation.createdAt = Number(conversation.createdAt) || Date.now() + index;
-  conversation.updatedAt = Number(conversation.updatedAt) || conversation.createdAt;
-  conversation.deletedAt = Number(conversation.deletedAt) || null;
-  conversation.lastChangedBy = conversation.lastChangedBy || syncGetDeviceId();
-  conversation.messages = Array.isArray(conversation.messages) ? conversation.messages : [];
-  conversation.messageTombstones = Array.isArray(conversation.messageTombstones) ? conversation.messageTombstones : [];
-  let previousCreatedAt = conversation.createdAt - 1;
-  conversation.messages.forEach((message, messageIndex) => {
-    const hadCreatedAt = Number(message?.createdAt) > 0;
-    syncNormalizeMessageRecord(message, conversation, messageIndex);
-    if (!hadCreatedAt && message.createdAt <= previousCreatedAt) {
-      message.createdAt = previousCreatedAt + 1;
-      message.updatedAt = Math.max(Number(message.updatedAt) || 0, message.createdAt);
-    }
-    previousCreatedAt = message.createdAt;
-  });
-  conversation.messageTombstones = conversation.messageTombstones
-    .filter(tombstone => tombstone?.id && tombstone.deletedAt)
-    .map(tombstone => ({
-      id: tombstone.id,
-      role: tombstone.role || '',
-      createdAt: Number(tombstone.createdAt) || Number(tombstone.deletedAt),
-      updatedAt: Number(tombstone.updatedAt) || Number(tombstone.deletedAt),
-      deletedAt: Number(tombstone.deletedAt),
-      lastChangedBy: tombstone.lastChangedBy || syncGetDeviceId()
-    }));
-  return conversation;
-}
-
 function parseEnabledSetting(value) {
   if (typeof value === 'boolean') return value;
   if (value === null || value === undefined) return false;
@@ -1192,10 +968,10 @@ function isMemoryEnabled() {
   return parseEnabledSetting(localStorage.getItem('llmMemoryEnabled'));
 }
 
-function normalizeMemoryEntry(raw, index) {
+function normalizeMemoryEntry(raw, index, seedTimestamp) {
   let text = '';
   let id = '';
-  let createdAt = index + 1;
+  let createdAt = seedTimestamp + index;
 
   if (typeof raw === 'string') {
     text = raw.trim();
@@ -1207,29 +983,21 @@ function normalizeMemoryEntry(raw, index) {
     if (Number.isFinite(rawCreatedAt) && rawCreatedAt > 0) createdAt = rawCreatedAt;
   }
 
-  const deletedAt = raw && typeof raw === 'object' ? Number(raw.deletedAt) || null : null;
-  if (!text && !deletedAt) return null;
-  if (!id) id = syncLegacyRecordId('mem', { index, text, createdAt: Number(raw?.createdAt) || 0 });
-  return {
-    ...(raw && typeof raw === 'object' ? syncCloneJson(raw) : {}),
-    id,
-    text,
-    createdAt,
-    updatedAt: Number(raw?.updatedAt) || createdAt,
-    deletedAt,
-    lastChangedBy: raw?.lastChangedBy || syncGetDeviceId()
-  };
+  if (!text) return null;
+  if (!id) id = 'mem_' + createdAt + '_' + index;
+  return { id, text, createdAt };
 }
 
 function normalizeMemoryList(rawList) {
   if (!Array.isArray(rawList)) return { memories: [], changed: rawList !== null && rawList !== undefined };
 
+  const seedTimestamp = Date.now();
   const usedIds = new Set();
   const normalized = [];
   let changed = false;
 
   rawList.forEach((raw, index) => {
-    const entry = normalizeMemoryEntry(raw, index);
+    const entry = normalizeMemoryEntry(raw, index, seedTimestamp);
     if (!entry) {
       changed = true;
       return;
@@ -1249,8 +1017,7 @@ function normalizeMemoryList(rawList) {
     const rawText = typeof raw.text === 'string' ? raw.text : '';
     const rawId = typeof raw.id === 'string' ? raw.id : '';
     const rawCreatedAt = Number(raw.createdAt);
-    if (rawText !== entry.text || rawId !== entry.id || !Number.isFinite(rawCreatedAt) || rawCreatedAt !== entry.createdAt
-      || !Number.isFinite(Number(raw.updatedAt)) || !Object.prototype.hasOwnProperty.call(raw, 'deletedAt') || !raw.lastChangedBy) {
+    if (rawText !== entry.text || rawId !== entry.id || !Number.isFinite(rawCreatedAt) || rawCreatedAt !== entry.createdAt) {
       changed = true;
     }
   });
@@ -1260,21 +1027,12 @@ function normalizeMemoryList(rawList) {
 }
 
 async function loadMemories() {
-  if (memoryRecordsLoaded) return memoryRecords.filter(memory => !memory.deletedAt);
   if (db) {
     try {
       const idbRaw = await idbGetAll('memories');
       const normalizedIdb = normalizeMemoryList(idbRaw);
-      if (normalizedIdb.memories.length > 0) {
-        memoryRecords = normalizedIdb.memories;
-        memoryRecordsLoaded = true;
-        syncCaptureObservedMemories();
-        if (normalizedIdb.changed) {
-          await idbPutAll('memories', memoryRecords);
-          syncMarkDirty('memory migration');
-        }
-        return memoryRecords.filter(memory => !memory.deletedAt);
-      }
+      if (normalizedIdb.changed) await saveMemories(normalizedIdb.memories);
+      if (normalizedIdb.memories.length > 0) return normalizedIdb.memories;
     } catch(e) {}
   }
 
@@ -1282,68 +1040,20 @@ async function loadMemories() {
     const legacyRaw = JSON.parse(localStorage.getItem('assistantMemories') || '[]');
     const normalizedLegacy = normalizeMemoryList(legacyRaw);
     if (normalizedLegacy.memories.length > 0 || normalizedLegacy.changed) {
-      memoryRecords = normalizedLegacy.memories;
-      memoryRecordsLoaded = true;
-      syncCaptureObservedMemories();
-      if (db) await idbPutAll('memories', memoryRecords);
-      else localStorage.setItem('assistantMemories', JSON.stringify(memoryRecords));
-      syncMarkDirty('memory migration');
+      await saveMemories(normalizedLegacy.memories);
       if (db) localStorage.removeItem('assistantMemories');
     }
-    if (!memoryRecordsLoaded) {
-      memoryRecords = normalizedLegacy.memories;
-      memoryRecordsLoaded = true;
-      syncCaptureObservedMemories();
-    }
-    return memoryRecords.filter(memory => !memory.deletedAt);
+    return normalizedLegacy.memories;
   } catch(e) { return []; }
 }
 
-function syncCaptureObservedMemories() {
-  syncObservedMemories = new Map(memoryRecords.map(memory => [memory.id, {
-    hash: syncRecordHash(memory, 'memory'),
-    record: syncCloneJson(memory)
-  }]));
-}
-
-async function saveMemories(memories, options = {}) {
-  if (!memoryRecordsLoaded) await loadMemories();
+async function saveMemories(memories) {
   const normalized = normalizeMemoryList(memories).memories;
-  const now = Date.now();
-  let changed = false;
-  const nextById = new Map(normalized.map(memory => [memory.id, memory]));
-  if (!options.remote) {
-    memoryRecords.filter(memory => !memory.deletedAt).forEach(existing => {
-      if (!nextById.has(existing.id)) {
-        nextById.set(existing.id, syncTombstoneRecord(existing, now));
-        changed = true;
-      }
-    });
-    memoryRecords.filter(memory => memory.deletedAt).forEach(tombstone => {
-      const live = nextById.get(tombstone.id);
-      if (!live) nextById.set(tombstone.id, tombstone);
-      else if (!live.deletedAt && syncRecordTimestamp(live) <= syncRecordTimestamp(tombstone)) syncTouchRecord(live, now);
-    });
-    nextById.forEach(memory => {
-      if (memory.deletedAt) return;
-      const observed = syncObservedMemories.get(memory.id);
-      if (!observed || observed.hash !== syncRecordHash(memory, 'memory')) {
-        syncTouchRecord(memory, now);
-        changed = true;
-      }
-    });
-  }
-  memoryRecords = Array.from(nextById.values());
-  memoryRecordsLoaded = true;
   if (!db) {
-    localStorage.setItem('assistantMemories', JSON.stringify(memoryRecords));
-    syncCaptureObservedMemories();
-    if (changed && !syncApplyingRemote) syncMarkDirty('memory changed');
+    localStorage.setItem('assistantMemories', JSON.stringify(normalized));
     return;
   }
-  await idbPutAll('memories', memoryRecords);
-  syncCaptureObservedMemories();
-  if (changed && !syncApplyingRemote) syncMarkDirty('memory changed');
+  await idbPutAll('memories', normalized);
 }
 
 async function getMemoryPrompt() {
@@ -1637,7 +1347,10 @@ function buildSnippet(text, idx, windowSize = 90) {
 }
 
 function searchLocalDocs(query, conv) {
-  const docs = (conv && conv.docs) || [];
+  // Project files come first so both callers (the file-search popup and /files) see
+  // them without either needing to know projects exist.
+  const projectDocs = (getProject(conv && conv.projectId) || {}).docs || [];
+  const docs = projectDocs.concat((conv && conv.docs) || []);
   if (!query || !docs.length) return [];
   const q = query.toLowerCase();
   const terms = q.split(/\s+/).filter(Boolean);
@@ -1872,15 +1585,16 @@ async function handleCommand(cmd, conv) {
 
 async function handleManualSearch(query, conv) {
   const ts = Date.now();
-  messages.push(syncCreateMessage('user', { content: '/search ' + query }, ts));
-  const assistantMsg = syncCreateMessage('assistant', {
+  messages.push({ role: 'user', content: '/search ' + query, timestamp: ts });
+  const assistantMsg = {
+    role: 'assistant',
     content: '',
     swipes: [''],
     swipeIndex: 0,
+    timestamp: Date.now(),
     swipeToolUse: [[{ query, results: [], searching: true }]]
-  }, syncNextMessageTimestamp());
+  };
   messages.push(assistantMsg);
-  saveConversations();
   renderMessages();
 
   try {
@@ -1898,27 +1612,28 @@ async function handleManualSearch(query, conv) {
   }
 
   if (conv) conv.updatedAt = Date.now();
-  saveConversations();
-  renderMessages({ preserveScroll: true });
+  debouncedSave();
+  renderMessages();
   updateTokenInfo();
 }
 
 async function handleFileSearch(query, conv) {
   const ts = Date.now();
-  messages.push(syncCreateMessage('user', { content: '/files ' + query }, ts));
+  messages.push({ role: 'user', content: '/files ' + query, timestamp: ts });
   const results = searchLocalDocs(query, conv);
   const toolResults = results.map(r => ({ title: r.name, url: '', snippet: r.snippet }));
-  const assistantMsg = syncCreateMessage('assistant', {
+  const assistantMsg = {
+    role: 'assistant',
     content: results.length ? ('Found ' + results.length + ' matching file snippet' + (results.length === 1 ? '' : 's') + '.') : 'No matching file snippets found.',
     swipes: [''],
     swipeIndex: 0,
+    timestamp: Date.now(),
     swipeToolUse: [[{ query, results: toolResults, searching: false }]]
-  }, syncNextMessageTimestamp());
+  };
   messages.push(assistantMsg);
-  saveConversations();
   if (conv) conv.updatedAt = Date.now();
-  saveConversations();
-  renderMessages({ preserveScroll: true });
+  debouncedSave();
+  renderMessages();
   updateTokenInfo();
 }
 
@@ -2038,6 +1753,15 @@ function setAssistantLlmMetadata(assistantMsg, swipeIdx, model, format) {
 // ============================================
 // Anthropic Message Conversion
 // ============================================
+
+// Claude models that reject temperature / top_p / top_k with a 400.
+const NO_SAMPLING_PARAMS_RE = /opus-5|sonnet-5|opus-4-[78]|fable-5|mythos-5/i;
+
+function resolveMaxTokens() {
+  const n = parseInt(localStorage.getItem('llmMaxTokens'), 10);
+  return Number.isFinite(n) && n > 0 ? n : 8192;
+}
+
 function prepareAnthropicMessages(apiMessages) {
   let systemText = '';
   const msgs = [];
@@ -2103,6 +1827,11 @@ function prepareAnthropicMessages(apiMessages) {
 // Initialization
 // ============================================
 document.addEventListener('DOMContentLoaded', async () => {
+  // Share view is decided first: it changes whether local data is touched at all.
+  const shareId = new URLSearchParams(location.search).get('share');
+  readOnlyShare = !!shareId;
+  if (readOnlyShare) document.body.classList.add('share-view');
+
   // Migration: strip endpoint suffix from proxy URL
   const storedUrl = localStorage.getItem('llmProxyUrl');
   if (storedUrl) {
@@ -2112,16 +1841,27 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Migration/default: keep CORS proxy enabled unless explicitly replaced.
   localStorage.setItem('llmCorsProxy', getCorsProxyUrl());
 
-  try {
-    await openDB();
-  } catch (error) {
-    db = null;
-    console.warn('IndexedDB unavailable, using localStorage fallback:', error);
+  // Service worker: installability + offline. The protocol guard matters because
+  // synapse.html is shipped as a standalone single file and gets opened over file://,
+  // where registration throws.
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
-  await syncLoadState();
-  migrateToPromptEntries();
-  await loadConversations();
-  await loadMemories();
+
+  // Skipped entirely in share view. Opening the DB and leaving `conversations` empty is
+  // what makes an accidental save destructive, so don't open it at all.
+  if (!readOnlyShare) {
+    await openDB();
+    try {
+      const deleted = await cacheCleanupExpired();
+      if (deleted > 0) console.log('Cleaned up ' + deleted + ' expired cache entries');
+    } catch (e) {
+      console.warn('Cache cleanup failed:', e);
+    }
+    migrateToPromptEntries();
+    await loadProjects();
+    await loadConversations();
+  }
   loadTheme();
   loadCustomFont(localStorage.getItem('assistantFont') || '');
   loadCachedModels('setup');
@@ -2129,24 +1869,26 @@ document.addEventListener('DOMContentLoaded', async () => {
   initModalAccessibility();
   renderLocalUpdateStatus();
   checkLocalUpdateStatus(false);
-  syncInitialize();
 
   // Save on page unload — sync fallback since IDB is async
   window.addEventListener('beforeunload', () => {
+    // Second wipe vector: the localStorage fallback below writes `conversations`
+    // directly, bypassing the guard inside saveConversations.
+    if (readOnlyShare) return;
     clearTimeout(_saveDebounceTimer);
-    _saveDebounceTimer = null;
     saveConversations();
     // Only write to localStorage as fallback if IndexedDB is not available
     if (!db) {
       try {
-        localStorage.setItem('assistantConversations', JSON.stringify([...conversations, ...conversationTombstones]));
+        localStorage.setItem('assistantConversations', JSON.stringify(conversations));
         localStorage.setItem('assistantActiveConvId', activeConvId || '');
       } catch(e) {}
     }
   });
 
-  // Show setup modal if no API key
-  if (!localStorage.getItem('llmProxyUrl') || !localStorage.getItem('llmApiKey')) {
+  // Show setup modal if no API key. A visitor reading a shared link has no reason to
+  // be asked for one.
+  if (!readOnlyShare && (!localStorage.getItem('llmProxyUrl') || !localStorage.getItem('llmApiKey'))) {
     openModal('setupModal', '#setupProxy');
   }
 
@@ -2272,10 +2014,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   const msgsArea = document.getElementById('messagesArea');
   const scrollFab = document.getElementById('scrollFab');
   msgsArea.addEventListener('scroll', () => {
-    const distanceFromBottom = msgsArea.scrollHeight - msgsArea.scrollTop - msgsArea.clientHeight;
-    scrollFab.classList.toggle('visible', distanceFromBottom >= 100);
+    const atBottom = msgsArea.scrollHeight - msgsArea.scrollTop - msgsArea.clientHeight < 100;
+    scrollFab.classList.toggle('visible', !atBottom);
     if (streaming && !_suppressScrollFlag) {
-      userScrolledAway = distanceFromBottom > 4;
+      userScrolledAway = !atBottom;
     }
   });
 
@@ -2400,6 +2142,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.addEventListener('keydown', onKey);
     document.body.appendChild(overlay);
   });
+
+  // Last: the rest of init (theme, fonts, mermaid, KaTeX, lightbox and key handlers)
+  // is wanted in share view too, so this runs after it rather than returning early.
+  if (readOnlyShare) await initShareView(shareId);
 });
 
 // ============================================
@@ -2762,53 +2508,45 @@ async function renderMermaidBlocks(container) {
   }
 }
 
-function renderEmotionSprites(container) {
-  if (!areEmotionSpritesEnabled() || !container) return;
-  const selectedPrefix = getEmotionSpritePrefix();
-  const skipSelector = 'script,style,textarea,input,select,option,button,code,pre,.emotion-sprite-wrap';
-  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
-    acceptNode(node) {
-      if (!node.nodeValue || !node.nodeValue.includes('_')) return NodeFilter.FILTER_REJECT;
-      if (!node.parentElement || node.parentElement.closest(skipSelector)) return NodeFilter.FILTER_REJECT;
-      return NodeFilter.FILTER_ACCEPT;
-    }
-  });
-  const nodes = [];
-  for (let node = walker.nextNode(); node; node = walker.nextNode()) nodes.push(node);
+// ============================================
+// Artifact Preview
+// ============================================
+const ARTIFACT_LANGS = ['html', 'svg', 'xml'];
 
-  nodes.forEach(node => {
-    EMOTION_SPRITE_TAG_RE.lastIndex = 0;
-    let match = EMOTION_SPRITE_TAG_RE.exec(node.nodeValue);
-    if (!match) return;
-    const fragment = document.createDocumentFragment();
-    let cursor = 0;
-    while (match) {
-      const raw = match[0];
-      const name = match[1];
-      if (match.index > cursor) fragment.appendChild(document.createTextNode(node.nodeValue.slice(cursor, match.index)));
-      if (EMOTION_SPRITE_NAMES[name] === selectedPrefix) {
-        const wrap = document.createElement('span');
-        wrap.className = 'emotion-sprite-wrap';
-        wrap.dataset.emotion = name;
-        const image = document.createElement('img');
-        image.className = 'emotion-sprite';
-        image.src = EMOTION_SPRITE_ASSET_PATH + name + '.png';
-        image.alt = name.replaceAll('_', ' ');
-        image.title = name;
-        image.width = 128;
-        image.height = 128;
-        image.loading = 'lazy';
-        image.decoding = 'async';
-        wrap.appendChild(image);
-        fragment.appendChild(wrap);
-      } else {
-        fragment.appendChild(document.createTextNode(raw));
+function addArtifactPreview(container) {
+  container.querySelectorAll('pre code').forEach(code => {
+    const wrapper = code.parentElement && code.parentElement.parentElement;
+    if (!wrapper || !wrapper.classList.contains('code-block-wrapper')) return;
+    if (wrapper.querySelector('.code-preview-btn')) return;
+    const cls = Array.from(code.classList).find(c => c.startsWith('language-'));
+    const lang = cls ? cls.replace('language-', '').toLowerCase() : '';
+    if (!ARTIFACT_LANGS.includes(lang)) return;
+    if (!code.textContent.includes('<')) return;
+
+    const btn = document.createElement('button');
+    btn.className = 'code-preview-btn';
+    btn.textContent = 'Preview';
+    btn.title = 'Render this markup in a sandbox';
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const existing = wrapper.querySelector('iframe.artifact-frame');
+      if (existing) {
+        existing.remove();
+        btn.textContent = 'Preview';
+        return;
       }
-      cursor = match.index + raw.length;
-      match = EMOTION_SPRITE_TAG_RE.exec(node.nodeValue);
-    }
-    if (cursor < node.nodeValue.length) fragment.appendChild(document.createTextNode(node.nodeValue.slice(cursor)));
-    node.replaceWith(fragment);
+      const frame = document.createElement('iframe');
+      frame.className = 'artifact-frame';
+      // allow-scripts ONLY. Adding allow-same-origin alongside it would put the frame
+      // on this page's origin and hand model-generated script the stored API key.
+      frame.setAttribute('sandbox', 'allow-scripts');
+      frame.setAttribute('referrerpolicy', 'no-referrer');
+      frame.setAttribute('title', 'Artifact preview');
+      frame.srcdoc = code.textContent;
+      wrapper.appendChild(frame);
+      btn.textContent = 'Hide';
+    };
+    wrapper.appendChild(btn);
   });
 }
 
@@ -2816,8 +2554,8 @@ function renderEmotionSprites(container) {
 // Post-Render Pipeline
 // ============================================
 function postRenderProcessing(bubble) {
-  renderEmotionSprites(bubble);
   addCodeCopyButtons(bubble);
+  addArtifactPreview(bubble);
   highlightCodeBlocks(bubble);
   // Line-number DOM rewriting can be fragile on some mobile WebKit builds.
   // Keep desktop behavior, skip on small screens for more robust code rendering.
@@ -2849,6 +2587,56 @@ function getMsgText(msg) {
     }).filter(Boolean).join(' ');
   }
   return '';
+}
+
+// ============================================
+// Read Aloud
+// ============================================
+
+// Reuses the markdown renderer instead of writing a second stripper: rendering to HTML
+// and taking textContent drops the asterisks, backticks and link syntax that would
+// otherwise be read out literally. Fenced code is dropped — reading it aloud is noise.
+function toSpeechText(text) {
+  const holder = document.createElement('div');
+  holder.innerHTML = renderMarkdown(text || '');
+  holder.querySelectorAll('pre').forEach(el => el.remove());
+  return holder.textContent.replace(/\s+/g, ' ').trim();
+}
+
+function speakMessage(msg, btn) {
+  const synth = window.speechSynthesis;
+  if (!synth) {
+    showToast('Read aloud is not supported in this browser.', 'error');
+    return;
+  }
+  const stopping = btn.dataset.speaking === 'true';
+  // Always stop whatever is playing first, then clear every live button's state. This
+  // self-heals across re-renders: stale buttons are gone from the DOM, so the query
+  // only ever finds current ones.
+  // ponytail: speech orphaned by a re-render keeps playing until the next click or the
+  // end of the utterance. Hook renderMessages if that ever actually bites.
+  synth.cancel();
+  document.querySelectorAll('.msg-action-btn[data-speaking="true"]').forEach(b => {
+    b.dataset.speaking = 'false';
+    b.textContent = 'Speak';
+  });
+  if (stopping) return;
+
+  const text = toSpeechText(stripThinkTags(getMsgText(msg)).content);
+  if (!text) {
+    showToast('Nothing to read in this message.');
+    return;
+  }
+  const utterance = new SpeechSynthesisUtterance(text);
+  const reset = () => {
+    btn.dataset.speaking = 'false';
+    btn.textContent = 'Speak';
+  };
+  utterance.onend = reset;
+  utterance.onerror = reset;
+  btn.dataset.speaking = 'true';
+  btn.textContent = 'Stop';
+  synth.speak(utterance);
 }
 
 function formatTokenCount(tokens) {
@@ -2958,6 +2746,14 @@ function updateTokenInfo() {
     parts.push('Conv: ~' + (total > 999 ? (total / 1000).toFixed(1) + 'k' : total) + ' tokens');
   }
 
+  // Project instructions and files are re-sent on every request, so surface them —
+  // otherwise the cost is completely invisible in this bar.
+  const activeProject = getProject((getActiveConv() || {}).projectId);
+  if (activeProject) {
+    const projTokens = estimateTokens((activeProject.instructions || '') + '\n' + projectDocsSystemText(activeProject));
+    if (projTokens > 0) parts.push('Proj: ~' + formatTokenCount(projTokens) + ' tokens/msg');
+  }
+
   const inputCost = parseFloat(localStorage.getItem('llmInputCost') || '0');
   const outputCost = parseFloat(localStorage.getItem('llmOutputCost') || '0');
   if ((inputCost > 0 || outputCost > 0) && total > 0) {
@@ -2976,6 +2772,8 @@ function updateTokenInfo() {
 // ============================================
 const DB_NAME = 'assistantDB';
 const DB_VERSION = 2;
+const RESPONSE_CACHE_STORE = 'responseCache';
+const RESPONSE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 let db = null;
 
 function openDB() {
@@ -2987,6 +2785,13 @@ function openDB() {
       if (!d.objectStoreNames.contains('conversations')) d.createObjectStore('conversations', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('memories')) d.createObjectStore('memories', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('meta')) d.createObjectStore('meta', { keyPath: 'key' });
+      if (oldVersion < 2 || !d.objectStoreNames.contains(RESPONSE_CACHE_STORE)) {
+        const cacheObjectStore = d.objectStoreNames.contains(RESPONSE_CACHE_STORE)
+          ? e.target.transaction.objectStore(RESPONSE_CACHE_STORE)
+          : d.createObjectStore(RESPONSE_CACHE_STORE, { keyPath: 'cacheKey' });
+        if (!cacheObjectStore.indexNames.contains('cachedAt')) cacheObjectStore.createIndex('cachedAt', 'cachedAt', { unique: false });
+        if (!cacheObjectStore.indexNames.contains('model')) cacheObjectStore.createIndex('model', 'model', { unique: false });
+      }
     };
     req.onsuccess = (e) => { db = e.target.result; resolve(db); };
     req.onerror = (e) => reject(e.target.error);
@@ -3053,19 +2858,23 @@ function idbPutAll(store, items) {
   });
 }
 
-function normalizeStableValue(value) {
+function isResponseCacheEnabled() {
+  return localStorage.getItem('llmCacheEnabled') !== 'false';
+}
+
+function normalizeForCache(value) {
   if (value === undefined || typeof value === 'function' || typeof value === 'symbol') return null;
   if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map(normalizeStableValue);
+  if (Array.isArray(value)) return value.map(normalizeForCache);
   const out = {};
   Object.keys(value).sort().forEach(key => {
-    out[key] = normalizeStableValue(value[key]);
+    out[key] = normalizeForCache(value[key]);
   });
   return out;
 }
 
-function stableJson(value) {
-  return JSON.stringify(normalizeStableValue(value));
+function stableCacheJson(value) {
+  return JSON.stringify(normalizeForCache(value));
 }
 
 function fallbackHash(text) {
@@ -3081,7 +2890,86 @@ function fallbackHash(text) {
   return 'fallback_' + (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0');
 }
 
-function formatBytes(bytes) {
+async function generateCacheKey(userMessage, model, systemMessages) {
+  const payload = stableCacheJson({
+    version: 1,
+    model: model || '',
+    userMessage,
+    systemMessages: systemMessages || []
+  });
+  if (!window.crypto?.subtle) return fallbackHash(payload);
+  const digest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function getResponseCacheRequestParts(apiMessages) {
+  const systemMessages = [];
+  let userMessage = null;
+  (apiMessages || []).forEach(message => {
+    if (!message || !message.role) return;
+    if (message.role === 'system') {
+      systemMessages.push({ role: 'system', content: message.content || '' });
+    } else if (message.role === 'user') {
+      userMessage = { role: 'user', content: normalizeForCache(message.content) };
+    }
+  });
+  return { userMessage, systemMessages };
+}
+
+async function cacheLookup(cacheKey) {
+  if (!db || !cacheKey) return null;
+  const entry = await idbGet(RESPONSE_CACHE_STORE, cacheKey);
+  if (!entry) return null;
+  const now = Date.now();
+  if (entry.expiresAt && entry.expiresAt <= now) {
+    await cacheDelete(cacheKey);
+    return null;
+  }
+  entry.hitCount = (entry.hitCount || 0) + 1;
+  entry.lastHitAt = now;
+  try { await idbPut(RESPONSE_CACHE_STORE, entry); } catch(e) { console.warn('Cache hit update failed:', e); }
+  return entry;
+}
+
+async function cacheStore(entry) {
+  if (!db || !entry?.cacheKey) return;
+  const existing = await idbGet(RESPONSE_CACHE_STORE, entry.cacheKey).catch(() => null);
+  const now = Date.now();
+  const normalized = {
+    ...entry,
+    cachedAt: entry.cachedAt || now,
+    expiresAt: entry.expiresAt || (now + RESPONSE_CACHE_TTL_MS),
+    hitCount: existing?.hitCount || 0,
+    lastHitAt: existing?.lastHitAt || null
+  };
+  await idbPut(RESPONSE_CACHE_STORE, normalized);
+}
+
+async function cacheDelete(cacheKey) {
+  if (!db || !cacheKey) return;
+  await idbDelete(RESPONSE_CACHE_STORE, cacheKey);
+}
+
+async function cacheClear() {
+  if (!db) return;
+  await idbClear(RESPONSE_CACHE_STORE);
+}
+
+async function cacheCleanupExpired() {
+  if (!db) return 0;
+  const now = Date.now();
+  const entries = await idbGetAll(RESPONSE_CACHE_STORE);
+  let deleted = 0;
+  for (const entry of entries) {
+    if (entry.expiresAt && entry.expiresAt <= now) {
+      await idbDelete(RESPONSE_CACHE_STORE, entry.cacheKey);
+      deleted++;
+    }
+  }
+  return deleted;
+}
+
+function formatCacheBytes(bytes) {
   if (!bytes) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB'];
   let value = bytes;
@@ -3093,110 +2981,97 @@ function formatBytes(bytes) {
   return (unit === 0 ? value : value.toFixed(value >= 10 ? 1 : 2)) + ' ' + units[unit];
 }
 
+async function cacheGetStats() {
+  if (!db) return { count: 0, sizeBytes: 0, hits: 0, expired: 0 };
+  const entries = await idbGetAll(RESPONSE_CACHE_STORE);
+  const now = Date.now();
+  return entries.reduce((stats, entry) => {
+    stats.count++;
+    stats.sizeBytes += stableCacheJson(entry).length * 2;
+    stats.hits += entry.hitCount || 0;
+    if (entry.expiresAt && entry.expiresAt <= now) stats.expired++;
+    return stats;
+  }, { count: 0, sizeBytes: 0, hits: 0, expired: 0 });
+}
+
+function buildResponseCacheEntry(cacheKey, userMessage, systemMessages, model, format, fullText, thinkingText, toolBlocks, assistantMsg, swipeIdx) {
+  const now = Date.now();
+  const images = assistantMsg.swipeImages?.[swipeIdx] || assistantMsg.images || [];
+  return {
+    cacheKey,
+    cachedAt: now,
+    expiresAt: now + RESPONSE_CACHE_TTL_MS,
+    model,
+    format,
+    userMessage,
+    systemMessages,
+    response: {
+      content: fullText || '',
+      thinking: thinkingText || '',
+      toolUse: normalizeForCache(toolBlocks || []),
+      images: normalizeForCache(images || []),
+      metadata: { model, format, timestamp: now }
+    },
+    hitCount: 0
+  };
+}
+
+function restoreCachedResponse(entry, assistantMsg, swipeIdx, bubbleEl) {
+  const response = entry?.response || {};
+  const content = response.content || '';
+  const thinking = response.thinking || '';
+  const toolUse = Array.isArray(response.toolUse) ? response.toolUse : [];
+  const images = Array.isArray(response.images) ? response.images : [];
+  assistantMsg._responseCacheHit = true;
+  assistantMsg.swipes = assistantMsg.swipes || [];
+  assistantMsg.swipes[swipeIdx] = content;
+  assistantMsg.content = content;
+  if (thinking) {
+    assistantMsg.swipeThinking = assistantMsg.swipeThinking || [];
+    assistantMsg.swipeThinking[swipeIdx] = thinking;
+  }
+  if (toolUse.length > 0) {
+    assistantMsg.swipeToolUse = assistantMsg.swipeToolUse || [];
+    assistantMsg.swipeToolUse[swipeIdx] = toolUse;
+  }
+  if (images.length > 0) {
+    assistantMsg.swipeImages = assistantMsg.swipeImages || [];
+    assistantMsg.swipeImages[swipeIdx] = images;
+    assistantMsg.images = images;
+  }
+  bubbleEl.innerHTML = renderThinkingHTML(thinking) + renderToolBlocksHTML(toolUse) + renderMarkdown(content) + renderGenImages(images);
+  postRenderProcessing(bubbleEl);
+  const msgsArea = document.getElementById('messagesArea');
+  if (msgsArea) msgsArea.scrollTop = msgsArea.scrollHeight;
+  updateMessageTokenMetadata(assistantMsg, swipeIdx);
+  debugLog('Response cache hit', {
+    model: entry.model,
+    hits: entry.hitCount || 0,
+    cachedAt: entry.cachedAt ? new Date(entry.cachedAt).toISOString() : ''
+  });
+}
+
 // ============================================
 // Conversation Management
 // ============================================
 function genId() { return 'conv_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6); }
 
-function syncCaptureObservedConversations() {
-  syncObservedConversations = new Map();
-  syncObservedMessages = new Map();
-  conversations.forEach(conversation => {
-    syncObservedConversations.set(conversation.id, {
-      hash: syncRecordHash(conversation, 'conversation'),
-      record: syncCloneJson(conversation)
-    });
-    conversation.messages.forEach(message => {
-      syncObservedMessages.set(conversation.id + ':' + message.id, {
-        hash: syncRecordHash(message, 'message'),
-        record: syncCloneJson(message)
-      });
-    });
-  });
-}
-
-function syncPrepareLocalConversationChanges() {
-  const now = Date.now();
-  let changed = false;
-  conversations.forEach((conversation, conversationIndex) => {
-    let conversationChanged = false;
-    syncNormalizeConversationRecord(conversation, conversationIndex);
-    const tombstoneIndex = conversationTombstones.findIndex(tombstone => tombstone.id === conversation.id);
-    if (tombstoneIndex !== -1) {
-      conversationTombstones.splice(tombstoneIndex, 1);
-      syncTouchRecord(conversation, now);
-      changed = true;
-      conversationChanged = true;
-    }
-
-    const currentMessageIds = new Set(conversation.messages.map(message => message.id));
-    syncObservedMessages.forEach((observed, key) => {
-      if (!key.startsWith(conversation.id + ':')) return;
-      const messageId = key.slice(conversation.id.length + 1);
-      if (currentMessageIds.has(messageId) || conversation.messageTombstones.some(tombstone => tombstone.id === messageId)) return;
-      conversation.messageTombstones.push(syncTombstoneRecord(observed.record, now));
-      changed = true;
-      conversationChanged = true;
-    });
-
-    conversation.messages.forEach(message => {
-      const key = conversation.id + ':' + message.id;
-      const observed = syncObservedMessages.get(key);
-      const tombstoneIndex = conversation.messageTombstones.findIndex(tombstone => tombstone.id === message.id);
-      if (tombstoneIndex !== -1) {
-        conversation.messageTombstones.splice(tombstoneIndex, 1);
-        syncTouchRecord(message, now);
-        changed = true;
-        conversationChanged = true;
-      } else if (!observed || observed.hash !== syncRecordHash(message, 'message')) {
-        syncTouchRecord(message, now);
-        changed = true;
-        conversationChanged = true;
-      }
-    });
-
-    const observedConversation = syncObservedConversations.get(conversation.id);
-    if (!observedConversation || observedConversation.hash !== syncRecordHash(conversation, 'conversation') || conversationChanged) {
-      syncTouchRecord(conversation, now);
-      changed = true;
-    }
-  });
-
-  const currentConversationIds = new Set(conversations.map(conversation => conversation.id));
-  syncObservedConversations.forEach((observed, id) => {
-    if (currentConversationIds.has(id) || conversationTombstones.some(tombstone => tombstone.id === id)) return;
-    conversationTombstones.push(syncTombstoneRecord(observed.record, now));
-    changed = true;
-  });
-
-  return changed;
-}
-
 function saveConversations() {
-  const changed = syncApplyingRemote ? false : syncPrepareLocalConversationChanges();
+  // Hard stop in share view. idbPutAll clears the store before writing, so saving an
+  // empty in-memory `conversations` here would destroy the visitor's own history. The
+  // hidden delete/fork/regenerate handlers still exist in the DOM, so guard centrally.
+  if (readOnlyShare) return;
   try { localStorage.setItem('assistantActiveConvId', activeConvId || ''); } catch(e) {}
-  const storedConversations = [...conversations, ...conversationTombstones];
-  syncCaptureObservedConversations();
-  if (changed && !syncApplyingRemote) syncMarkDirty('conversation changed');
-  if (!db) {
-    try { localStorage.setItem('assistantConversations', JSON.stringify(storedConversations)); } catch(e) {}
-    return;
-  }
-  idbPutAll('conversations', storedConversations)
+  if (!db) return;
+  idbPutAll('conversations', conversations)
     .then(() => idbPut('meta', { key: 'activeConvId', value: activeConvId || '' }))
     .catch(e => console.error('IDB save error:', e));
 }
 
 let _saveDebounceTimer;
-let _lastProgressSaveAt = 0;
 function debouncedSave() {
-  if (_saveDebounceTimer) return;
-  const delay = Math.max(0, 1000 - (Date.now() - _lastProgressSaveAt));
-  _saveDebounceTimer = setTimeout(() => {
-    _saveDebounceTimer = null;
-    _lastProgressSaveAt = Date.now();
-    saveConversations();
-  }, delay);
+  clearTimeout(_saveDebounceTimer);
+  _saveDebounceTimer = setTimeout(saveConversations, 1000);
 }
 
 function migratePersonaField(convs) {
@@ -3221,24 +3096,9 @@ function migratePersonaField(convs) {
 async function loadConversations() {
   // Try IndexedDB first
   try {
-    const storedConversations = await idbGetAll('conversations');
-    if (storedConversations.length > 0) {
-      const before = stableJson(storedConversations);
-      storedConversations.forEach((conversation, index) => syncNormalizeConversationRecord(conversation, index));
-      conversations = storedConversations.filter(conversation => !conversation.deletedAt);
-      conversationTombstones = storedConversations.filter(conversation => conversation.deletedAt);
-      if (conversations.length === 0) {
-        const now = Date.now();
-        conversations.push(syncNormalizeConversationRecord({
-          id: syncGenerateRecordId('conv'),
-          title: 'New Chat',
-          messages: [],
-          createdAt: now,
-          updatedAt: now,
-          deletedAt: null,
-          lastChangedBy: syncGetDeviceId()
-        }));
-      }
+    const convs = await idbGetAll('conversations');
+    if (convs.length > 0) {
+      conversations = convs;
       const meta = await new Promise((resolve) => {
         const tx = db.transaction('meta', 'readonly');
         const req = tx.objectStore('meta').get('activeConvId');
@@ -3246,6 +3106,9 @@ async function loadConversations() {
         req.onerror = () => resolve(null);
       });
       activeConvId = meta?.value || conversations[0].id;
+      conversations.forEach(c => c.messages.forEach(m => {
+        if (m.role === 'assistant' && !m.swipes) { m.swipes = [typeof m.content === 'string' ? m.content : '']; m.swipeIndex = 0; }
+      }));
       // Migrate characterSystemPrompt → persona
       migratePersonaField(conversations);
       activeConvId = (conversations.find(c => c.id === activeConvId)) ? activeConvId : conversations[0].id;
@@ -3254,11 +3117,6 @@ async function loadConversations() {
       renderMessages();
       updateTokenInfo();
       updateCharacterUI();
-      syncCaptureObservedConversations();
-      if (before !== stableJson([...conversations, ...conversationTombstones])) {
-        await idbPutAll('conversations', [...conversations, ...conversationTombstones]);
-        syncMarkDirty('conversation migration');
-      }
       return;
     }
   } catch(e) { console.error('IDB load error:', e); }
@@ -3266,11 +3124,7 @@ async function loadConversations() {
   // Migrate from localStorage
   const saved = localStorage.getItem('assistantConversations');
   if (saved) {
-    try {
-      const storedConversations = JSON.parse(saved);
-      conversations = storedConversations.filter(conversation => !conversation.deletedAt);
-      conversationTombstones = storedConversations.filter(conversation => conversation.deletedAt);
-    }
+    try { conversations = JSON.parse(saved); }
     catch (e) { console.error('Failed to parse conversations, resetting:', e); conversations = []; }
   }
 
@@ -3287,7 +3141,10 @@ async function loadConversations() {
     conversations.push({ id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() });
   }
 
-  conversations.forEach((conversation, index) => syncNormalizeConversationRecord(conversation, index));
+  // Migrate swipes
+  conversations.forEach(c => c.messages.forEach(m => {
+    if (m.role === 'assistant' && !m.swipes) { m.swipes = [typeof m.content === 'string' ? m.content : '']; m.swipeIndex = 0; }
+  }));
 
   // Migrate characterSystemPrompt → persona
   migratePersonaField(conversations);
@@ -3298,14 +3155,12 @@ async function loadConversations() {
 
   // Write migrated data to IndexedDB and clean localStorage
   try {
-    await idbPutAll('conversations', [...conversations, ...conversationTombstones]);
+    await idbPutAll('conversations', conversations);
     await idbPut('meta', { key: 'activeConvId', value: activeConvId || '' });
     localStorage.removeItem('assistantConversations');
     localStorage.removeItem('assistantActiveConvId');
   } catch(e) { console.error('IDB migration error:', e); }
 
-  syncCaptureObservedConversations();
-  syncMarkDirty('conversation migration');
   saveConversations();
   renderSidebar();
   renderMessages();
@@ -3315,8 +3170,11 @@ async function loadConversations() {
 
 function getActiveConv() { return conversations.find(c => c.id === activeConvId); }
 
-function createConversation() {
+function createConversation(projectId) {
   const conv = { id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
+  // Only ever set from the per-project "+" in the sidebar; index.html calls this with
+  // no argument, and a click event must not be mistaken for a project id.
+  if (typeof projectId === 'string' && getProject(projectId)) conv.projectId = projectId;
   conversations.unshift(conv);
   activeConvId = conv.id;
   messages = conv.messages;
@@ -3346,6 +3204,11 @@ function deleteConversation(id, e) {
   e.stopPropagation();
   const conv = conversations.find(c => c.id === id);
   if (!conv) return;
+  // Deleting locally does not revoke the published gist. Silently orphaning public data
+  // is worse than an extra prompt.
+  if (conv.shareGistId && !confirm(
+    'This chat has a public share link. Deleting it here does NOT revoke that link — ' +
+    'use "Unshare chat" first.\n\nDelete anyway?')) return;
   const idx = conversations.indexOf(conv);
   conversations.splice(idx, 1);
   if (conversations.length === 0) {
@@ -3386,6 +3249,249 @@ function clearAllConversations() {
   createConversation();
 }
 
+// ============================================
+// Projects
+// ============================================
+// Stored as a single record in the existing `meta` store rather than a new object store
+// (which would force a DB version bump for ~20 records) or localStorage (project files
+// are unbounded text — the same reason conversations moved to IndexedDB).
+
+const PROJECT_DOC_CHAR_LIMIT = 20000;
+let _projectEditId = null;
+
+async function loadProjects() {
+  try {
+    const record = await idbGet('meta', 'projects');
+    projects = (record && record.value) || [];
+  } catch (e) {
+    console.error('IDB projects load error:', e);
+    projects = [];
+  }
+}
+
+function saveProjects() {
+  if (!db) return;
+  idbPut('meta', { key: 'projects', value: projects })
+    .catch(e => console.error('IDB projects save error:', e));
+}
+
+function getProject(id) {
+  return id ? (projects.find(p => p.id === id) || null) : null;
+}
+
+function createProject(name) {
+  const proj = {
+    id: 'proj_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+    name: (name || 'New project').trim() || 'New project',
+    instructions: '',
+    docs: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  projects.unshift(proj);
+  saveProjects();
+  renderSidebar();
+  return proj;
+}
+
+function deleteProject(id) {
+  const proj = getProject(id);
+  if (!proj) return;
+  if (!confirm('Delete project "' + proj.name + '"? Its chats are kept and become unfiled.')) return;
+  // Detach, never cascade — deleting a folder must not delete the conversations in it.
+  conversations.forEach(c => { if (c.projectId === id) delete c.projectId; });
+  projects = projects.filter(p => p.id !== id);
+  _projectEditId = projects.length ? projects[0].id : null;
+  saveProjects();
+  saveConversations();
+  renderSidebar();
+  renderProjectEditor();
+  showToast('Project deleted. Its chats are now unfiled.', 'success');
+}
+
+function assignConversationToProject(conv, projectId) {
+  if (projectId) conv.projectId = projectId;
+  else delete conv.projectId;
+  conv.updatedAt = Date.now();
+  saveConversations();
+  renderSidebar();
+}
+
+function projectDocsSystemText(project) {
+  const docs = (project && project.docs) || [];
+  if (!docs.length) return '';
+  return 'Project files (reference material):\n\n' + docs
+    .map(d => '--- ' + d.name + ' ---\n' + d.text + '\n--- end ' + d.name + ' ---')
+    .join('\n\n');
+}
+
+function showProjectPicker(conv, anchorEl) {
+  document.querySelectorAll('.tag-picker').forEach(p => p.remove());
+  const picker = document.createElement('div');
+  picker.className = 'tag-picker project-picker';
+  const rect = anchorEl.getBoundingClientRect();
+  picker.style.top = rect.bottom + 4 + 'px';
+  picker.style.left = Math.max(8, rect.left - 120) + 'px';
+
+  const addItem = (label, active, onClick) => {
+    const btn = document.createElement('button');
+    btn.className = 'project-picker-item' + (active ? ' active' : '');
+    btn.textContent = label;
+    btn.onclick = () => { onClick(); picker.remove(); };
+    picker.appendChild(btn);
+  };
+
+  addItem('No project', !conv.projectId, () => assignConversationToProject(conv, null));
+  projects.forEach(p => {
+    addItem(p.name, conv.projectId === p.id, () => assignConversationToProject(conv, p.id));
+  });
+  addItem('+ New project…', false, () => {
+    const name = prompt('Project name:');
+    if (name === null) return;
+    const proj = createProject(name);
+    assignConversationToProject(conv, proj.id);
+  });
+
+  document.body.appendChild(picker);
+  const closePicker = (e) => {
+    if (!picker.contains(e.target) && e.target !== anchorEl) {
+      picker.remove();
+      document.removeEventListener('click', closePicker);
+    }
+  };
+  setTimeout(() => document.addEventListener('click', closePicker), 0);
+}
+
+// --- Projects modal ---
+
+function openProjectsModal(projectId) {
+  _projectEditId = projectId || (projects.length ? projects[0].id : null);
+  renderProjectEditor();
+  openModal('projectsModal');
+}
+
+function selectProjectInModal(id) {
+  _projectEditId = id || null;
+  renderProjectEditor();
+}
+
+function renderProjectEditor() {
+  const select = document.getElementById('projSelect');
+  const body = document.getElementById('projEditorBody');
+  const empty = document.getElementById('projEmptyState');
+  if (!select || !body) return;
+
+  select.innerHTML = '';
+  projects.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = p.name;
+    if (p.id === _projectEditId) opt.selected = true;
+    select.appendChild(opt);
+  });
+
+  const proj = getProject(_projectEditId);
+  body.style.display = proj ? '' : 'none';
+  if (empty) empty.style.display = proj ? 'none' : '';
+  if (!proj) return;
+
+  document.getElementById('projName').value = proj.name;
+  document.getElementById('projInstructions').value = proj.instructions || '';
+
+  const count = conversations.filter(c => c.projectId === proj.id).length;
+  document.getElementById('projChatCount').textContent =
+    count === 1 ? '1 chat in this project' : count + ' chats in this project';
+
+  const list = document.getElementById('projDocList');
+  list.innerHTML = '';
+  if (!proj.docs.length) {
+    const none = document.createElement('div');
+    none.className = 'setting-hint';
+    none.textContent = 'No files yet. Files added here are sent with every chat in this project.';
+    list.appendChild(none);
+    return;
+  }
+  proj.docs.forEach(doc => {
+    const row = document.createElement('div');
+    row.className = 'prompt-entry';
+    const label = document.createElement('span');
+    label.style.flex = '1';
+    label.textContent = doc.name + ' (' + formatTokenCount(estimateTokens(doc.text)) + ' tokens)';
+    row.appendChild(label);
+    const del = document.createElement('button');
+    del.textContent = '✕';
+    del.title = 'Remove file';
+    del.setAttribute('aria-label', 'Remove ' + doc.name);
+    del.onclick = () => removeProjectDoc(doc.id);
+    row.appendChild(del);
+    list.appendChild(row);
+  });
+}
+
+function newProjectFromModal() {
+  const name = prompt('Project name:');
+  if (name === null) return;
+  const proj = createProject(name);
+  _projectEditId = proj.id;
+  renderProjectEditor();
+}
+
+function saveProjectFromModal() {
+  const proj = getProject(_projectEditId);
+  if (!proj) { closeModal('projectsModal'); return; }
+  proj.name = document.getElementById('projName').value.trim() || proj.name;
+  proj.instructions = document.getElementById('projInstructions').value;
+  proj.updatedAt = Date.now();
+  saveProjects();
+  renderSidebar();
+  closeModal('projectsModal');
+  showToast('Project saved.', 'success');
+}
+
+function removeProjectDoc(docId) {
+  const proj = getProject(_projectEditId);
+  if (!proj) return;
+  proj.docs = proj.docs.filter(d => d.id !== docId);
+  proj.updatedAt = Date.now();
+  saveProjects();
+  renderProjectEditor();
+}
+
+// Reuses readAttachmentFile so project files get the same PDF/DOCX/RTF/text extraction
+// as chat attachments, instead of duplicating that dispatch. It appends to
+// pendingAttachments, so drain what it added back off the end.
+async function addProjectFiles(event) {
+  const proj = getProject(_projectEditId);
+  if (!proj) return;
+  const files = Array.from(event.target.files || []);
+  let skipped = 0;
+  for (const file of files) {
+    const before = pendingAttachments.length;
+    try {
+      await readAttachmentFile(file);
+    } catch (e) {
+      console.warn('Project file read failed:', file.name, e);
+    }
+    const added = pendingAttachments.splice(before);
+    added.forEach(att => {
+      const text = att.textContent || (att.file && att.file.textContent) || '';
+      if (!text) { skipped++; return; }
+      proj.docs.push({
+        id: 'doc_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+        name: att.name || (att.file && att.file.name) || 'file',
+        text: text.slice(0, PROJECT_DOC_CHAR_LIMIT),
+        createdAt: Date.now()
+      });
+    });
+  }
+  proj.updatedAt = Date.now();
+  saveProjects();
+  renderPreviews();
+  renderProjectEditor();
+  event.target.value = '';
+  if (skipped) showToast(skipped + ' file(s) skipped — no readable text (images can’t be project files).');
+}
+
 function renderSidebar() {
   const list = document.getElementById('convList');
   list.innerHTML = '';
@@ -3393,9 +3499,16 @@ function renderSidebar() {
   // Sort: pinned first (by updatedAt desc), then unpinned by updatedAt desc
   // If any have sortOrder, use that instead
   const hasSortOrder = conversations.some(c => c.sortOrder != null);
+  // Unfiled chats sort last so the existing date groups stay where they are.
+  const projectSortKey = (c) => {
+    const p = getProject(c.projectId);
+    return p ? p.name.toLowerCase() : '￿';
+  };
   const sorted = [...conversations].sort((a, b) => {
     if (a.pinned && !b.pinned) return -1;
     if (!a.pinned && b.pinned) return 1;
+    const pa = projectSortKey(a), pb = projectSortKey(b);
+    if (pa !== pb) return pa < pb ? -1 : 1;
     if (hasSortOrder && a.sortOrder != null && b.sortOrder != null) return a.sortOrder - b.sortOrder;
     return (b.updatedAt || 0) - (a.updatedAt || 0);
   });
@@ -3409,6 +3522,8 @@ function renderSidebar() {
 
   function getGroup(c) {
     if (c.pinned) return 'Pinned';
+    const p = getProject(c.projectId);
+    if (p) return '\u{1F4C1} ' + p.name;
     const t = c.updatedAt || c.createdAt || 0;
     if (t >= todayStart) return 'Today';
     if (t >= yesterdayStart) return 'Yesterday';
@@ -3423,8 +3538,26 @@ function renderSidebar() {
     if (group !== lastGroup) {
       const header = document.createElement('div');
       header.className = 'conv-group-header';
-      header.textContent = group;
       header.dataset.group = group;
+      const proj = getProject(c.projectId);
+      if (proj && !c.pinned) {
+        header.classList.add('project-header');
+        header.dataset.projectId = proj.id;
+        const label = document.createElement('span');
+        label.textContent = group;
+        label.title = 'Edit project';
+        label.onclick = () => openProjectsModal(proj.id);
+        header.appendChild(label);
+        const addBtn = document.createElement('button');
+        addBtn.className = 'project-add-btn';
+        addBtn.textContent = '+';
+        addBtn.title = 'New chat in ' + proj.name;
+        addBtn.setAttribute('aria-label', 'New chat in ' + proj.name);
+        addBtn.onclick = (e) => { e.stopPropagation(); createConversation(proj.id); };
+        header.appendChild(addBtn);
+      } else {
+        header.textContent = group;
+      }
       list.appendChild(header);
       lastGroup = group;
     }
@@ -3530,6 +3663,14 @@ function renderSidebar() {
     tagBtn.setAttribute('aria-label', 'Tag conversation');
     tagBtn.onclick = (e) => { e.stopPropagation(); showTagPicker(c, tagBtn); };
     div.appendChild(tagBtn);
+    const projBtn = document.createElement('button');
+    projBtn.className = 'conv-delete';
+    projBtn.innerHTML = '&#128193;';
+    projBtn.title = 'Project';
+    projBtn.style.fontSize = '12px';
+    projBtn.setAttribute('aria-label', 'Move conversation to a project');
+    projBtn.onclick = (e) => { e.stopPropagation(); showProjectPicker(c, projBtn); };
+    div.appendChild(projBtn);
     div.appendChild(del);
     list.appendChild(div);
   });
@@ -3667,9 +3808,54 @@ function switchSettingsTab(tabName, btn) {
   document.querySelectorAll('.settings-tab-content').forEach(t => t.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById('settingsTab-' + tabName).classList.add('active');
-  const tabs = btn.closest('.settings-tabs');
-  if (tabs && tabs.scrollWidth > tabs.clientWidth) {
-    tabs.scrollLeft = Math.max(0, btn.offsetLeft - (tabs.clientWidth - btn.offsetWidth) / 2);
+}
+
+function toggleCache(enabled) {
+  localStorage.setItem('llmCacheEnabled', enabled ? 'true' : 'false');
+  updateCacheStats();
+  showToast(enabled ? 'Response cache enabled.' : 'Response cache disabled.', 'info');
+}
+
+async function clearResponseCache() {
+  if (!confirm('Clear all cached responses?')) return;
+  try {
+    await cacheClear();
+    await updateCacheStats();
+    showToast('Response cache cleared.', 'success');
+  } catch (err) {
+    showToast('Could not clear cache: ' + (err.message || err), 'error');
+  }
+}
+
+async function cleanupExpiredCache() {
+  try {
+    const deleted = await cacheCleanupExpired();
+    await updateCacheStats();
+    showToast(deleted ? ('Removed ' + deleted + ' expired cache ' + (deleted === 1 ? 'entry.' : 'entries.')) : 'No expired cache entries.', 'info');
+  } catch (err) {
+    showToast('Cache cleanup failed: ' + (err.message || err), 'error');
+  }
+}
+
+async function updateCacheStats() {
+  const el = document.getElementById('cacheStats');
+  if (!el) return;
+  if (!db) {
+    el.textContent = 'Unavailable';
+    return;
+  }
+  el.textContent = 'Loading...';
+  try {
+    const stats = await cacheGetStats();
+    const parts = [
+      stats.count + ' ' + (stats.count === 1 ? 'entry' : 'entries'),
+      formatCacheBytes(stats.sizeBytes),
+      stats.hits + ' ' + (stats.hits === 1 ? 'hit' : 'hits')
+    ];
+    if (stats.expired) parts.push(stats.expired + ' expired');
+    el.textContent = parts.join(' | ');
+  } catch (err) {
+    el.textContent = 'Could not load';
   }
 }
 
@@ -3690,13 +3876,15 @@ function openSettings() {
   document.getElementById('setStreaming').checked = localStorage.getItem('llmStreaming') !== 'false';
   document.getElementById('setEnterSend').checked = localStorage.getItem('llmEnterSend') !== 'false';
   document.getElementById('setTemperature').value = localStorage.getItem('llmTemperature') || '';
+  document.getElementById('setMaxTokens').value = localStorage.getItem('llmMaxTokens') || '';
+  document.getElementById('setPromptCache').checked = localStorage.getItem('llmPromptCache') !== 'false';
+  document.getElementById('setThinking').checked = localStorage.getItem('llmThinking') === 'true';
+  document.getElementById('setThinkingEffort').value = localStorage.getItem('llmThinkingEffort') || '';
   document.getElementById('setInputCost').value = localStorage.getItem('llmInputCost') || '';
   document.getElementById('setOutputCost').value = localStorage.getItem('llmOutputCost') || '';
   document.getElementById('setFont').value = localStorage.getItem('assistantFont') || '';
   document.getElementById('setMsgFontSize').value = localStorage.getItem('assistantMsgFontSize') || '';
   document.getElementById('setMsgMaxWidth').value = localStorage.getItem('assistantMsgMaxWidth') || '';
-  document.getElementById('setEmotionSprites').checked = areEmotionSpritesEnabled();
-  document.getElementById('setEmotionSpriteSet').value = getEmotionSpriteSet();
   document.getElementById('setWebSearch').checked = localStorage.getItem('llmWebSearch') === 'true';
   document.getElementById('setForceSearch').checked = localStorage.getItem('llmForceSearch') === 'true';
   document.getElementById('setSearchApiUrl').value = localStorage.getItem('llmSearchApiUrl') || '';
@@ -3718,6 +3906,9 @@ function openSettings() {
   if (debugIncludeText) debugIncludeText.checked = isDebugTextIncluded();
   renderDebugLogPreview();
   renderLocalUpdateStatus();
+  const cacheEnabled = document.getElementById('cacheEnabled');
+  if (cacheEnabled) cacheEnabled.checked = isResponseCacheEnabled();
+  updateCacheStats();
   renderSyncSettings();
 
   // Presets
@@ -3789,6 +3980,10 @@ function collectProfileSettingsFromInputs() {
     llmStreaming: document.getElementById('setStreaming').checked ? 'true' : 'false',
     llmEnterSend: document.getElementById('setEnterSend').checked ? 'true' : 'false',
     llmTemperature: document.getElementById('setTemperature').value.trim(),
+    llmMaxTokens: document.getElementById('setMaxTokens').value.trim(),
+    llmPromptCache: document.getElementById('setPromptCache').checked ? 'true' : 'false',
+    llmThinking: document.getElementById('setThinking').checked ? 'true' : 'false',
+    llmThinkingEffort: document.getElementById('setThinkingEffort').value,
     llmExtraParams: document.getElementById('setExtraParams').value.trim(),
     llmExcludeParams: document.getElementById('setExcludeParams').value.trim(),
     llmPrefill: document.getElementById('setPrefill').value,
@@ -3799,8 +3994,6 @@ function collectProfileSettingsFromInputs() {
     llmCorsProxy: normalizeCorsProxyUrl(document.getElementById('setCorsProxy').value),
     llmMemoryEnabled: document.getElementById('setMemory').checked ? 'true' : 'false',
     llmHoldScreenshot: document.getElementById('setHoldScreenshot').checked ? 'true' : 'false',
-    llmEmotionSprites: document.getElementById('setEmotionSprites').checked ? 'true' : 'false',
-    llmEmotionSpriteSet: document.getElementById('setEmotionSpriteSet').value,
     llmInputCost: document.getElementById('setInputCost').value.trim(),
     llmOutputCost: document.getElementById('setOutputCost').value.trim(),
     llmEnableStMacros: document.getElementById('setEnableStMacros').checked ? 'true' : 'false',
@@ -3815,6 +4008,10 @@ function applyProfileToInputs(settings) {
   document.getElementById('setStreaming').checked = settings.llmStreaming !== 'false';
   document.getElementById('setEnterSend').checked = settings.llmEnterSend !== 'false';
   document.getElementById('setTemperature').value = settings.llmTemperature || '';
+  document.getElementById('setMaxTokens').value = settings.llmMaxTokens || '';
+  document.getElementById('setPromptCache').checked = settings.llmPromptCache !== 'false';
+  document.getElementById('setThinking').checked = settings.llmThinking === 'true';
+  document.getElementById('setThinkingEffort').value = settings.llmThinkingEffort || '';
   document.getElementById('setExtraParams').value = settings.llmExtraParams || '';
   document.getElementById('setExcludeParams').value = settings.llmExcludeParams || '';
   document.getElementById('setPrefill').value = settings.llmPrefill || '';
@@ -3825,8 +4022,6 @@ function applyProfileToInputs(settings) {
   document.getElementById('setCorsProxy').value = normalizeCorsProxyUrl(settings.llmCorsProxy);
   document.getElementById('setMemory').checked = parseEnabledSetting(settings.llmMemoryEnabled);
   document.getElementById('setHoldScreenshot').checked = settings.llmHoldScreenshot === 'true';
-  document.getElementById('setEmotionSprites').checked = settings.llmEmotionSprites === 'true';
-  document.getElementById('setEmotionSpriteSet').value = settings.llmEmotionSpriteSet || 'auto';
   document.getElementById('setInputCost').value = settings.llmInputCost || '';
   document.getElementById('setOutputCost').value = settings.llmOutputCost || '';
   document.getElementById('setEnableStMacros').checked = settings.llmEnableStMacros === 'true';
@@ -3947,6 +4142,10 @@ function saveSettings() {
   localStorage.setItem('llmEnterSend', document.getElementById('setEnterSend').checked ? 'true' : 'false');
   const tempVal = document.getElementById('setTemperature').value.trim();
   localStorage.setItem('llmTemperature', tempVal);
+  localStorage.setItem('llmMaxTokens', document.getElementById('setMaxTokens').value.trim());
+  localStorage.setItem('llmPromptCache', document.getElementById('setPromptCache').checked ? 'true' : 'false');
+  localStorage.setItem('llmThinking', document.getElementById('setThinking').checked ? 'true' : 'false');
+  localStorage.setItem('llmThinkingEffort', document.getElementById('setThinkingEffort').value);
   localStorage.setItem('llmInputCost', document.getElementById('setInputCost').value.trim());
   localStorage.setItem('llmOutputCost', document.getElementById('setOutputCost').value.trim());
   localStorage.setItem('llmWebSearch', document.getElementById('setWebSearch').checked ? 'true' : 'false');
@@ -3956,9 +4155,6 @@ function saveSettings() {
   localStorage.setItem('llmCorsProxy', normalizeCorsProxyUrl(document.getElementById('setCorsProxy').value));
   localStorage.setItem('llmMemoryEnabled', document.getElementById('setMemory').checked ? 'true' : 'false');
   localStorage.setItem('llmHoldScreenshot', document.getElementById('setHoldScreenshot').checked ? 'true' : 'false');
-  localStorage.setItem('llmEmotionSprites', document.getElementById('setEmotionSprites').checked ? 'true' : 'false');
-  localStorage.setItem('llmEmotionSpriteSet', document.getElementById('setEmotionSpriteSet').value);
-  if (!streaming) renderMessages({ preserveScroll: true });
   setDebugPreference();
   syncSaveSettings(false);
 
@@ -4254,6 +4450,7 @@ function renderPromptEntries() {
     const div = document.createElement('div');
     div.className = 'prompt-entry' + (entry.enabled ? '' : ' disabled');
     div.dataset.peId = entry.id;
+    div.draggable = true;
 
     // Drag-and-drop
     div.addEventListener('dragstart', (e) => {
@@ -4285,7 +4482,6 @@ function renderPromptEntries() {
     const drag = document.createElement('span');
     drag.className = 'drag-handle';
     drag.textContent = '☰';
-    drag.draggable = true;
 
     const toggle = document.createElement('input');
     toggle.type = 'checkbox';
@@ -4412,6 +4608,19 @@ async function buildSystemMessages(conv) {
     const content = resolveText(entry.content);
     if (entry.enabled && typeof content === 'string' && content.trim()) msgs.push({ role: 'system', content });
   });
+  // Project instructions and files. Sits after prompt entries (which are the user's
+  // global system prompt and are never overridden) but before the empty fallback below,
+  // so a project with instructions suppresses "You are a helpful assistant."
+  // Macros are applied to instructions only — resolving them inside a source file would
+  // silently rewrite any {{...}} the file happens to contain.
+  const project = getProject(conv && conv.projectId);
+  if (project) {
+    if (project.instructions && project.instructions.trim()) {
+      msgs.push({ role: 'system', content: 'Project instructions (' + project.name + '):\n\n' + resolveText(project.instructions) });
+    }
+    const projectFiles = projectDocsSystemText(project);
+    if (projectFiles) msgs.push({ role: 'system', content: projectFiles });
+  }
   // Fallback if completely empty
   if (msgs.length === 0) {
     msgs.push({ role: 'system', content: 'You are a helpful assistant.' });
@@ -4436,7 +4645,6 @@ async function buildSystemMessages(conv) {
   // Memory prompt
   const mem = await getMemoryPrompt();
   if (mem) msgs.push({ role: 'system', content: mem });
-  if (areEmotionSpritesEnabled()) msgs.push({ role: 'system', content: buildEmotionSpriteInstructions() });
   return msgs;
 }
 
@@ -4455,11 +4663,9 @@ function maybeAddAvatar(wrapper) {
   }
 }
 
-function renderMessages({ preserveScroll = false } = {}) {
+function renderMessages() {
   closeChatSearch();
   const area = document.getElementById('messagesArea');
-  const wasAtBottom = area.scrollHeight - area.scrollTop - area.clientHeight <= 4;
-  const savedScrollTop = preserveScroll && !wasAtBottom ? area.scrollTop : null;
   area.innerHTML = '';
 
   if (messages.length === 0) {
@@ -4543,6 +4749,13 @@ function renderMessages({ preserveScroll = false } = {}) {
     actions.appendChild(copyBtn);
 
     if (msg.role === 'assistant') {
+      const speakBtn = document.createElement('button');
+      speakBtn.className = 'msg-action-btn';
+      speakBtn.textContent = 'Speak';
+      speakBtn.setAttribute('aria-label', 'Read message aloud');
+      speakBtn.onclick = () => speakMessage(msg, speakBtn);
+      actions.appendChild(speakBtn);
+
       const toolData = msg.swipeToolUse && msg.swipeToolUse[msg.swipeIndex];
       const hasSources = toolData && toolData.some(tb =>
         (tb.type === 'url_fetch' && (tb.content || tb.url)) ||
@@ -4686,7 +4899,7 @@ function renderMessages({ preserveScroll = false } = {}) {
     area.appendChild(wrapper);
   });
 
-  area.scrollTop = savedScrollTop === null ? area.scrollHeight : savedScrollTop;
+  area.scrollTop = area.scrollHeight;
   updateSendBtnState();
 
   // Restore select mode state if active
@@ -4778,7 +4991,7 @@ function renderEditMode(area, msg, idx) {
     const newBranch = JSON.parse(JSON.stringify(messages.slice(idx)));
     msg.branches[msg.branchIndex] = newBranch;
     saveConversations();
-    renderMessages({ preserveScroll: true });
+    renderMessages();
   };
 
   editActions.appendChild(cancelBtn);
@@ -4793,9 +5006,8 @@ async function resendAfterEdit() {
   const conv = getActiveConv();
   if (!proxyUrl || !apiKey) return;
 
-  const assistantMsg = syncCreateMessage('assistant', { content: '', swipes: [''], swipeIndex: 0 });
+  const assistantMsg = { role: 'assistant', content: '', swipes: [''], swipeIndex: 0, timestamp: Date.now() };
   messages.push(assistantMsg);
-  saveConversations();
 
   const area = document.getElementById('messagesArea');
   const wrapper = document.createElement('div');
@@ -4813,10 +5025,14 @@ async function resendAfterEdit() {
 
   await streamResponse(apiMessages, assistantMsg, 0, bubble, null, null);
 
-  extractMemories(apiMessages);
+  if (assistantMsg._responseCacheHit) {
+    delete assistantMsg._responseCacheHit;
+  } else {
+    extractMemories(apiMessages);
+  }
   if (conv) conv.updatedAt = Date.now();
   saveConversations();
-  renderMessages({ preserveScroll: true });
+  renderMessages();
   updateTokenInfo();
 }
 
@@ -4829,7 +5045,7 @@ function swipeMsg(idx, dir) {
   msg.swipeIndex = Math.max(0, Math.min(msg.swipes.length - 1, msg.swipeIndex + dir));
   msg.content = msg.swipes[msg.swipeIndex];
   if (msg.swipeImages) msg.images = msg.swipeImages[msg.swipeIndex] || [];
-  saveConversations();
+  debouncedSave();
   renderMessages();
   updateTokenInfo();
 }
@@ -4850,7 +5066,7 @@ function switchBranch(msgIdx, dir) {
   const branch = JSON.parse(JSON.stringify(msg.branches[msg.branchIndex]));
   messages.length = msgIdx;
   branch.forEach(m => messages.push(m));
-  saveConversations();
+  debouncedSave();
   renderMessages();
   updateTokenInfo();
 }
@@ -5393,6 +5609,29 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
   try { extra = JSON.parse(localStorage.getItem('llmExtraParams') || '{}'); } catch(e) { console.warn('Extra params parse error:', e); }
   const exclude = (localStorage.getItem('llmExcludeParams') || '').split(',').map(s => s.trim()).filter(Boolean);
 
+  let responseCacheKey = '';
+  let responseCacheUserMessage = null;
+  let responseCacheSystemMessages = [];
+  if (isResponseCacheEnabled() && !prefixText) {
+    try {
+      const cacheParts = getResponseCacheRequestParts(apiMessages);
+      responseCacheUserMessage = cacheParts.userMessage;
+      responseCacheSystemMessages = cacheParts.systemMessages;
+      if (responseCacheUserMessage) {
+        responseCacheKey = await generateCacheKey(responseCacheUserMessage, model, responseCacheSystemMessages);
+        const cached = await cacheLookup(responseCacheKey);
+        if (cached) {
+          restoreCachedResponse(cached, assistantMsg, swipeIdx, bubbleEl);
+          showToast('Loaded cached response.', 'success');
+          return;
+        }
+      }
+    } catch (cacheErr) {
+      console.warn('Response cache lookup failed:', cacheErr);
+      responseCacheKey = '';
+    }
+  }
+
   abortController = new AbortController();
   streaming = true;
   userScrolledAway = false;
@@ -5416,8 +5655,11 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     let url, headers, body;
     const useStream = localStorage.getItem('llmStreaming') !== 'false';
 
-    // Assistant prefill
-    const prefill = localStorage.getItem('llmPrefill') || '';
+    // Assistant prefill. A trailing assistant turn is rejected with a 400 by Claude 4.6
+    // and later, so skip it there rather than failing every request; the settings field
+    // carries a matching note.
+    const prefillBlocked = format === 'anthropic' && /opus-5|sonnet-5|opus-4-[678]|sonnet-4-6|fable-5|mythos-5/i.test(model);
+    const prefill = prefillBlocked ? '' : (localStorage.getItem('llmPrefill') || '');
     if (prefill && !prefixText) {
       apiMessages.push({ role: 'assistant', content: prefill });
       fullText = prefill;
@@ -5431,7 +5673,20 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
         'anthropic-version': '2023-06-01'
       };
       const prepared = prepareAnthropicMessages(apiMessages);
-      body = { model, system: prepared.system, messages: prepared.messages, max_tokens: 4096, stream: useStream, ...extra };
+      const thinkingOn = localStorage.getItem('llmThinking') === 'true';
+      const thinkingEffort = localStorage.getItem('llmThinkingEffort') || '';
+      body = {
+        model,
+        system: prepared.system,
+        messages: prepared.messages,
+        max_tokens: resolveMaxTokens(),
+        stream: useStream,
+        // Adaptive thinking only. budget_tokens is rejected by Opus 4.7+ / Sonnet 5 /
+        // Fable 5; display defaults to "omitted" there, which renders an empty pane.
+        ...(thinkingOn ? { thinking: { type: 'adaptive', display: 'summarized' } } : {}),
+        ...(thinkingEffort ? { output_config: { effort: thinkingEffort } } : {}),
+        ...extra
+      };
       if (resolveWebSearchEnabled()) {
         body.tools = (body.tools || []).concat([
           { type: 'web_search_20250305', name: 'web_search', max_uses: 20 },
@@ -5441,6 +5696,13 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
           body.tool_choice = { type: 'any' };
           body.system = (body.system || '') + '\n\nIMPORTANT: You MUST call the web_search tool to look up information before answering. Do NOT answer from memory or training data. Always search first, then synthesize your answer from the results.';
         }
+      }
+      // Prompt caching. Must run AFTER the force-search concat above, which appends to
+      // body.system as a string. Breakpoint goes on the system block only: `system`
+      // survives the { ...body } spreads into tool follow-up requests, whereas a
+      // breakpoint on the last message would go stale as soon as `messages` is replaced.
+      if (typeof body.system === 'string' && body.system && localStorage.getItem('llmPromptCache') !== 'false') {
+        body.system = [{ type: 'text', text: body.system, cache_control: { type: 'ephemeral' } }];
       }
     } else {
       url = baseUrl + '/chat/completions';
@@ -5494,6 +5756,12 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     if (!('temperature' in body)) {
       const temp = parseFloat(localStorage.getItem('llmTemperature'));
       if (!isNaN(temp)) body.temperature = temp;
+    }
+    // Sampling params are rejected with a 400 by current Claude models. This block runs
+    // for both API formats, so without the strip a saved temperature breaks every
+    // request on those models with no hint as to why.
+    if (format === 'anthropic' && NO_SAMPLING_PARAMS_RE.test(model)) {
+      delete body.temperature; delete body.top_p; delete body.top_k;
     }
     exclude.forEach(k => delete body[k]);
     debugLogPayload('API request', body, { url, format, model });
@@ -5760,7 +6028,6 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       fullText = stripped.content;
       assistantMsg.swipes[swipeIdx] = fullText;
       assistantMsg.content = fullText;
-      debouncedSave();
       if (thinkingText) {
         assistantMsg.swipeThinking = assistantMsg.swipeThinking || [];
         assistantMsg.swipeThinking[swipeIdx] = thinkingText;
@@ -5781,7 +6048,6 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       const renderStreamProgress = () => {
         assistantMsg.swipes[swipeIdx] = fullText;
         assistantMsg.content = fullText;
-        debouncedSave();
         const now = Date.now();
         if (now - lastRender > 80) {
           const msgsArea = document.getElementById('messagesArea');
@@ -6042,7 +6308,6 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
 
         assistantMsg.swipes[swipeIdx] = fullText;
         assistantMsg.content = fullText;
-        debouncedSave();
         const now = Date.now();
         if (now - lastRender > 80) {
           // Preserve scroll position when user has scrolled away
@@ -6253,7 +6518,6 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             }
             assistantMsg.swipes[swipeIdx] = fullText;
             assistantMsg.content = fullText;
-            debouncedSave();
             const now2 = Date.now();
             if (now2 - lastRender > 80) {
               const msgsArea2 = document.getElementById('messagesArea');
@@ -6271,7 +6535,11 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
         if (!fullText && pendingAnthropicToolCalls.length === 0) {
           try {
             const recoveryBody = { ...body, messages: followUpMessages, stream: true };
-            recoveryBody.system = [body.system, TOOL_FINAL_ANSWER_NUDGE].filter(Boolean).join('\n\n');
+            // body.system may be a cache_control block array — append a second block
+            // rather than string-joining it, which would stringify to "[object Object]".
+            recoveryBody.system = Array.isArray(body.system)
+              ? body.system.concat([{ type: 'text', text: TOOL_FINAL_ANSWER_NUDGE }])
+              : [body.system, TOOL_FINAL_ANSWER_NUDGE].filter(Boolean).join('\n\n');
             delete recoveryBody.tools;
             delete recoveryBody.tool_choice;
             exclude.forEach(k => delete recoveryBody[k]);
@@ -6366,7 +6634,6 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
                 }
                 assistantMsg.swipes[swipeIdx] = fullText;
                 assistantMsg.content = fullText;
-                debouncedSave();
                 const now = Date.now();
                 if (now - lastRender > 80) {
                   bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
@@ -6497,7 +6764,6 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
           }
           assistantMsg.swipes[swipeIdx] = fullText;
           assistantMsg.content = fullText;
-          debouncedSave();
           const now2 = Date.now();
           if (now2 - lastRender > 80) {
             const msgsArea2 = document.getElementById('messagesArea');
@@ -6548,7 +6814,6 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       fullText = stripped.content;
       assistantMsg.swipes[swipeIdx] = fullText;
       assistantMsg.content = fullText;
-      debouncedSave();
       if (streamImages.length) {
         assistantMsg.swipeImages = assistantMsg.swipeImages || [];
         assistantMsg.swipeImages[swipeIdx] = streamImages;
@@ -6574,6 +6839,25 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       }
       _suppressScrollFlag = false;
     }
+    if (responseCacheKey && fullText && !abortController?.signal?.aborted) {
+      try {
+        await cacheStore(buildResponseCacheEntry(
+          responseCacheKey,
+          responseCacheUserMessage,
+          responseCacheSystemMessages,
+          model,
+          format,
+          fullText,
+          thinkingText,
+          toolBlocks,
+          assistantMsg,
+          swipeIdx
+        ));
+        debugLog('Response cached', { model, format, cacheKey: responseCacheKey });
+      } catch (cacheErr) {
+        console.warn('Response cache storage failed:', cacheErr);
+      }
+    }
   } catch (e) {
     if (e.name === 'AbortError') {
       if (!fullText) fullText = '(stopped)';
@@ -6585,7 +6869,6 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     fullText = strippedErr.content;
     assistantMsg.swipes[swipeIdx] = fullText;
     assistantMsg.content = fullText;
-    saveConversations();
     if (thinkingText) {
       assistantMsg.swipeThinking = assistantMsg.swipeThinking || [];
       assistantMsg.swipeThinking[swipeIdx] = thinkingText;
@@ -6710,7 +6993,7 @@ async function sendMessage() {
       userContent = text;
     }
 
-    const userMsg = syncCreateMessage('user', { content: userContent });
+    const userMsg = { role: 'user', content: userContent, timestamp: Date.now() };
     updateMessageTokenMetadata(userMsg);
     messages.push(userMsg);
     input.value = '';
@@ -6726,9 +7009,8 @@ async function sendMessage() {
 
   renderMessages();
 
-  const assistantMsg = syncCreateMessage('assistant', { content: '', swipes: [''], swipeIndex: 0 });
+  const assistantMsg = { role: 'assistant', content: '', swipes: [''], swipeIndex: 0, timestamp: Date.now() };
   messages.push(assistantMsg);
-  saveConversations();
 
   const area = document.getElementById('messagesArea');
   const wrapper = document.createElement('div');
@@ -6750,10 +7032,14 @@ async function sendMessage() {
 
   await streamResponse(apiMessages, assistantMsg, 0, bubble, overrideModel, null);
 
-  extractMemories(apiMessages);
+  if (assistantMsg._responseCacheHit) {
+    delete assistantMsg._responseCacheHit;
+  } else {
+    extractMemories(apiMessages);
+  }
   if (conv) conv.updatedAt = Date.now();
-  saveConversations();
-  renderMessages({ preserveScroll: true });
+  debouncedSave();
+  renderMessages();
   updateTokenInfo();
 }
 
@@ -6773,7 +7059,6 @@ async function regenerate() {
   msg.swipes.push('');
   msg.swipeIndex = msg.swipes.length - 1;
   msg.content = '';
-  saveConversations();
   renderMessages();
 
   const area = document.getElementById('messagesArea');
@@ -6789,10 +7074,11 @@ async function regenerate() {
   }
 
   await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, null);
+  if (msg._responseCacheHit) delete msg._responseCacheHit;
 
   if (conv) conv.updatedAt = Date.now();
-  saveConversations();
-  renderMessages({ preserveScroll: true });
+  debouncedSave();
+  renderMessages();
   updateTokenInfo();
 }
 
@@ -6825,10 +7111,11 @@ async function continueMessage() {
   const bubble = lastWrapper.querySelector('.msg-bubble');
 
   await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, existingText);
+  if (msg._responseCacheHit) delete msg._responseCacheHit;
 
   if (conv) conv.updatedAt = Date.now();
-  saveConversations();
-  renderMessages({ preserveScroll: true });
+  debouncedSave();
+  renderMessages();
   updateTokenInfo();
 }
 
@@ -6871,6 +7158,8 @@ function exportConversation() {
 function exportAllConversations() {
   const data = {
     conversations: conversations,
+    // Advertised as a full backup, so project instructions and files ride along too.
+    projects: projects,
     exportedAt: new Date().toISOString(),
     settings: {
       model: localStorage.getItem('llmModel') || '',
@@ -6900,6 +7189,16 @@ function importConversation(event) {
       // Handle bulk export format { conversations: [...] }
       if (data.conversations && Array.isArray(data.conversations)) {
         let count = 0;
+        // Restore projects first so imported conversations resolve their projectId.
+        // Existing projects win on id collision — an import shouldn't clobber local edits.
+        if (Array.isArray(data.projects)) {
+          data.projects.forEach(p => {
+            if (p && p.id && !getProject(p.id)) {
+              projects.push({ ...p, docs: Array.isArray(p.docs) ? p.docs : [] });
+            }
+          });
+          saveProjects();
+        }
         data.conversations.forEach(conv => {
           conv.id = conv.id || genId();
           conv.createdAt = conv.createdAt || Date.now();
@@ -6960,25 +7259,6 @@ function syncGetDeviceId() {
   return id;
 }
 
-function syncGetDeviceLabel() {
-  let label = localStorage.getItem('assistantSyncDeviceLabel') || '';
-  if (!label) {
-    const isPhone = /Android|iPhone|iPod|Windows Phone/i.test(navigator.userAgent || '')
-      || (window.matchMedia?.('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 820);
-    label = isPhone ? 'Phone' : 'PC';
-    localStorage.setItem('assistantSyncDeviceLabel', label);
-  }
-  return label;
-}
-
-function syncGetStoredConfig() {
-  return {
-    token: localStorage.getItem('assistantSyncGistToken') || '',
-    gistId: localStorage.getItem('assistantSyncGistId') || '',
-    passphrase: localStorage.getItem('assistantSyncPassphrase') || ''
-  };
-}
-
 function syncGetConfigFromInputs() {
   const tokenEl = document.getElementById('setSyncToken');
   const gistEl = document.getElementById('setSyncGistId');
@@ -6991,23 +7271,10 @@ function syncGetConfigFromInputs() {
 }
 
 function syncSaveSettings(showSavedToast = true) {
-  const previous = syncGetStoredConfig();
   const cfg = syncGetConfigFromInputs();
-  if (previous.gistId && previous.gistId === cfg.gistId && previous.passphrase && previous.passphrase !== cfg.passphrase) {
-    const passEl = document.getElementById('setSyncPassphrase');
-    if (passEl) passEl.value = previous.passphrase;
-    if (showSavedToast) showToast('Create a new sync Gist before changing its passphrase.', 'error');
-    return previous;
-  }
   syncSetStoredValue('assistantSyncGistToken', cfg.token);
   syncSetStoredValue('assistantSyncGistId', cfg.gistId);
   syncSetStoredValue('assistantSyncPassphrase', cfg.passphrase);
-  if (previous.gistId !== cfg.gistId || previous.passphrase !== cfg.passphrase) {
-    syncState.lastRevision = '';
-    syncState.lastEtag = '';
-    syncState.baseHashes = null;
-    syncMarkDirty('sync destination changed');
-  }
   renderSyncSettings();
   if (showSavedToast) showToast('Sync settings saved.', 'success');
   return cfg;
@@ -7016,90 +7283,43 @@ function syncSaveSettings(showSavedToast = true) {
 function syncSetStatus(state, message, details) {
   const status = document.getElementById('syncStatus');
   const detailsEl = document.getElementById('syncDetails');
-  const quick = document.getElementById('syncQuickStatus');
-  const indicator = document.getElementById('syncIndicator');
-  const quickButton = document.getElementById('syncQuickButton');
   if (status) {
     status.textContent = message || 'Not configured';
     status.className = 'debug-status-pill ' + (state || 'unknown');
   }
   if (detailsEl) detailsEl.textContent = details || '';
-  if (quick) quick.textContent = message || 'Sync status';
-  if (indicator) {
-    indicator.hidden = !syncGetStoredConfig().token || !syncGetStoredConfig().passphrase;
-    indicator.className = 'sync-indicator ' + (state || 'unknown');
-    indicator.title = details || message || 'Sync status';
-  }
-  if (quickButton) quickButton.disabled = state === 'checking';
-}
-
-function syncReviewCount() {
-  let count = 0;
-  [...conversations, ...conversationTombstones].forEach(conversation => {
-    if (conversation.reviewLater && conversation.conflictVersions?.length) count++;
-    [...(conversation.messages || []), ...(conversation.messageTombstones || [])].forEach(message => {
-      if (message.reviewLater && message.conflictVersions?.length) count++;
-    });
-  });
-  memoryRecords.forEach(memory => {
-    if (memory.reviewLater && memory.conflictVersions?.length) count++;
-  });
-  return count;
-}
-
-function syncRenderReviewStatus() {
-  const row = document.getElementById('syncReviewRow');
-  const text = document.getElementById('syncReviewCount');
-  const count = syncReviewCount();
-  if (row) row.hidden = count === 0;
-  if (text) text.textContent = 'Review later: ' + count;
-}
-
-function syncSizeWarningText() {
-  return syncState.lastSizeBytes >= SYNC_SIZE_WARNING_BYTES
-    ? ' Encrypted sync data is ' + formatBytes(syncState.lastSizeBytes) + ', approaching the practical Gist limit.'
-    : '';
-}
-
-function syncRefreshStatus() {
-  const token = localStorage.getItem('assistantSyncGistToken') || '';
-  const gistId = localStorage.getItem('assistantSyncGistId') || '';
-  const passphrase = localStorage.getItem('assistantSyncPassphrase') || '';
-  syncRenderReviewStatus();
-
-  if (!token || !passphrase) {
-    syncSetStatus('unknown', 'Sync not configured', 'Add a GitHub token and sync passphrase. They stay on this device.');
-  } else if (!gistId) {
-    syncSetStatus('dirty', 'Changes waiting', 'Sync now will create a private encrypted Gist.');
-  } else if (syncState.paused) {
-    syncSetStatus('paused', 'Sync paused', (syncState.pauseReason || 'Your changes are safe on this device.') + syncSizeWarningText());
-  } else if (!navigator.onLine && syncState.dirty) {
-    syncSetStatus('offline', 'Offline with changes waiting', 'Local chat remains available and sync will resume when online.');
-  } else if (syncState.dirty) {
-    syncSetStatus('dirty', 'Changes waiting', 'Automatic sync is queued.' + syncSizeWarningText());
-  } else if (syncState.lastSyncedAt) {
-    syncSetStatus('current', 'Synced ' + formatRelativeTime(syncState.lastSyncedAt), 'Last synced ' + new Date(syncState.lastSyncedAt).toLocaleString() + '.' + syncSizeWarningText());
-  } else {
-    syncSetStatus('current', 'Sync ready', 'Private encrypted Gist configured.');
-  }
 }
 
 function renderSyncSettings() {
   const tokenEl = document.getElementById('setSyncToken');
   const gistEl = document.getElementById('setSyncGistId');
   const passEl = document.getElementById('setSyncPassphrase');
-  if (tokenEl && document.activeElement !== tokenEl) tokenEl.value = localStorage.getItem('assistantSyncGistToken') || '';
-  if (gistEl && document.activeElement !== gistEl) gistEl.value = localStorage.getItem('assistantSyncGistId') || '';
-  if (passEl && document.activeElement !== passEl) passEl.value = localStorage.getItem('assistantSyncPassphrase') || '';
-  const deviceLabel = document.getElementById('syncDeviceLabel');
-  if (deviceLabel) deviceLabel.textContent = 'This device: ' + syncGetDeviceLabel();
-  syncRefreshStatus();
+  if (tokenEl) tokenEl.value = localStorage.getItem('assistantSyncGistToken') || '';
+  if (gistEl) gistEl.value = localStorage.getItem('assistantSyncGistId') || '';
+  if (passEl) passEl.value = localStorage.getItem('assistantSyncPassphrase') || '';
+
+  const token = localStorage.getItem('assistantSyncGistToken') || '';
+  const gistId = localStorage.getItem('assistantSyncGistId') || '';
+  const passphrase = localStorage.getItem('assistantSyncPassphrase') || '';
+  const lastPush = Number(localStorage.getItem('assistantSyncLastPushAt') || 0);
+  const lastPull = Number(localStorage.getItem('assistantSyncLastPullAt') || 0);
+  const lastParts = [];
+  if (lastPush) lastParts.push('last push ' + formatRelativeTime(lastPush));
+  if (lastPull) lastParts.push('last pull ' + formatRelativeTime(lastPull));
+
+  if (!token || !passphrase) {
+    syncSetStatus('unknown', 'Not configured', 'Add a GitHub token and sync passphrase before pushing or pulling.');
+  } else if (!gistId) {
+    syncSetStatus('checking', 'Ready to create', 'Push now will create a private encrypted Gist.');
+  } else {
+    syncSetStatus('current', 'Configured', 'Gist ' + gistId + (lastParts.length ? ' | ' + lastParts.join(' | ') : ''));
+  }
 }
 
 function syncValidateConfig(cfg, requireGist = false) {
   if (!cfg.token) throw new Error('GitHub token is required.');
   if (!cfg.passphrase) throw new Error('Sync passphrase is required.');
-  if (requireGist && !cfg.gistId) throw new Error('Gist ID is required. Sync once to create a Gist or paste a pairing code.');
+  if (requireGist && !cfg.gistId) throw new Error('Gist ID is required. Push once to create a Gist or paste a pairing code.');
 }
 
 function syncRequireCrypto() {
@@ -7239,28 +7459,6 @@ async function fetchGist(url, options = {}, token = '') {
   return response.json();
 }
 
-async function syncFetchGistState(cfg, conditional = false) {
-  const headers = {
-    Accept: 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28',
-    Authorization: 'Bearer ' + cfg.token
-  };
-  if (conditional && syncState.lastEtag) headers['If-None-Match'] = syncState.lastEtag;
-  const response = await fetch(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), {
-    cache: 'no-store',
-    headers
-  });
-  if (response.status === 304) return { notModified: true, gist: null, etag: syncState.lastEtag, revision: syncState.lastRevision };
-  if (!response.ok) throw new Error(syncFormatGistError(response, await response.text()));
-  const gist = await response.json();
-  return {
-    notModified: false,
-    gist,
-    etag: response.headers.get('ETag') || '',
-    revision: gist.history?.[0]?.version || gist.updated_at || ''
-  };
-}
-
 async function fetchGistRawText(url) {
   const response = await fetch(url, { cache: 'no-store' });
   if (!response.ok) throw new Error(syncFormatGistError(response, await response.text()));
@@ -7275,919 +7473,359 @@ async function syncGetGistFileContent(gist, filename) {
   throw new Error('Gist file is truncated and has no raw URL: ' + filename);
 }
 
-async function syncReadManifest(gist) {
-  let content;
-  try {
-    content = await syncGetGistFileContent(gist, 'manifest.json');
-  } catch (error) {
-    const manifestError = new Error('Could not read the Synapse sync manifest: ' + error.message + ' The Gist was not changed.');
-    manifestError.name = 'SyncManifestError';
-    throw manifestError;
-  }
-  let manifest;
-  try {
-    manifest = JSON.parse(content);
-  } catch (error) {
-    const manifestError = new Error('The Synapse sync manifest contains invalid JSON. The Gist was not changed.');
-    manifestError.name = 'SyncManifestError';
-    throw manifestError;
-  }
-  if (!manifest || manifest.app !== 'Synapse') {
-    const manifestError = new Error('The Gist manifest does not identify a Synapse sync snapshot. The Gist was not changed.');
-    manifestError.name = 'SyncManifestError';
-    throw manifestError;
-  }
-  if (!['gist-sync-v1', 'gist-sync-v2'].includes(manifest.schema)) {
-    const manifestError = new Error('Unsupported Synapse sync schema: ' + (manifest.schema || 'missing') + '. The Gist was not changed.');
-    manifestError.name = 'SyncManifestError';
-    throw manifestError;
+async function syncReadManifest(gist, token) {
+  const content = await syncGetGistFileContent(gist, 'manifest.json', token);
+  const manifest = JSON.parse(content);
+  if (!manifest || manifest.app !== 'Synapse' || manifest.schema !== 'gist-sync-v1') {
+    throw new Error('This Gist does not look like a Synapse sync Gist.');
   }
   return manifest;
 }
 
 function syncConversationFileName(id) {
-  return 'conv_' + syncBytesToBase64Url(new TextEncoder().encode(String(id || 'unknown'))) + '.json.enc';
+  const safeId = String(id || 'unknown').replace(/[^A-Za-z0-9_-]/g, '_');
+  return (safeId.startsWith('conv_') ? safeId : 'conv_' + safeId) + '.json.enc';
 }
 
 function syncCloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function syncNormalizeSnapshot(snapshot) {
-  const normalized = {
-    version: 2,
-    conversations: [],
-    memories: normalizeMemoryList(snapshot?.memories || []).memories
-  };
-  (snapshot?.conversations || []).forEach((conversation, index) => {
-    const cleaned = syncSanitizeConversationForRemote(conversation);
-    normalized.conversations.push(syncNormalizeConversationRecord(cleaned, index));
+function syncNormalizeConversation(conv) {
+  const normalized = conv && typeof conv === 'object' ? syncCloneJson(conv) : {};
+  normalized.id = normalized.id || genId();
+  normalized.title = normalized.title || 'Untitled Chat';
+  normalized.createdAt = Number(normalized.createdAt) || Date.now();
+  normalized.updatedAt = Number(normalized.updatedAt) || normalized.createdAt || Date.now();
+  normalized.messages = Array.isArray(normalized.messages) ? normalized.messages : [];
+  normalized.messages.forEach(m => {
+    if (m.role === 'assistant' && !m.swipes) {
+      m.swipes = [typeof m.content === 'string' ? m.content : ''];
+      m.swipeIndex = 0;
+    }
   });
-  normalized.conversations.sort((a, b) => String(a.id).localeCompare(String(b.id)));
-  normalized.conversations.forEach(conversation => {
-    conversation.messages.sort((a, b) =>
-      (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0) || String(a.id).localeCompare(String(b.id))
-    );
-    conversation.messageTombstones.sort((a, b) => String(a.id).localeCompare(String(b.id)));
-  });
-  normalized.memories.sort((a, b) => String(a.id).localeCompare(String(b.id)));
   return normalized;
 }
 
-async function syncGetLocalSnapshot() {
+function syncScrubProfileSecrets(profile) {
+  if (!profile || typeof profile !== 'object') return {};
+  const cleaned = syncCloneJson(profile);
+  if (!cleaned || typeof cleaned !== 'object') return {};
+  if (cleaned.settings && typeof cleaned.settings === 'object') {
+    SYNC_PROFILE_SECRET_KEYS.forEach(key => delete cleaned.settings[key]);
+  }
+  return cleaned;
+}
+
+function syncPreserveLocalProfileSecrets(remoteProfiles) {
+  const localById = new Map(loadProfiles().map(profile => [profile.id, profile]));
+  return remoteProfiles.map(profile => {
+    const cleaned = syncScrubProfileSecrets(profile);
+    const local = localById.get(cleaned.id);
+    if (!local?.settings) return cleaned;
+    cleaned.settings = cleaned.settings && typeof cleaned.settings === 'object' ? cleaned.settings : {};
+    SYNC_PROFILE_SECRET_KEYS.forEach(key => {
+      if (!cleaned.settings[key] && local.settings[key]) cleaned.settings[key] = local.settings[key];
+    });
+    return cleaned;
+  });
+}
+
+function syncCollectSettings() {
+  const settings = {};
+  SYNC_SETTINGS_KEYS.forEach(key => {
+    const value = localStorage.getItem(key);
+    if (value === null) return;
+    if (key === 'assistantProfiles') {
+      try {
+        const profiles = JSON.parse(value);
+        settings[key] = JSON.stringify(Array.isArray(profiles) ? profiles.map(syncScrubProfileSecrets) : []);
+      } catch(e) {
+        settings[key] = '[]';
+      }
+      return;
+    }
+    settings[key] = value;
+  });
+  return settings;
+}
+
+function syncApplySettings(settings) {
+  if (!settings || typeof settings !== 'object') return;
+  SYNC_SETTINGS_KEYS.forEach(key => {
+    if (!Object.prototype.hasOwnProperty.call(settings, key)) {
+      return;
+    }
+    let value = settings[key];
+    if (key === 'assistantProfiles') {
+      try {
+        const profiles = JSON.parse(value || '[]');
+        value = JSON.stringify(Array.isArray(profiles) ? syncPreserveLocalProfileSecrets(profiles) : []);
+      } catch(e) {
+        value = '[]';
+      }
+    }
+    if (value === null || value === undefined) localStorage.removeItem(key);
+    else localStorage.setItem(key, String(value));
+  });
+  applyTheme(localStorage.getItem('assistantTheme') || 'dark');
+  loadCustomFont(localStorage.getItem('assistantFont') || '');
+  applyMsgOverrides();
+  renderPromptEntries();
+  loadPresets();
+  renderProfileSelect();
+  renderProfileSummary();
+}
+
+async function syncBuildGistFiles(passphrase, existingManifest = null) {
   clearTimeout(_saveDebounceTimer);
-  _saveDebounceTimer = null;
-  saveConversations();
-  await loadMemories();
-  return syncNormalizeSnapshot({
-    conversations: [...conversations, ...conversationTombstones],
-    memories: memoryRecords
-  });
-}
-
-async function syncReadRemoteSnapshot(gist, manifest, cfg) {
-  if (manifest.salt) localStorage.setItem('assistantSyncSalt', manifest.salt);
-  const keyCache = {};
-  let remoteMemories = [];
-  const memoriesFile = manifest.files?.memories || 'memories.json.enc';
-  if (gist.files?.[memoriesFile]) {
-    const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, memoriesFile), cfg.passphrase, keyCache);
-    remoteMemories = payload?.memories || [];
+  if (db) {
+    await idbPutAll('conversations', conversations);
+    await idbPut('meta', { key: 'activeConvId', value: activeConvId || '' });
   }
 
-  const remoteConversations = [];
-  const entries = Array.isArray(manifest.files?.conversations) ? manifest.files.conversations : [];
-  for (const entry of entries) {
-    if (!entry?.file) continue;
-    const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, entry.file), cfg.passphrase, keyCache);
-    if (payload?.conversation) remoteConversations.push(payload.conversation);
-  }
-  return syncNormalizeSnapshot({ conversations: remoteConversations, memories: remoteMemories });
-}
-
-function syncBaseRecordHash(record, kind) {
-  const comparable = kind === 'conversation'
-    ? syncComparableRecord(record, 'conversation')
-    : (kind === 'message' ? syncSanitizeMessageForRemote(record) : syncStripLocalOnlyData(syncCloneJson(record || {})));
-  delete comparable.updatedAt;
-  delete comparable.lastChangedBy;
-  delete comparable.conflictVersions;
-  delete comparable.reviewLater;
-  if (kind === 'conversation') comparable.deletedAt = Number(record?.deletedAt) || null;
-  return fallbackHash(stableJson(comparable));
-}
-
-function syncRecordBodyHash(record, kind) {
-  const comparable = kind === 'conversation'
-    ? syncComparableRecord(record, 'conversation')
-    : (kind === 'message' ? syncSanitizeMessageForRemote(record) : syncStripLocalOnlyData(syncCloneJson(record || {})));
-  ['updatedAt', 'lastChangedBy', 'conflictVersions', 'reviewLater', 'resolvedConflictHashes', 'conflictResolvedAt'].forEach(key => delete comparable[key]);
-  if (kind === 'conversation') comparable.deletedAt = Number(record?.deletedAt) || null;
-  return fallbackHash(stableJson(comparable));
-}
-
-function syncBuildBaseHashes(snapshot) {
-  const base = { conversations: {}, messages: {}, memories: {} };
-  snapshot.conversations.forEach(conversation => {
-    base.conversations[conversation.id] = syncBaseRecordHash(conversation, 'conversation');
-    [...conversation.messages, ...conversation.messageTombstones].forEach(message => {
-      base.messages[conversation.id + ':' + message.id] = syncBaseRecordHash(message, 'message');
-    });
-  });
-  snapshot.memories.forEach(memory => {
-    base.memories[memory.id] = syncBaseRecordHash(memory, 'memory');
-  });
-  return base;
-}
-
-function syncRecordTieBreaker(record, kind) {
-  return syncRecordTimestamp(record) + ':' + (record.deletedAt ? '1' : '0') + ':' + syncBaseRecordHash(record, kind) + ':' + (record.lastChangedBy || '');
-}
-
-function syncConflictVersion(record) {
-  const version = syncCloneJson(record);
-  delete version.conflictVersions;
-  delete version.reviewLater;
-  return version;
-}
-
-function syncMergeStoredConflicts(winner, other, kind) {
-  const resolved = new Set([...(winner.resolvedConflictHashes || []), ...(other.resolvedConflictHashes || [])]);
-  const versions = [...(winner.conflictVersions || []), ...(other.conflictVersions || [])];
-  const unique = new Map();
-  versions.forEach(version => {
-    const hash = syncRecordBodyHash(version, kind);
-    if (hash !== syncRecordBodyHash(winner, kind) && !resolved.has(hash)) unique.set(hash, syncConflictVersion(version));
-  });
-  if (unique.size) {
-    winner.conflictVersions = Array.from(unique.values());
-    winner.reviewLater = true;
-  } else {
-    delete winner.conflictVersions;
-    delete winner.reviewLater;
-  }
-  if (resolved.size) winner.resolvedConflictHashes = Array.from(resolved).sort();
-  winner.conflictResolvedAt = Math.max(Number(winner.conflictResolvedAt) || 0, Number(other.conflictResolvedAt) || 0) || undefined;
-  return winner;
-}
-
-function syncRetainConflict(winner, loser, kind) {
-  if (winner.deletedAt || loser.deletedAt) return winner;
-  winner = syncMergeStoredConflicts(winner, loser, kind);
-  const resolved = new Set(winner.resolvedConflictHashes || []);
-  const loserHash = syncRecordBodyHash(loser, kind);
-  if (loserHash !== syncRecordBodyHash(winner, kind) && !resolved.has(loserHash)) {
-    const versions = [...(winner.conflictVersions || []), syncConflictVersion(loser)];
-    const unique = new Map(versions.map(version => [syncRecordBodyHash(version, kind), syncConflictVersion(version)]));
-    winner.conflictVersions = Array.from(unique.values());
-    winner.reviewLater = true;
-  }
-  return winner;
-}
-
-function syncChooseRecord(localRecord, remoteRecord, kind, baseHash = '') {
-  if (!localRecord) return syncCloneJson(remoteRecord);
-  if (!remoteRecord) return syncCloneJson(localRecord);
-  const local = syncCloneJson(localRecord);
-  const remote = syncCloneJson(remoteRecord);
-  const localTimestamp = syncRecordTimestamp(local);
-  const remoteTimestamp = syncRecordTimestamp(remote);
-
-  if (local.deletedAt || remote.deletedAt) {
-    if (localTimestamp !== remoteTimestamp) return localTimestamp > remoteTimestamp ? local : remote;
-    if (!!local.deletedAt !== !!remote.deletedAt) return local.deletedAt ? local : remote;
-  }
-
-  const localHash = syncBaseRecordHash(local, kind);
-  const remoteHash = syncBaseRecordHash(remote, kind);
-  const localBodyHash = syncRecordBodyHash(local, kind);
-  const remoteBodyHash = syncRecordBodyHash(remote, kind);
-  const localResolved = new Set(local.resolvedConflictHashes || []);
-  const remoteResolved = new Set(remote.resolvedConflictHashes || []);
-  if (localResolved.has(remoteBodyHash) && localBodyHash !== remoteBodyHash) return syncMergeStoredConflicts(local, remote, kind);
-  if (remoteResolved.has(localBodyHash) && localBodyHash !== remoteBodyHash) return syncMergeStoredConflicts(remote, local, kind);
-  if (localBodyHash === remoteBodyHash) {
-    const winner = syncRecordTieBreaker(local, kind) >= syncRecordTieBreaker(remote, kind) ? local : remote;
-    const loser = winner === local ? remote : local;
-    return syncMergeStoredConflicts(winner, loser, kind);
-  }
-
-  if (baseHash) {
-    const localChanged = localHash !== baseHash;
-    const remoteChanged = remoteHash !== baseHash;
-    if (localChanged && !remoteChanged) return syncMergeStoredConflicts(local, remote, kind);
-    if (remoteChanged && !localChanged) return syncMergeStoredConflicts(remote, local, kind);
-  }
-
-  const winner = syncRecordTieBreaker(local, kind) >= syncRecordTieBreaker(remote, kind) ? local : remote;
-  const loser = winner === local ? remote : local;
-  return syncRetainConflict(winner, loser, kind);
-}
-
-function syncConversationShell(conversation) {
-  const shell = syncCloneJson(conversation || {});
-  delete shell.messages;
-  delete shell.messageTombstones;
-  return shell;
-}
-
-function syncMergeSnapshots(localSnapshot, remoteSnapshot, baseHashes = null) {
-  const local = syncNormalizeSnapshot(localSnapshot);
-  const remote = syncNormalizeSnapshot(remoteSnapshot);
-  const mergedConversations = [];
-  const localConversations = new Map(local.conversations.map(conversation => [conversation.id, conversation]));
-  const remoteConversations = new Map(remote.conversations.map(conversation => [conversation.id, conversation]));
-  const conversationIds = new Set([...localConversations.keys(), ...remoteConversations.keys()]);
-
-  conversationIds.forEach(conversationId => {
-    const localConversation = localConversations.get(conversationId);
-    const remoteConversation = remoteConversations.get(conversationId);
-    if (!localConversation || !remoteConversation) {
-      mergedConversations.push(syncCloneJson(localConversation || remoteConversation));
-      return;
-    }
-
-    const shell = syncChooseRecord(
-      syncConversationShell(localConversation),
-      syncConversationShell(remoteConversation),
-      'conversation',
-      baseHashes?.conversations?.[conversationId] || ''
-    );
-    if (shell.deletedAt) {
-      shell.messages = [];
-      shell.messageTombstones = [];
-      mergedConversations.push(shell);
-      return;
-    }
-
-    const localMessages = new Map([...localConversation.messages, ...localConversation.messageTombstones].map(message => [message.id, message]));
-    const remoteMessages = new Map([...remoteConversation.messages, ...remoteConversation.messageTombstones].map(message => [message.id, message]));
-    const messageIds = new Set([...localMessages.keys(), ...remoteMessages.keys()]);
-    const liveMessages = [];
-    const messageTombstones = [];
-    messageIds.forEach(messageId => {
-      const mergedMessage = syncChooseRecord(
-        localMessages.get(messageId),
-        remoteMessages.get(messageId),
-        'message',
-        baseHashes?.messages?.[conversationId + ':' + messageId] || ''
-      );
-      if (mergedMessage.deletedAt) messageTombstones.push(mergedMessage);
-      else liveMessages.push(mergedMessage);
-    });
-    liveMessages.sort((a, b) =>
-      (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0) || String(a.id).localeCompare(String(b.id))
-    );
-    shell.messages = liveMessages;
-    shell.messageTombstones = messageTombstones;
-    shell.updatedAt = Math.max(Number(shell.updatedAt) || 0, ...liveMessages.map(syncRecordTimestamp), ...messageTombstones.map(syncRecordTimestamp));
-    mergedConversations.push(shell);
-  });
-
-  const localMemories = new Map(local.memories.map(memory => [memory.id, memory]));
-  const remoteMemories = new Map(remote.memories.map(memory => [memory.id, memory]));
-  const memoryIds = new Set([...localMemories.keys(), ...remoteMemories.keys()]);
-  const mergedMemories = [];
-  memoryIds.forEach(memoryId => {
-    mergedMemories.push(syncChooseRecord(
-      localMemories.get(memoryId),
-      remoteMemories.get(memoryId),
-      'memory',
-      baseHashes?.memories?.[memoryId] || ''
-    ));
-  });
-  return syncNormalizeSnapshot({ conversations: mergedConversations, memories: mergedMemories });
-}
-
-async function syncSnapshotHash(snapshot) {
-  return syncSha256Hex(syncNormalizeSnapshot(snapshot));
-}
-
-function syncRecordContainsVersion(container, expected, kind) {
-  if (!container) return false;
-  if (expected.deletedAt) return !!container.deletedAt && syncRecordTimestamp(container) >= syncRecordTimestamp(expected);
-  const candidates = [container, ...(container.conflictVersions || [])];
-  const containsVersions = [expected, ...(expected.conflictVersions || [])].every(expectedVersion => {
-    const expectedHash = syncRecordBodyHash(expectedVersion, kind);
-    return candidates.some(version => !version.deletedAt && syncRecordBodyHash(version, kind) === expectedHash);
-  });
-  const containerResolved = new Set(container.resolvedConflictHashes || []);
-  const containsResolutions = (expected.resolvedConflictHashes || []).every(hash => containerResolved.has(hash));
-  return containsVersions && containsResolutions;
-}
-
-function syncSnapshotContains(remoteSnapshot, expectedSnapshot) {
-  const remoteConversations = new Map(remoteSnapshot.conversations.map(conversation => [conversation.id, conversation]));
-  for (const expectedConversation of expectedSnapshot.conversations) {
-    const remoteConversation = remoteConversations.get(expectedConversation.id);
-    if (!syncRecordContainsVersion(syncConversationShell(remoteConversation), syncConversationShell(expectedConversation), 'conversation')) return false;
-    if (expectedConversation.deletedAt) continue;
-    const remoteMessages = new Map([...remoteConversation.messages, ...remoteConversation.messageTombstones].map(message => [message.id, message]));
-    for (const expectedMessage of [...expectedConversation.messages, ...expectedConversation.messageTombstones]) {
-      if (!syncRecordContainsVersion(remoteMessages.get(expectedMessage.id), expectedMessage, 'message')) return false;
-    }
-  }
-  const remoteMemories = new Map(remoteSnapshot.memories.map(memory => [memory.id, memory]));
-  for (const expectedMemory of expectedSnapshot.memories) {
-    if (!syncRecordContainsVersion(remoteMemories.get(expectedMemory.id), expectedMemory, 'memory')) return false;
-  }
-  return true;
-}
-
-async function syncBuildGistFiles(snapshot, passphrase, existingManifest = null) {
   const existingSalt = existingManifest?.salt || localStorage.getItem('assistantSyncSalt') || '';
   const context = await syncBuildCryptoContext(passphrase, existingSalt || null);
   localStorage.setItem('assistantSyncSalt', context.saltBase64);
-  const normalized = syncNormalizeSnapshot(snapshot);
+
   const now = Date.now();
-  const memoriesPayload = { version: 2, exportedAt: new Date(now).toISOString(), memories: normalized.memories };
+  const settingsPayload = { version: 1, exportedAt: new Date(now).toISOString(), settings: syncCollectSettings() };
+  const memoriesPayload = { version: 1, exportedAt: new Date(now).toISOString(), memories: await loadMemories() };
+  const projectsPayload = { version: 1, exportedAt: new Date(now).toISOString(), projects };
+  const localConversations = conversations.map(syncNormalizeConversation);
   const files = {
-    'memories.json.enc': { content: await syncEncryptPayloadWithKey(memoriesPayload, context) }
+    'settings.json.enc': { content: await syncEncryptPayloadWithKey(settingsPayload, context) },
+    'memories.json.enc': { content: await syncEncryptPayloadWithKey(memoriesPayload, context) },
+    'projects.json.enc': { content: await syncEncryptPayloadWithKey(projectsPayload, context) }
   };
+
   const conversationEntries = [];
-  for (const conversation of normalized.conversations) {
-    const filename = syncConversationFileName(conversation.id);
-    const payload = { version: 2, exportedAt: new Date(now).toISOString(), conversation };
+  for (const conv of localConversations) {
+    const filename = syncConversationFileName(conv.id);
+    const payload = { version: 1, exportedAt: new Date(now).toISOString(), conversation: conv };
     files[filename] = { content: await syncEncryptPayloadWithKey(payload, context) };
     conversationEntries.push({
-      id: conversation.id,
+      id: conv.id,
       file: filename,
-      updatedAt: Number(conversation.updatedAt) || 0,
-      deletedAt: Number(conversation.deletedAt) || null,
-      hash: await syncSha256Hex(conversation)
+      updatedAt: Number(conv.updatedAt) || 0,
+      hash: await syncSha256Hex(conv)
     });
   }
+
   const manifest = {
-    version: 2,
+    version: 1,
     app: 'Synapse',
-    schema: 'gist-sync-v2',
+    schema: 'gist-sync-v1',
     updatedAt: now,
-    writer: { id: syncGetDeviceId(), label: syncGetDeviceLabel() },
+    deviceId: syncGetDeviceId(),
     salt: context.saltBase64,
     kdf: { name: 'PBKDF2-SHA256', iterations: SYNC_KDF_ITERATIONS },
-    files: { memories: 'memories.json.enc', conversations: conversationEntries },
+    files: {
+      settings: 'settings.json.enc',
+      memories: 'memories.json.enc',
+      projects: 'projects.json.enc',
+      conversations: conversationEntries
+    },
     hashes: {
-      memories: await syncSha256Hex(normalized.memories),
-      snapshot: await syncSnapshotHash(normalized)
+      settings: await syncSha256Hex(settingsPayload.settings),
+      memories: await syncSha256Hex(memoriesPayload.memories),
+      projects: await syncSha256Hex(projectsPayload.projects)
     }
   };
   files['manifest.json'] = { content: JSON.stringify(manifest, null, 2) };
-  const sizeBytes = Object.values(files).reduce((total, file) => total + new TextEncoder().encode(file.content).byteLength, 0);
-  return { files, manifest, sizeBytes };
+  return { files, manifest };
 }
 
 function syncIsOwnedFileName(name) {
   return name === 'manifest.json'
     || name === 'settings.json.enc'
     || name === 'memories.json.enc'
+    || name === 'projects.json.enc'
     || (name.startsWith('conv_') && name.endsWith('.json.enc'));
 }
 
-function syncRestoreRemovedDataUrls(target, local) {
-  if (!target || !local || typeof target !== 'object' || typeof local !== 'object') return;
-  Object.entries(local).forEach(([key, localValue]) => {
-    if (typeof localValue === 'string' && localValue.startsWith('data:') && target[key] === undefined) {
-      target[key] = localValue;
-      return;
-    }
-    if (target[key] && localValue && typeof target[key] === 'object' && typeof localValue === 'object') {
-      syncRestoreRemovedDataUrls(target[key], localValue);
-    }
-  });
-}
-
-function syncRestoreLocalMessageData(projected, local) {
-  if (!projected || !local) return projected;
-  const attachments = Array.isArray(local.content)
-    ? local.content.filter(part => part?.type === 'image_url' || part?.type === 'file').map(syncCloneJson)
-    : [];
-  if (attachments.length) {
-    const textParts = Array.isArray(projected.content)
-      ? projected.content.filter(part => part?.type === 'text')
-      : (typeof projected.content === 'string' && projected.content ? [{ type: 'text', text: projected.content }] : []);
-    projected.content = [...textParts, ...attachments];
-  }
-  ['images', 'swipeImages'].forEach(key => {
-    if (local[key] !== undefined) projected[key] = syncCloneJson(local[key]);
-  });
-  if (Array.isArray(projected.branches) && Array.isArray(local.branches)) {
-    projected.branches.forEach((branch, branchIndex) => {
-      if (!Array.isArray(branch)) return;
-      const localById = new Map((local.branches[branchIndex] || []).filter(message => message?.id).map(message => [message.id, message]));
-      branch.forEach(message => syncRestoreLocalMessageData(message, localById.get(message.id)));
-    });
-  }
-  syncRestoreRemovedDataUrls(projected, local);
-  return projected;
-}
-
-function syncRestoreLocalOnlyData(snapshot) {
-  const localById = new Map(conversations.map(conversation => [conversation.id, conversation]));
-  snapshot.conversations.forEach(conversation => {
-    if (conversation.deletedAt) return;
-    const local = localById.get(conversation.id);
-    if (!local) return;
-    if (local.docs !== undefined) conversation.docs = syncCloneJson(local.docs);
-    if (local.characterAvatar !== undefined) conversation.characterAvatar = local.characterAvatar;
-    const localMessages = new Map((local.messages || []).map(message => [message.id, message]));
-    conversation.messages.forEach(message => syncRestoreLocalMessageData(message, localMessages.get(message.id)));
-    syncRestoreRemovedDataUrls(conversation, local);
-  });
-  return snapshot;
-}
-
-async function syncApplySnapshot(snapshot) {
-  const previousActiveConvId = activeConvId;
-  const normalized = syncRestoreLocalOnlyData(syncNormalizeSnapshot(snapshot));
-  syncApplyingRemote = true;
-  let createdFallback = false;
+async function syncPushToGist() {
+  const cfg = syncSaveSettings(false);
   try {
-    conversations = normalized.conversations.filter(conversation => !conversation.deletedAt);
-    conversationTombstones = normalized.conversations.filter(conversation => conversation.deletedAt);
-    if (conversations.length === 0) {
-      const now = Date.now();
-      conversations.push(syncNormalizeConversationRecord({
-        id: syncGenerateRecordId('conv'),
-        title: 'New Chat',
-        messages: [],
-        createdAt: now,
-        updatedAt: now,
-        deletedAt: null,
-        lastChangedBy: syncGetDeviceId()
-      }));
-      createdFallback = true;
+    syncValidateConfig(cfg, false);
+    syncSetStatus('checking', 'Pushing...', 'Encrypting local data and writing Gist files.');
+    let gist = null;
+    let existingManifest = null;
+    if (cfg.gistId) {
+      gist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+      try {
+        existingManifest = await syncReadManifest(gist, cfg.token);
+      } catch(e) {
+        throw new Error('Existing Gist is not a Synapse sync Gist. Clear the Gist ID to create a new one.');
+      }
     }
-    memoryRecords = normalized.memories;
-    memoryRecordsLoaded = true;
-    if (!conversations.some(conversation => conversation.id === activeConvId)) activeConvId = conversations[0].id;
-    messages = getActiveConv()?.messages || [];
-    localStorage.setItem('assistantActiveConvId', activeConvId || '');
-    syncCaptureObservedConversations();
-    syncCaptureObservedMemories();
-  } finally {
-    syncApplyingRemote = false;
-  }
-  if (db) {
-    await Promise.all([
-      idbPutAll('conversations', [...conversations, ...conversationTombstones]),
-      idbPutAll('memories', memoryRecords),
-      idbPut('meta', { key: 'activeConvId', value: activeConvId || '' })
-    ]);
-  } else {
-    localStorage.setItem('assistantConversations', JSON.stringify([...conversations, ...conversationTombstones]));
-    localStorage.setItem('assistantMemories', JSON.stringify(memoryRecords));
-  }
-  renderSidebar();
-  renderMessages({ preserveScroll: activeConvId === previousActiveConvId });
-  updateTokenInfo();
-  updateCharacterUI();
-  syncRenderReviewStatus();
-  if (createdFallback) syncMarkDirty('empty chat created');
-  return createdFallback;
-}
 
-async function syncLoadState() {
-  try {
-    const stored = db ? await idbGet('meta', 'syncState') : null;
-    if (stored?.value && typeof stored.value === 'object') syncState = { ...syncState, ...stored.value };
-  } catch(e) {}
-  if (localStorage.getItem('assistantSyncDirty') === 'true') syncState.dirty = true;
-  syncState.lastSyncedAt = Number(syncState.lastSyncedAt) || Number(localStorage.getItem('assistantSyncLastSyncedAt') || 0);
-}
-
-function syncPersistState() {
-  localStorage.setItem('assistantSyncDirty', syncState.dirty ? 'true' : 'false');
-  syncSetStoredValue('assistantSyncLastSyncedAt', syncState.lastSyncedAt || '');
-  if (db) idbPut('meta', { key: 'syncState', value: syncCloneJson(syncState) }).catch(() => {});
-}
-
-function syncScheduleDebounced() {
-  clearTimeout(syncDebounceTimer);
-  const cfg = syncGetStoredConfig();
-  if (!cfg.token || !cfg.passphrase) return;
-  syncDebounceTimer = setTimeout(() => syncNow(false), SYNC_DEBOUNCE_MS);
-}
-
-function syncMarkDirty(reason = '') {
-  syncLocalGeneration++;
-  syncState.dirty = true;
-  if (reason === 'sync destination changed') {
-    syncState.paused = false;
-    syncState.pauseReason = '';
-  }
-  syncPersistState();
-  if (!syncState.paused) syncScheduleDebounced();
-  syncRefreshStatus();
-}
-
-function syncMarkClean(snapshot, remoteState) {
-  syncState.dirty = false;
-  syncState.paused = false;
-  syncState.pauseReason = '';
-  syncState.lastRevision = remoteState.revision || '';
-  syncState.lastEtag = remoteState.etag || '';
-  syncState.lastSyncedAt = Date.now();
-  syncState.baseHashes = syncBuildBaseHashes(snapshot);
-  syncPersistState();
-  syncRefreshStatus();
-}
-
-function syncRandomBackoff() {
-  return 2000 + Math.floor(Math.random() * 6001);
-}
-
-function syncWait(milliseconds) {
-  return new Promise(resolve => setTimeout(resolve, milliseconds));
-}
-
-function syncEnqueue(work) {
-  const result = syncQueue.then(work, work);
-  syncQueue = result.catch(() => {});
-  return result;
-}
-
-async function syncPerformSync(manual = false) {
-  const cfg = syncGetStoredConfig();
-  syncValidateConfig(cfg, false);
-  if (!navigator.onLine) {
-    syncState.dirty = true;
-    syncPersistState();
-    syncSetStatus('offline', 'Offline with changes waiting', 'Local chat remains available and sync will resume when online.');
-    return false;
-  }
-  if (streaming) {
-    syncSetStatus('dirty', 'Remote changes available', 'Sync will continue after the active response finishes.');
-    syncScheduleDebounced();
-    return false;
-  }
-
-  syncState.paused = false;
-  syncState.pauseReason = '';
-  syncSetStatus('checking', 'Syncing', 'Fetching and merging the latest encrypted snapshot.');
-  let lastError = null;
-  for (let attempt = 0; attempt <= SYNC_MAX_WRITE_RETRIES; attempt++) {
-    try {
-      const localBefore = await syncGetLocalSnapshot();
-      const generationAtStart = syncLocalGeneration;
-      const configAtStart = stableJson(syncGetStoredConfig());
-      let latest = null;
-      let manifest = null;
-      let remoteSnapshot = { version: 2, conversations: [], memories: [] };
-      if (cfg.gistId) {
-        latest = await syncFetchGistState(cfg, false);
-        manifest = await syncReadManifest(latest.gist);
-        remoteSnapshot = await syncReadRemoteSnapshot(latest.gist, manifest, cfg);
-      }
-
-      if (syncLocalGeneration !== generationAtStart || streaming || stableJson(syncGetStoredConfig()) !== configAtStart) {
-        const deferred = new Error('Local data changed while sync was preparing.');
-        deferred.name = 'SyncDeferredError';
-        throw deferred;
-      }
-
-      const merged = syncMergeSnapshots(localBefore, remoteSnapshot, syncState.baseHashes);
-      const built = await syncBuildGistFiles(merged, cfg.passphrase, manifest);
-      syncState.lastSizeBytes = built.sizeBytes;
-      syncPersistState();
-      const sizeWarning = built.sizeBytes >= SYNC_SIZE_WARNING_BYTES
-        ? ' Encrypted sync data is ' + formatBytes(built.sizeBytes) + ', approaching the practical Gist limit.'
-        : '';
-
-      if (syncLocalGeneration !== generationAtStart || streaming || stableJson(syncGetStoredConfig()) !== configAtStart) {
-        const deferred = new Error('Local data changed while sync was encrypting.');
-        deferred.name = 'SyncDeferredError';
-        throw deferred;
-      }
-
-      if (cfg.gistId) {
-        const patchFiles = { ...built.files };
-        Object.keys(latest.gist?.files || {}).forEach(name => {
-          if (syncIsOwnedFileName(name) && !patchFiles[name]) patchFiles[name] = null;
-        });
-        await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ description: 'Synapse encrypted sync data', files: patchFiles })
-        }, cfg.token);
-      } else {
-        const created = await fetchGist(SYNC_GIST_API_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ description: 'Synapse encrypted sync data', public: false, files: built.files })
-        }, cfg.token);
-        cfg.gistId = created.id;
-        localStorage.setItem('assistantSyncGistId', cfg.gistId);
-        const gistEl = document.getElementById('setSyncGistId');
-        if (gistEl) gistEl.value = cfg.gistId;
-      }
-
-      const verifiedState = await syncFetchGistState(cfg, false);
-      const verifiedManifest = await syncReadManifest(verifiedState.gist);
-      const verifiedSnapshot = await syncReadRemoteSnapshot(verifiedState.gist, verifiedManifest, cfg);
-      if (!syncSnapshotContains(verifiedSnapshot, localBefore)) throw new Error('Another device changed the Gist during verification.');
-
-      if (streaming) {
-        syncMarkDirty('active response during sync');
-        syncSetStatus('dirty', 'Changes waiting', 'Sync will continue after the active response finishes.');
-        return false;
-      }
-
-      if (syncLocalGeneration !== generationAtStart) {
-        if (streaming) {
-          syncMarkDirty('local change during sync');
-          syncSetStatus('dirty', 'Changes waiting', 'Sync will continue after the active response finishes.');
-          return false;
-        }
-        const freshLocal = await syncGetLocalSnapshot();
-        const safeLocal = syncMergeSnapshots(freshLocal, verifiedSnapshot, syncState.baseHashes);
-        await syncApplySnapshot(safeLocal);
-        syncMarkDirty('local change during sync');
-        syncSetStatus('dirty', 'Changes waiting', 'The latest local change is queued for the next sync.');
-        return false;
-      }
-
-      const finalMerged = syncMergeSnapshots(merged, verifiedSnapshot, syncBuildBaseHashes(merged));
-      if (await syncSnapshotHash(finalMerged) !== await syncSnapshotHash(verifiedSnapshot)) {
-        throw new Error('Another device changed the Gist during verification.');
-      }
-
-      const generationBeforeApply = syncLocalGeneration;
-      const createdFallback = await syncApplySnapshot(verifiedSnapshot);
-      if (createdFallback) {
-        syncState.lastRevision = verifiedState.revision || '';
-        syncState.lastEtag = verifiedState.etag || '';
-        syncState.baseHashes = syncBuildBaseHashes(verifiedSnapshot);
-        syncPersistState();
-        syncSetStatus('dirty', 'Changes waiting', 'A new empty chat is queued for encrypted backup.');
-        return false;
-      }
-      if (syncLocalGeneration !== generationBeforeApply) {
-        syncState.lastRevision = verifiedState.revision || '';
-        syncState.lastEtag = verifiedState.etag || '';
-        syncState.baseHashes = syncBuildBaseHashes(verifiedSnapshot);
-        syncState.dirty = true;
-        syncPersistState();
-        syncSetStatus('dirty', 'Changes waiting', 'A local edit made during sync is queued safely.');
-        return false;
-      }
-      syncMarkClean(verifiedSnapshot, verifiedState);
-      syncSetStatus('current', 'Synced just now', 'Last synced ' + new Date(syncState.lastSyncedAt).toLocaleString() + '.' + sizeWarning);
-      if (manual) showToast('Sync complete.', 'success');
-      return true;
-    } catch (error) {
-      if (error.name === 'SyncDeferredError') {
-        syncMarkDirty('sync deferred');
-        syncSetStatus('dirty', 'Changes waiting', 'Sync will restart after local activity settles.');
-        return false;
-      }
-      lastError = error;
-      const message = error.name === 'OperationError'
-        ? 'Could not decrypt sync data. Check the passphrase.'
-        : (error.message || 'Sync failed.');
-      const nonRetryable = error.name === 'OperationError'
-        || error.name === 'SyncManifestError'
-        || /not an encrypted Synapse|GitHub token|Gist not found|Unsupported sync encryption/i.test(message);
-      if (nonRetryable || attempt === SYNC_MAX_WRITE_RETRIES) break;
-      syncSetStatus('checking', 'Syncing', 'Remote changed during sync, retrying safely.');
-      await syncWait(syncRandomBackoff());
-    }
-  }
-
-  const message = lastError?.name === 'OperationError'
-    ? 'Could not decrypt sync data. Check the passphrase.'
-    : (lastError?.message || 'Unable to verify the remote snapshot.');
-  syncState.dirty = true;
-  syncState.paused = true;
-  syncState.pauseReason = message + ' Your changes are safe on this device.';
-  syncPersistState();
-  syncSetStatus('paused', 'Sync paused', syncState.pauseReason + syncSizeWarningText());
-  if (manual) showToast('Sync paused: ' + message, 'error', 6000);
-  return false;
-}
-
-function syncNow(manual = true) {
-  return syncEnqueue(() => syncPerformSync(manual)).catch(error => {
-    console.error('Sync failed:', error);
-    syncState.dirty = true;
-    syncState.paused = true;
-    syncState.pauseReason = (error.message || 'Sync failed.') + ' Your changes are safe on this device.';
-    syncPersistState();
-    syncSetStatus('paused', 'Sync paused', syncState.pauseReason + syncSizeWarningText());
-    if (manual) showToast('Sync paused: ' + (error.message || error), 'error', 6000);
-    return false;
-  });
-}
-
-function syncPushToGist() {
-  return syncNow(true);
-}
-
-function syncPullFromGist() {
-  return syncNow(true);
-}
-
-async function syncCheckRemote() {
-  const cfg = syncGetStoredConfig();
-  if (!cfg.token || !cfg.passphrase || !cfg.gistId || !navigator.onLine) return;
-  return syncEnqueue(async () => {
-    const remoteState = await syncFetchGistState(cfg, true);
-    if (remoteState.notModified || remoteState.revision === syncState.lastRevision) {
-      syncRefreshStatus();
-      return;
-    }
-    syncSetStatus('dirty', 'Remote changes available', 'Merging encrypted changes from another device.');
-    if (streaming) return;
-    const manifest = await syncReadManifest(remoteState.gist);
-    const remoteSnapshot = await syncReadRemoteSnapshot(remoteState.gist, manifest, cfg);
-    const localSnapshot = await syncGetLocalSnapshot();
-    const generationAtMerge = syncLocalGeneration;
-    let merged = syncMergeSnapshots(localSnapshot, remoteSnapshot, syncState.baseHashes);
-    if (generationAtMerge !== syncLocalGeneration) {
-      merged = syncMergeSnapshots(await syncGetLocalSnapshot(), remoteSnapshot, syncState.baseHashes);
-    }
-    if (streaming) {
-      syncSetStatus('dirty', 'Remote changes available', 'Sync will continue after the active response finishes.');
-      return;
-    }
-    const generationBeforeApply = syncLocalGeneration;
-    const createdFallback = await syncApplySnapshot(merged);
-    syncState.lastRevision = remoteState.revision;
-    syncState.lastEtag = remoteState.etag;
-    if (!createdFallback && syncLocalGeneration !== generationBeforeApply) {
-      syncState.baseHashes = syncBuildBaseHashes(remoteSnapshot);
-      syncState.dirty = true;
-      syncPersistState();
-      syncSetStatus('dirty', 'Changes waiting', 'Remote changes merged and the latest local edit is queued safely.');
-    } else if (!createdFallback && await syncSnapshotHash(merged) === await syncSnapshotHash(remoteSnapshot)) {
-      syncMarkClean(remoteSnapshot, remoteState);
-      syncSetStatus('current', 'Synced just now', 'Remote changes merged silently.');
+    const built = await syncBuildGistFiles(cfg.passphrase, existingManifest);
+    if (cfg.gistId) {
+      const patchFiles = { ...built.files };
+      Object.keys(gist?.files || {}).forEach(name => {
+        if (syncIsOwnedFileName(name) && !patchFiles[name]) patchFiles[name] = null;
+      });
+      const nonDeletedFiles = Object.values(patchFiles).filter(value => value !== null).length;
+      if (!nonDeletedFiles) patchFiles['manifest.json'] = built.files['manifest.json'];
+      await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: 'Synapse encrypted sync data', files: patchFiles })
+      }, cfg.token);
     } else {
-      syncMarkDirty('merged remote changes');
-      syncSetStatus('dirty', 'Changes waiting', 'Remote changes merged, encrypted backup update queued.');
+      gist = await fetchGist(SYNC_GIST_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: 'Synapse encrypted sync data', public: false, files: built.files })
+      }, cfg.token);
+      cfg.gistId = gist.id;
+      localStorage.setItem('assistantSyncGistId', cfg.gistId);
+      const gistEl = document.getElementById('setSyncGistId');
+      if (gistEl) gistEl.value = cfg.gistId;
     }
-  }).catch(error => {
-    console.warn('Remote sync check failed:', error);
-    const message = error.name === 'OperationError' ? 'Could not decrypt sync data. Check the passphrase.' : (error.message || 'Remote check failed.');
-    if (error.name === 'OperationError' || error.name === 'SyncManifestError' || /not an encrypted Synapse|GitHub token|Gist not found/i.test(message)) {
-      syncState.paused = true;
-      syncState.pauseReason = message + ' Your local data was not changed.';
-      syncPersistState();
-      syncSetStatus('paused', 'Sync paused', syncState.pauseReason + syncSizeWarningText());
-    } else if (syncState.dirty) {
-      syncSetStatus('offline', 'Offline with changes waiting', 'Sync will retry automatically.');
-    }
-  });
+
+    localStorage.setItem('assistantSyncLastPushAt', String(Date.now()));
+    localStorage.setItem('assistantSyncLastHash', await syncSha256Hex(built.manifest));
+    renderSyncSettings();
+    syncSetStatus('current', 'Pushed', 'Encrypted sync Gist updated with ' + conversations.length + ' conversations.');
+    showToast('Sync push complete.', 'success');
+  } catch (err) {
+    console.error('Sync push failed:', err);
+    syncSetStatus('unknown', 'Push failed', err.message || 'Unable to push sync data.');
+    showToast('Sync push failed: ' + (err.message || err), 'error', 6000);
+  }
 }
 
-function syncInitialize() {
-  clearInterval(syncPollTimer);
-  clearInterval(syncDirtyRetryTimer);
-  syncPollTimer = setInterval(syncCheckRemote, SYNC_POLL_MS);
-  syncDirtyRetryTimer = setInterval(() => {
-    if (syncState.dirty && !syncState.paused) syncNow(false);
-  }, SYNC_DIRTY_RETRY_MS);
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState !== 'hidden') return;
-    clearTimeout(_saveDebounceTimer);
-    _saveDebounceTimer = null;
-    saveConversations();
-    if (syncState.dirty && !syncState.paused) syncNow(false);
-  });
-  window.addEventListener('online', () => {
-    if (syncState.dirty && !syncState.paused) syncNow(false);
-    else syncCheckRemote();
-  });
-  window.addEventListener('offline', renderSyncSettings);
-  if (syncState.dirty && !syncState.paused) syncScheduleDebounced();
-  setTimeout(syncCheckRemote, 1000);
-  renderSyncSettings();
-}
+async function syncMergeConversationLists(localList, remoteList) {
+  const merged = new Map();
+  let added = 0;
+  let updated = 0;
+  let tied = 0;
+  localList.map(syncNormalizeConversation).forEach(conv => merged.set(conv.id, conv));
 
-function syncCollectReviewItems() {
-  const items = [];
-  conversations.forEach(conversation => {
-    if (conversation.reviewLater && conversation.conflictVersions?.length) {
-      items.push({ kind: 'conversation', ownerId: '', record: conversation, label: 'Conversation: ' + conversation.title });
+  for (const remoteRaw of remoteList) {
+    const remote = syncNormalizeConversation(remoteRaw);
+    const local = merged.get(remote.id);
+    if (!local) {
+      merged.set(remote.id, remote);
+      added++;
+      continue;
     }
-    conversation.messages.forEach(message => {
-      if (message.reviewLater && message.conflictVersions?.length) {
-        const preview = getMsgText(message).replace(/\s+/g, ' ').trim().slice(0, 80) || message.role || 'message';
-        items.push({ kind: 'message', ownerId: conversation.id, record: message, label: 'Message: ' + preview });
+    const remoteUpdated = Number(remote.updatedAt) || 0;
+    const localUpdated = Number(local.updatedAt) || 0;
+    if (remoteUpdated > localUpdated) {
+      merged.set(remote.id, remote);
+      updated++;
+      continue;
+    }
+    if (remoteUpdated === localUpdated) {
+      const localHash = await syncSha256Hex(local);
+      const remoteHash = await syncSha256Hex(remote);
+      if (remoteHash !== localHash && remoteHash > localHash) {
+        merged.set(remote.id, remote);
+        tied++;
       }
-    });
-  });
-  memoryRecords.filter(memory => !memory.deletedAt).forEach(memory => {
-    if (memory.reviewLater && memory.conflictVersions?.length) {
-      items.push({ kind: 'memory', ownerId: '', record: memory, label: 'Memory: ' + (memory.text || '').slice(0, 80) });
-    }
-  });
-  return items;
-}
-
-async function syncResolveReviewItem(kind, ownerId, recordId, versionIndex) {
-  let record = null;
-  let replace = null;
-  if (kind === 'conversation') {
-    record = conversations.find(conversation => conversation.id === recordId);
-    replace = selected => {
-      const messagesForConversation = record.messages;
-      const tombstonesForConversation = record.messageTombstones;
-      Object.keys(record).forEach(key => delete record[key]);
-      Object.assign(record, selected, { messages: messagesForConversation, messageTombstones: tombstonesForConversation });
-    };
-  } else if (kind === 'message') {
-    const conversation = conversations.find(item => item.id === ownerId);
-    const index = conversation?.messages.findIndex(message => message.id === recordId) ?? -1;
-    if (index >= 0) {
-      record = conversation.messages[index];
-      replace = selected => { conversation.messages[index] = selected; };
-    }
-  } else if (kind === 'memory') {
-    const index = memoryRecords.findIndex(memory => memory.id === recordId);
-    if (index >= 0) {
-      record = memoryRecords[index];
-      replace = selected => { memoryRecords[index] = selected; };
     }
   }
-  if (!record || !replace) return;
-  const allVersions = [record, ...(record.conflictVersions || [])];
-  const selected = versionIndex < 0 ? syncCloneJson(record) : syncCloneJson(record.conflictVersions?.[versionIndex]);
-  if (!selected) return;
-  const selectedHash = syncRecordBodyHash(selected, kind);
-  const resolved = new Set(record.resolvedConflictHashes || []);
-  allVersions.forEach(version => {
-    const hash = syncRecordBodyHash(version, kind);
-    if (hash !== selectedHash) resolved.add(hash);
-  });
-  selected.id = record.id;
-  selected.createdAt = Number(selected.createdAt) || Number(record.createdAt) || Date.now();
-  delete selected.conflictVersions;
-  delete selected.reviewLater;
-  selected.resolvedConflictHashes = Array.from(resolved).sort();
-  selected.conflictResolvedAt = Date.now();
-  if (kind === 'message') syncRestoreLocalMessageData(selected, record);
-  syncTouchRecord(selected, selected.conflictResolvedAt);
-  replace(selected);
-  if (kind === 'memory') await saveMemories(memoryRecords);
-  else saveConversations();
-  syncMarkDirty('conflict resolved');
-  syncRenderReviewStatus();
+
+  return { conversations: Array.from(merged.values()), added, updated, tied };
 }
 
-function syncOpenReviewLater() {
-  document.querySelectorAll('.char-info-overlay,.char-info-popup').forEach(element => element.remove());
-  const items = syncCollectReviewItems();
-  if (!items.length) {
-    showToast('Nothing needs review.', 'info');
-    return;
-  }
-  const overlay = document.createElement('div');
-  overlay.className = 'char-info-overlay';
-  const popup = document.createElement('div');
-  popup.className = 'char-info-popup sync-review-popup';
-  popup.innerHTML = '<h3>Review later</h3>' +
-    '<div class="settings-note">Both device versions are still stored. Choose one only when you are ready.</div>' +
-    '<div class="sync-review-list"></div>' +
-    '<button class="btn btn-secondary sync-wide-btn" type="button" data-review-close>Close</button>';
-  const list = popup.querySelector('.sync-review-list');
-  items.forEach(item => {
-    const row = document.createElement('div');
-    row.className = 'sync-review-item';
-    row.innerHTML = '<div class="sync-review-label">' + escapeHTML(item.label) + '</div>' +
-      '<div class="sync-review-choices"></div>';
-    const choices = row.querySelector('.sync-review-choices');
-    const versions = [{ label: 'Keep current', index: -1 }, ...(item.record.conflictVersions || []).map((version, index) => ({
-      label: 'Use version ' + (index + 1),
-      index
-    }))];
-    versions.forEach(version => {
-      const button = document.createElement('button');
-      button.className = 'btn btn-secondary';
-      button.type = 'button';
-      button.textContent = version.label;
-      button.onclick = async () => {
-        await syncResolveReviewItem(item.kind, item.ownerId, item.record.id, version.index);
-        overlay.remove();
-        popup.remove();
-        if (syncReviewCount()) syncOpenReviewLater();
-      };
-      choices.appendChild(button);
-    });
-    list.appendChild(row);
+function syncMergeProjectLists(localList, remoteList) {
+  const byId = new Map();
+  (localList || []).forEach(p => { if (p && p.id) byId.set(p.id, p); });
+  (remoteList || []).forEach(p => {
+    if (!p || !p.id) return;
+    const existing = byId.get(p.id);
+    if (!existing || (Number(p.updatedAt) || 0) >= (Number(existing.updatedAt) || 0)) {
+      byId.set(p.id, { ...p, docs: Array.isArray(p.docs) ? p.docs : [] });
+    }
   });
-  const close = () => { overlay.remove(); popup.remove(); };
-  overlay.onclick = close;
-  popup.querySelector('[data-review-close]').onclick = close;
-  document.body.appendChild(overlay);
-  document.body.appendChild(popup);
+  return Array.from(byId.values()).sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
+}
+
+function syncMergeMemoryLists(localList, remoteList) {
+  const localNormalized = normalizeMemoryList(localList || []).memories;
+  const remoteNormalized = normalizeMemoryList(remoteList || []).memories;
+  const byId = new Map();
+  localNormalized.forEach(memory => byId.set(memory.id, memory));
+  remoteNormalized.forEach(memory => {
+    const existing = byId.get(memory.id);
+    if (!existing || Number(memory.createdAt) >= Number(existing.createdAt)) byId.set(memory.id, memory);
+  });
+  return Array.from(byId.values()).sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0));
+}
+
+async function syncPullFromGist() {
+  const cfg = syncSaveSettings(false);
+  try {
+    syncValidateConfig(cfg, true);
+    syncSetStatus('checking', 'Pulling...', 'Fetching and decrypting sync files.');
+    const gist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+    const manifest = await syncReadManifest(gist, cfg.token);
+    if (manifest.salt) localStorage.setItem('assistantSyncSalt', manifest.salt);
+    const keyCache = {};
+
+    const settingsFile = manifest.files?.settings || 'settings.json.enc';
+    const memoriesFile = manifest.files?.memories || 'memories.json.enc';
+    const settingsPayload = await syncDecryptPayload(await syncGetGistFileContent(gist, settingsFile, cfg.token), cfg.passphrase, keyCache);
+    const memoriesPayload = await syncDecryptPayload(await syncGetGistFileContent(gist, memoriesFile, cfg.token), cfg.passphrase, keyCache);
+
+    const remoteConversations = [];
+    const entries = Array.isArray(manifest.files?.conversations) ? manifest.files.conversations : [];
+    for (const entry of entries) {
+      if (!entry?.file) continue;
+      const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, entry.file, cfg.token), cfg.passphrase, keyCache);
+      if (payload?.conversation) remoteConversations.push(payload.conversation);
+    }
+
+    syncApplySettings(settingsPayload.settings || {});
+    const mergedMemories = syncMergeMemoryLists(await loadMemories(), memoriesPayload.memories || []);
+    await saveMemories(mergedMemories);
+
+    // Guarded on the manifest key so pulling from a gist written by an older client
+    // (which has no projects file) is a no-op rather than an error.
+    if (manifest.files?.projects) {
+      try {
+        const projectsPayload = await syncDecryptPayload(
+          await syncGetGistFileContent(gist, manifest.files.projects, cfg.token), cfg.passphrase, keyCache);
+        projects = syncMergeProjectLists(projects, projectsPayload.projects || []);
+        saveProjects();
+      } catch (e) {
+        console.warn('Project sync pull failed:', e);
+      }
+    }
+
+    const merged = await syncMergeConversationLists(conversations, remoteConversations);
+    conversations = merged.conversations;
+    if (conversations.length > 0 && !conversations.find(c => c.id === activeConvId)) activeConvId = conversations[0].id;
+    if (conversations.length === 0) activeConvId = null;
+    messages = getActiveConv()?.messages || [];
+    if (db) {
+      await idbPutAll('conversations', conversations);
+      await idbPut('meta', { key: 'activeConvId', value: activeConvId || '' });
+    }
+    localStorage.setItem('assistantActiveConvId', activeConvId || '');
+
+    renderSidebar();
+    renderMessages();
+    updateTokenInfo();
+    updateCharacterUI();
+    localStorage.setItem('assistantSyncLastPullAt', String(Date.now()));
+    renderSyncSettings();
+    syncSetStatus('current', 'Pulled', 'Merged ' + remoteConversations.length + ' remote conversations. Added ' + merged.added + ', updated ' + merged.updated + '.');
+    showToast('Sync pull complete.', 'success');
+  } catch (err) {
+    console.error('Sync pull failed:', err);
+    const message = err.name === 'OperationError' ? 'Could not decrypt sync data. Check the passphrase.' : (err.message || 'Unable to pull sync data.');
+    syncSetStatus('unknown', 'Pull failed', message);
+    showToast('Sync pull failed: ' + message, 'error', 6000);
+  }
 }
 
 function syncGeneratePassphrase() {
   try {
-    if (syncGetStoredConfig().gistId) {
-      showToast('Create a new sync Gist before changing its passphrase.', 'error');
-      return;
-    }
     const passphrase = syncBytesToBase64Url(syncRandomBytes(24)).match(/.{1,6}/g).join('-');
     const passEl = document.getElementById('setSyncPassphrase');
     if (passEl) passEl.value = passphrase;
@@ -8200,8 +7838,9 @@ function syncGeneratePassphrase() {
 
 function syncBuildPairingText() {
   const cfg = syncSaveSettings(false);
-  if (!cfg.gistId) throw new Error('Sync once to create a Gist before pairing.');
+  if (!cfg.gistId) throw new Error('Push once to create a Gist before pairing.');
   if (!cfg.passphrase) throw new Error('Sync passphrase is required for pairing.');
+  const includeToken = document.getElementById('setSyncQrIncludeToken')?.checked;
   const payload = {
     app: 'synapse',
     version: 1,
@@ -8209,6 +7848,7 @@ function syncBuildPairingText() {
     passphrase: cfg.passphrase,
     createdAt: Date.now()
   };
+  if (includeToken && cfg.token) payload.token = cfg.token;
   return 'sync:' + syncEncodePairingPayload(payload);
 }
 
@@ -8230,8 +7870,10 @@ function syncApplyPairingText(text, silent = false) {
     const payload = syncParsePairingText(source);
     const gistEl = document.getElementById('setSyncGistId');
     const passEl = document.getElementById('setSyncPassphrase');
+    const tokenEl = document.getElementById('setSyncToken');
     if (gistEl) gistEl.value = payload.gistId;
     if (passEl) passEl.value = payload.passphrase;
+    if (payload.token && tokenEl) tokenEl.value = payload.token;
     syncSaveSettings(false);
     showToast('Pairing code applied.', 'success');
     return true;
@@ -8343,6 +7985,202 @@ async function syncImportPairingQr(event) {
 // ============================================
 // Export as Markdown
 // ============================================
+// ============================================
+// Share (read-only public link)
+// ============================================
+// One plaintext file in a secret gist. Confidentiality comes from the unguessable gist
+// id, the same way ChatGPT and Claude share links work — the encrypted sync path can't
+// be reused because a reader has no passphrase.
+
+const SHARE_FILE = 'share.json';
+const SHARE_SCHEMA = 'share-v1';
+const SHARE_MAX_BYTES = 5000000;
+
+// Reduce a file part to its name. The dropped fields are the whole point: file.url is a
+// base64 copy of the upload and file.textContent is its full extracted text.
+function shareSafeContent(content) {
+  if (typeof content === 'string') return stripThinkTags(content).content;
+  if (!Array.isArray(content)) return String(content == null ? '' : content);
+  return content.map(part => {
+    if (part.type === 'file') return { type: 'file', file: { name: (part.file && part.file.name) || 'file' } };
+    if (part.type === 'text') return { type: 'text', text: stripThinkTags(part.text || '').content };
+    return part; // image_url parts are already just a data/remote URL the user chose to send
+  });
+}
+
+// ALLOWLIST, never a blacklist — a new private field added to conversations later must
+// not silently start leaking. Anything not named here is not published.
+function buildSharePayload(conv) {
+  return {
+    app: 'Synapse',
+    schema: SHARE_SCHEMA,
+    sharedAt: Date.now(),
+    title: conv.title || 'Shared chat',
+    messages: (conv.messages || [])
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => {
+        const out = { role: m.role, content: shareSafeContent(m.content) };
+        if (m.role === 'assistant') {
+          const images = (m.swipeImages && m.swipeImages[m.swipeIndex || 0]) || m.images || [];
+          if (images.length) { out.swipeImages = [images]; out.swipeIndex = 0; }
+        }
+        return out;
+      })
+  };
+}
+
+function shareLinkFor(gistId) {
+  return location.origin + location.pathname + '?share=' + encodeURIComponent(gistId);
+}
+
+async function copyShareText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    const helper = document.createElement('textarea');
+    helper.value = text;
+    helper.style.position = 'fixed';
+    helper.style.opacity = '0';
+    document.body.appendChild(helper);
+    helper.focus();
+    helper.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e2) { ok = false; }
+    helper.remove();
+    return ok;
+  }
+}
+
+async function shareConversation() {
+  const conv = getActiveConv();
+  if (!conv || !(conv.messages || []).length) {
+    showToast('Nothing to share in this chat yet.', 'error');
+    return;
+  }
+  const token = localStorage.getItem('assistantSyncGistToken') || '';
+  if (!token) {
+    showToast('Add a GitHub token in Settings → Sync first.', 'error');
+    return;
+  }
+  const payload = buildSharePayload(conv);
+  const json = JSON.stringify(payload);
+  if (json.length > SHARE_MAX_BYTES) {
+    showToast('Too large to share — inline images push this past the Gist size limit.', 'error');
+    return;
+  }
+  if (!conv.shareGistId && !confirm(
+    'Publish this chat to a secret GitHub Gist?\n\n' +
+    'Anyone with the link can read it. Your API key, files, personas, memories and ' +
+    'alternate responses are not included.')) return;
+
+  try {
+    showToast('Publishing…');
+    const files = {};
+    files[SHARE_FILE] = { content: json };
+    const gist = conv.shareGistId
+      ? await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(conv.shareGistId), {
+          method: 'PATCH', body: JSON.stringify({ files })
+        }, token)
+      : await fetchGist(SYNC_GIST_API_URL, {
+          method: 'POST',
+          body: JSON.stringify({ description: 'Synapse shared conversation', public: false, files })
+        }, token);
+    conv.shareGistId = gist.id;
+    saveConversations();
+    const link = shareLinkFor(gist.id);
+    const copied = await copyShareText(link);
+    showToast(copied ? 'Link copied. Anyone with it can read this chat.' : 'Shared: ' + link, 'success');
+  } catch (err) {
+    showToast('Share failed: ' + (err.message || err), 'error');
+  }
+}
+
+async function unshareConversation() {
+  const conv = getActiveConv();
+  if (!conv || !conv.shareGistId) {
+    showToast('This chat isn’t shared.');
+    return;
+  }
+  const token = localStorage.getItem('assistantSyncGistToken') || '';
+  if (!token) {
+    showToast('Add a GitHub token in Settings → Sync first.', 'error');
+    return;
+  }
+  try {
+    await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(conv.shareGistId), { method: 'DELETE' }, token);
+  } catch (err) {
+    showToast('Unshare failed: ' + (err.message || err), 'error');
+    return;
+  }
+  delete conv.shareGistId;
+  saveConversations();
+  showToast('Link revoked.', 'success');
+}
+
+async function initShareView(gistId) {
+  const area = document.getElementById('messagesArea');
+  const fail = (msg) => {
+    if (area) area.innerHTML = '<div class="chat-placeholder">' + escapeHTML(msg) + '</div>';
+  };
+  try {
+    // ponytail: anonymous GitHub API is 60 req/hr/IP. Switch to the gist raw URL if a
+    // shared link ever gets real traffic.
+    const gist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(gistId), { cache: 'no-store' });
+    const payload = JSON.parse(await syncGetGistFileContent(gist, SHARE_FILE));
+    if (!payload || payload.schema !== SHARE_SCHEMA || !Array.isArray(payload.messages)) {
+      throw new Error('Unrecognised share format');
+    }
+    messages = payload.messages;
+    document.title = (payload.title || 'Shared chat') + ' — Synapse';
+    const titleEl = document.querySelector('.toolbar-title');
+    if (titleEl) titleEl.textContent = payload.title || 'Shared chat';
+
+    const banner = document.createElement('div');
+    banner.className = 'share-banner';
+    banner.innerHTML = 'Read-only shared conversation · <a href="' +
+      escapeHTML(location.origin + location.pathname) + '">Open Synapse</a>';
+    document.body.appendChild(banner);
+
+    renderMessages();
+  } catch (err) {
+    console.warn('Share view failed:', err);
+    fail('This shared conversation is unavailable (it may have been unshared).');
+  }
+}
+
+// Runnable check for the one genuinely dangerous piece of this feature: the strip.
+// Run shareSelfTest() in the console after a build.
+function shareSelfTest() {
+  const conv = {
+    id: 'conv_1', title: 't', projectId: 'proj_1',
+    summary: 'SECRET_SUMMARY', persona: 'SECRET_PERSONA',
+    characterDescription: 'SECRET_CHAR', characterSystemPrompt: 'SECRET_SYSPROMPT',
+    tag: 'SECRET_TAG', shareGistId: 'SECRET_GIST',
+    docs: [{ id: 'd', name: 'n', text: 'SECRET_DOC' }],
+    messages: [
+      { role: 'user', content: [
+        { type: 'text', text: 'hi <think>SECRET_INLINE</think>' },
+        { type: 'file', file: { name: 'a.txt', url: 'data:SECRET_URL', textContent: 'SECRET_FILE' } }
+      ] },
+      { role: 'assistant', content: 'ok', swipes: ['ok', 'SECRET_SWIPE'], swipeIndex: 0,
+        swipeThinking: ['SECRET_THINK'], swipeToolUse: [[{ url: 'SECRET_TOOL' }]],
+        llm: { profileName: 'SECRET_PROFILE', providerName: 'SECRET_PROVIDER' } },
+      { role: 'system', content: 'SECRET_SYSTEM' }
+    ]
+  };
+  const json = JSON.stringify(buildSharePayload(conv));
+  const leaks = ['SECRET_SUMMARY', 'SECRET_PERSONA', 'SECRET_CHAR', 'SECRET_SYSPROMPT', 'SECRET_TAG',
+    'SECRET_GIST', 'SECRET_DOC', 'SECRET_URL', 'SECRET_FILE', 'SECRET_SWIPE', 'SECRET_THINK',
+    'SECRET_TOOL', 'SECRET_PROFILE', 'SECRET_PROVIDER', 'SECRET_SYSTEM', 'SECRET_INLINE', 'proj_1', 'conv_1']
+    .filter(s => json.includes(s));
+  if (leaks.length) throw new Error('share payload leaked: ' + leaks.join(', '));
+  if (!json.includes('a.txt')) throw new Error('share payload lost the file name');
+  if (!json.includes('hi')) throw new Error('share payload lost the message text');
+  console.log('shareSelfTest OK');
+  return true;
+}
+
 function exportMarkdown() {
   const conv = getActiveConv();
   if (!conv || conv.messages.length === 0) { showToast('No messages to export.', 'info'); return; }
@@ -9206,11 +9044,12 @@ async function importCharacterCard(event) {
     if (card.first_mes) {
       const firstMesTemplate = typeof card.first_mes === 'string' ? card.first_mes : String(card.first_mes);
       const firstMes = isStMacroEnabled() ? applyStMacros(firstMesTemplate, getRpMacroContext(conv)) : firstMesTemplate;
-      conv.messages.push(syncCreateMessage('assistant', {
+      conv.messages.push({
+        role: 'assistant',
         content: firstMes,
         swipes: [firstMes],
         swipeIndex: 0
-      }, conv.createdAt + 1));
+      });
     }
 
     conversations.unshift(conv);
@@ -9324,6 +9163,25 @@ function toggleVoice() {
 
 // Window bridge for inline handlers and external hooks
 const __windowBridge = {
+  // Share links (inline onclick in index.html; shareSelfTest is for the console)
+  shareConversation,
+  unshareConversation,
+  buildSharePayload,
+  shareSafeContent,
+  shareLinkFor,
+  initShareView,
+  shareSelfTest,
+  // Projects (inline onclick in index.html)
+  openProjectsModal,
+  selectProjectInModal,
+  newProjectFromModal,
+  saveProjectFromModal,
+  deleteProject,
+  addProjectFiles,
+  removeProjectDoc,
+  showProjectPicker,
+  assignConversationToProject,
+  getProject,
   openModal,
   closeModal,
   closeTopModal,
@@ -9395,10 +9253,6 @@ const __windowBridge = {
   buildApiContent,
   extractImages,
   renderMarkdown,
-  areEmotionSpritesEnabled,
-  getEmotionSpriteSet,
-  getEmotionSpritePrefix,
-  renderEmotionSprites,
   addCodeCopyButtons,
   highlightCodeBlocks,
   addLineNumbers,
@@ -9419,6 +9273,17 @@ const __windowBridge = {
   idbDelete,
   idbClear,
   idbPutAll,
+  generateCacheKey,
+  cacheLookup,
+  cacheStore,
+  cacheDelete,
+  cacheClear,
+  cacheCleanupExpired,
+  cacheGetStats,
+  toggleCache,
+  clearResponseCache,
+  cleanupExpiredCache,
+  updateCacheStats,
   genId,
   saveConversations,
   debouncedSave,
@@ -9496,19 +9361,8 @@ const __windowBridge = {
   importConversation,
   syncSaveSettings,
   renderSyncSettings,
-  syncNow,
-  syncNormalizeSnapshot,
-  syncMergeSnapshots,
-  syncBuildBaseHashes,
-  syncSnapshotContains,
-  syncSanitizeMessageForRemote,
-  syncBuildGistFiles,
-  syncDecryptPayload,
-  syncApplySnapshot,
-  syncResolveReviewItem,
   syncPushToGist,
   syncPullFromGist,
-  syncOpenReviewLater,
   syncGeneratePassphrase,
   syncRenderPairingQr,
   syncCopyPairingText,

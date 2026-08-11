@@ -191,6 +191,32 @@ body {
 .tag-picker-item:hover { transform: scale(1.2); }
 .tag-picker-item.active { border-color: var(--text-primary); }
 
+/* Project picker reuses .tag-picker's positioning/chrome but lists names, not swatches. */
+.project-picker {
+  flex-direction: column;
+  flex-wrap: nowrap;
+  min-width: 160px;
+  max-width: 240px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.project-picker-item {
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.85em;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.project-picker-item:hover { background: var(--hover); }
+.project-picker-item.active { background: var(--hover); font-weight: 600; }
+
 .conv-list {
   flex: 1;
   overflow-y: auto;
@@ -1010,6 +1036,7 @@ body {
   .msg-wrapper .msg-actions { display: flex; }
   .code-block-wrapper .code-copy-btn { opacity: 1; }
   .code-block-wrapper .code-download-btn { opacity: 1; }
+  .code-block-wrapper .code-preview-btn { opacity: 1; }
   .conv-item .conv-delete { display: block; }
 }
 
@@ -1045,6 +1072,9 @@ body {
   .swipe-controls button { padding: 8px 14px; min-height: 36px; }
   .regen-btn { padding: 10px 16px; min-height: 36px; }
   .code-copy-btn { padding: 8px 12px; font-size: 0.8em; min-height: 36px; }
+  /* Touch padding widens these buttons, so re-space them to stop the row overlapping. */
+  .code-download-btn { padding: 8px 10px; font-size: 0.8em; min-height: 36px; right: 78px; }
+  .code-preview-btn { padding: 8px 10px; font-size: 0.8em; min-height: 36px; right: 122px; }
   .conv-item .conv-delete { padding: 8px; min-width: 36px; min-height: 36px; display: flex; align-items: center; justify-content: center; }
   .conv-pin, .conv-item .conv-delete { min-width: 44px; min-height: 44px; }
   .input-row textarea, .modal input, .modal textarea, .modal select, .sidebar-search input, .chat-search-bar input, .msg-edit-textarea { font-size: 16px; }
@@ -1142,6 +1172,42 @@ body {
   font-size: 0.8em;
   margin-left: auto;
 }
+.setting-hint {
+  color: var(--text-secondary);
+  font-size: 0.8em;
+  line-height: 1.4;
+  margin: -4px 0 10px;
+}
+
+/* Read-only shared-conversation view (?share=...). The hidden controls are also inert
+   thanks to the readOnlyShare guard in saveConversations — this is presentation only. */
+body.share-view .sidebar,
+body.share-view .sidebar-overlay,
+body.share-view .toolbar-toggle,
+body.share-view .toolbar-right,
+body.share-view .input-area,
+body.share-view .scroll-fab,
+body.share-view .select-toolbar,
+body.share-view .msg-actions,
+body.share-view .regen-btn,
+body.share-view .swipe-controls,
+body.share-view .branch-controls,
+body.share-view .msg-meta { display: none !important; }
+body.share-view .main { margin-left: 0; }
+.share-banner {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 8px 12px;
+  text-align: center;
+  font-size: 0.8em;
+  color: var(--text-secondary);
+  background: var(--sidebar-bg);
+  border-top: 1px solid var(--card-border);
+  z-index: 50;
+}
+.share-banner a { color: var(--accent); }
 .settings-note {
   color: var(--text-secondary);
   font-size: 0.8em;
@@ -1388,6 +1454,36 @@ pre.has-line-numbers { counter-reset: code-line; }
 .code-block-wrapper:hover .code-download-btn { opacity: 1; }
 .code-download-btn:hover { background: var(--overlay-25); color: var(--text-primary); }
 
+.code-preview-btn {
+  position: absolute;
+  top: 6px;
+  right: 88px;
+  padding: 3px 8px;
+  font-size: 0.75em;
+  font-family: inherit;
+  background: var(--overlay-15);
+  border: none;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.2s, background 0.2s;
+}
+.code-block-wrapper:hover .code-preview-btn { opacity: 1; }
+.code-preview-btn:hover { background: var(--overlay-25); color: var(--text-primary); }
+.artifact-frame {
+  display: block;
+  width: 100%;
+  height: 420px;
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  /* Explicit white: artifacts assume a page background and vanish on dark themes. */
+  background: #fff;
+  resize: vertical;
+  overflow: auto;
+}
+
 /* Mermaid container */
 .mermaid-container { margin: 6px 0; overflow-x: auto; }
 .mermaid-container svg { max-width: 100%; }
@@ -1417,6 +1513,11 @@ pre.has-line-numbers { counter-reset: code-line; }
 
 /* Date group headers */
 .conv-group-header { font-size: 0.7em; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; padding: 10px 12px 4px; }
+.conv-group-header.project-header { display: flex; align-items: center; gap: 6px; }
+.conv-group-header.project-header > span { flex: 1; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-group-header.project-header > span:hover { color: var(--text-primary); }
+.project-add-btn { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 1.3em; line-height: 1; padding: 0 4px; border-radius: 4px; }
+.project-add-btn:hover { background: var(--hover); color: var(--text-primary); }
 
 /* Drag-drop reorder */
 .conv-item.dragging { opacity: 0.4; }

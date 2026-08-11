@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <link rel="icon" href="favicon.ico" type="image/x-icon">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#1a1a1a">
+<link rel="manifest" href="./manifest.json">
 <title>Synapse</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -13,7 +15,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="./styles.css?v=20260722a">
+<link rel="stylesheet" href="./styles.css?v=20260811a">
 </head>
 <body>
 
@@ -39,7 +41,7 @@
   <div class="tag-filter-bar" id="tagFilterBar"></div>
   <div class="conv-list" id="convList"></div>
   <div class="sidebar-footer">
-    made by <a href="https://platberlitz.github.io/" target="_blank">purachina</a> and <a href="https://builtbystone.dev" target="_blank">stoneman</a>
+    made by <a href="https://platberlitz.github.io/" target="_blank">purachina</a>
     <span class="footer-cta">click for more stuff from me</span>
     <div class="update-status" id="updateStatus" hidden></div>
   </div>
@@ -54,11 +56,6 @@
       <span class="toolbar-title">Synapse</span>
     </div>
     <div class="toolbar-right">
-      <div class="sync-indicator" id="syncIndicator" hidden>
-        <span class="sync-indicator-dot" aria-hidden="true"></span>
-        <span class="sync-indicator-text" id="syncQuickStatus">Sync status</span>
-        <button class="sync-quick-button" id="syncQuickButton" type="button" onclick="syncNow(true)" title="Sync now" aria-label="Sync now">&#8635;</button>
-      </div>
       <div class="toolbar-more">
         <button class="toolbar-btn" onclick="toggleToolbarMenu(event)" title="More actions" aria-label="More actions">&#8943;</button>
         <div class="toolbar-menu" id="toolbarMenu">
@@ -66,6 +63,9 @@
           <button onclick="exportMarkdown();closeToolbarMenu()">&#128221; Export as Markdown</button>
           <button onclick="exportAllConversations();closeToolbarMenu()">&#8659; Export all chats</button>
           <button onclick="document.getElementById('importInput').click();closeToolbarMenu()">&#8613; Import chat</button>
+          <button onclick="shareConversation();closeToolbarMenu()">&#128279; Share chat (link)</button>
+          <button onclick="unshareConversation();closeToolbarMenu()">&#128683; Unshare chat</button>
+          <button onclick="openProjectsModal();closeToolbarMenu()">&#128193; Projects</button>
           <button onclick="openFileSearch();closeToolbarMenu()">&#128270; Search files</button>
           <button onclick="openSummaryModal();closeToolbarMenu()">&#128220; Conversation summary</button>
           <button onclick="openStatusPanel();closeToolbarMenu()">&#9888; Status / diagnostics</button>
@@ -197,12 +197,34 @@
       </label>
       <label>Temperature</label>
       <input type="number" id="setTemperature" step="0.1" min="0" max="2" placeholder="e.g. 0.7 (leave empty for default)">
+      <div class="setting-hint">Not sent to Claude Opus 5 / Sonnet 5 / Opus 4.7+ &mdash; those models reject it.</div>
+      <label>Max response tokens</label>
+      <input type="number" id="setMaxTokens" step="256" min="256" placeholder="8192">
+      <div class="modal-section">Anthropic Options</div>
+      <label class="toggle-row">
+        <input type="checkbox" id="setPromptCache" checked> Prompt caching
+        <span class="toggle-hint">Cuts repeat cost ~90%</span>
+      </label>
+      <div class="setting-hint">Caches the system prompt between turns. Needs roughly 1,000+ tokens of system prompt before it engages &mdash; shorter prompts silently won't cache.</div>
+      <label class="toggle-row">
+        <input type="checkbox" id="setThinking"> Extended thinking
+      </label>
+      <label>Thinking effort</label>
+      <select id="setThinkingEffort">
+        <option value="">Default</option>
+        <option value="low">Low</option>
+        <option value="medium">Medium</option>
+        <option value="high">High</option>
+        <option value="xhigh">Extra high</option>
+        <option value="max">Max</option>
+      </select>
       <label>Extra Parameters (JSON)</label>
       <textarea id="setExtraParams" placeholder='{"temperature": 0.7, "max_tokens": 4096}'></textarea>
       <label>Exclude Parameters (comma-separated)</label>
       <input type="text" id="setExcludeParams" placeholder="e.g. stream,model">
       <label>Assistant Prefill</label>
       <input type="text" id="setPrefill" placeholder="e.g. Sure! Here's">
+      <div class="setting-hint">Not supported by Claude Opus 5 / Sonnet 5 / Opus 4.6+ &mdash; leave empty on those models.</div>
     </div>
 
     <div class="settings-tab-content" id="settingsTab-prompts">
@@ -301,18 +323,6 @@
     <input type="text" id="setMsgFontSize" placeholder="0.95em (default)">
     <label>Message Width</label>
     <input type="text" id="setMsgMaxWidth" placeholder="75% (default)">
-    <div class="modal-section">Emotion Sprites</div>
-    <label class="toggle-row">
-      <input type="checkbox" id="setEmotionSprites">
-      Enable emotion sprites
-    </label>
-    <label for="setEmotionSpriteSet">Sprite set</label>
-    <select id="setEmotionSpriteSet">
-      <option value="auto">Auto</option>
-      <option value="claude">Claude</option>
-      <option value="gpt">GPT</option>
-      <option value="gemini">Gemini</option>
-    </select>
     </div>
 
     <div class="settings-tab-content" id="settingsTab-tools">
@@ -353,14 +363,14 @@
 
     <div class="settings-tab-content" id="settingsTab-sync">
       <div class="modal-section">GitHub Gist</div>
-      <div class="settings-note">Encrypted sync keeps conversations, messages, memories, and conversation personas available across your devices. Keys, tokens, provider profiles, settings, drafts, attachments, and caches stay on this device.</div>
+      <div class="settings-note">Manual sync stores encrypted conversations, memories, presets, prompts, and appearance settings in a private Gist. API keys, provider URLs, search keys, and proxy settings stay on this device.</div>
       <form class="password-field-form" onsubmit="return false">
         <input class="sr-only" type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true">
         <label for="setSyncToken">GitHub token</label>
         <input type="password" id="setSyncToken" autocomplete="off" placeholder="Token with Gist read/write access">
       </form>
       <label for="setSyncGistId">Gist ID</label>
-      <input type="text" id="setSyncGistId" autocomplete="off" placeholder="Leave empty to create one on sync">
+      <input type="text" id="setSyncGistId" autocomplete="off" placeholder="Leave empty to create one on Push">
       <label for="setSyncPassphrase">Sync passphrase</label>
       <div class="model-selector-row sync-passphrase-row">
         <input type="password" id="setSyncPassphrase" autocomplete="off" placeholder="Used only for local encryption and decryption">
@@ -370,18 +380,19 @@
         <span class="debug-status-pill" id="syncStatus">Not configured</span>
         <button class="btn btn-secondary debug-inline-btn" type="button" onclick="syncSaveSettings()">Save</button>
       </div>
-      <div class="settings-note" id="syncDetails">Add a GitHub token and passphrase, then sync to create your private encrypted Gist.</div>
-      <div class="sync-device-label" id="syncDeviceLabel">This device</div>
+      <div class="settings-note" id="syncDetails">Add a GitHub token and passphrase, then push to create or update your private sync Gist.</div>
       <div class="sync-actions">
-        <button class="btn btn-primary" type="button" onclick="syncSaveSettings(false);syncNow(true)">Sync now</button>
-      </div>
-      <div class="sync-review-row" id="syncReviewRow" hidden>
-        <span id="syncReviewCount">Review later: 0</span>
-        <button class="btn btn-secondary debug-inline-btn" type="button" onclick="syncOpenReviewLater()">Review</button>
+        <button class="btn btn-primary" type="button" onclick="syncPushToGist()">Push now</button>
+        <button class="btn btn-secondary" type="button" onclick="syncPullFromGist()">Pull now</button>
       </div>
 
       <div class="modal-section">Pairing</div>
-      <div class="settings-note">The pairing code contains the Gist ID and passphrase. Enter the GitHub token separately on each device.</div>
+      <label class="toggle-row">
+        <input type="checkbox" id="setSyncQrIncludeToken">
+        Include GitHub token in pairing QR
+        <span class="toggle-hint">Off is safer</span>
+      </label>
+      <div class="settings-note">The pairing code can fill the Gist ID and passphrase on another device. Only include the token if you trust the room and the receiving device.</div>
       <div class="sync-actions">
         <button class="btn btn-secondary" type="button" onclick="syncRenderPairingQr()">Show QR</button>
         <button class="btn btn-secondary" type="button" onclick="syncCopyPairingText()">Copy code</button>
@@ -414,6 +425,19 @@
         <button class="btn btn-secondary debug-inline-btn" type="button" onclick="checkLocalUpdateStatus(true)">Check</button>
       </div>
       <div class="settings-note" id="localUpdateDetails">Update checks only appear while Synapse is running locally.</div>
+      <div class="modal-section">Response Caching</div>
+      <label class="toggle-row">
+        <input type="checkbox" id="cacheEnabled" onchange="toggleCache(this.checked)">
+        Enable Response Cache
+        <span class="toggle-hint">7 day TTL</span>
+      </label>
+      <div class="debug-status-row">
+        <span class="settings-stat" id="cacheStats">Loading...</span>
+      </div>
+      <div class="debug-actions">
+        <button class="btn btn-secondary" type="button" onclick="clearResponseCache()">Clear cache</button>
+        <button class="btn btn-secondary" type="button" onclick="cleanupExpiredCache()">Cleanup expired</button>
+      </div>
       <div class="modal-section">Recent Logs</div>
       <pre class="debug-log-preview" id="debugLogPreview">No debug events yet.</pre>
       <div class="debug-actions">
@@ -453,6 +477,36 @@
   </div>
 </div>
 
+<!-- Projects Modal -->
+<div class="modal-overlay" id="projectsModal" aria-hidden="true">
+  <div class="modal" aria-labelledby="projectsTitle">
+    <h2 id="projectsTitle">Projects</h2>
+    <div class="setting-hint">A project groups chats and gives them all the same instructions and files.</div>
+    <div class="model-selector-row">
+      <select id="projSelect" onchange="selectProjectInModal(this.value)" aria-label="Select project"></select>
+      <button class="btn" onclick="newProjectFromModal()">New</button>
+      <button class="btn" onclick="deleteProject(document.getElementById('projSelect').value)">Delete</button>
+    </div>
+    <div id="projEmptyState" class="setting-hint" style="display:none">No projects yet. Create one, then move chats into it with the folder button in the sidebar.</div>
+    <div id="projEditorBody">
+      <label>Name</label>
+      <input type="text" id="projName" placeholder="Project name">
+      <label>Project instructions</label>
+      <textarea id="projInstructions" rows="6" placeholder="Applied to every chat in this project."></textarea>
+      <label>Project files</label>
+      <div id="projDocList" class="prompt-entry-list"></div>
+      <input type="file" id="projFileInput" multiple style="display:none" onchange="addProjectFiles(event)">
+      <button class="btn" onclick="document.getElementById('projFileInput').click()">Add files</button>
+      <div class="setting-hint" id="projChatCount"></div>
+      <div class="setting-hint">Project files are sent with every message in this project, so they count toward the token cost of each request.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal('projectsModal')">Cancel</button>
+      <button class="btn btn-primary" onclick="saveProjectFromModal()">Save</button>
+    </div>
+  </div>
+</div>
+
 <!-- Update Instructions Modal -->
 <div class="modal-overlay" id="updateInstructionsModal" aria-hidden="true">
   <div class="modal update-instructions-modal" aria-labelledby="updateInstructionsTitle">
@@ -464,6 +518,6 @@
   </div>
 </div>
 
-<script type="module" src="./js/main.js?v=20260722a"></script>
+<script type="module" src="./js/main.js?v=20260811a"></script>
 </body>
 </html>
