@@ -20,16 +20,28 @@ let modelOverride = null;
 let mentionActive = false;
 let mentionIdx = 0;
 let activeTagFilter = null;
+let conversationView = localStorage.getItem('assistantConversationView') || 'active';
+let conversationSort = localStorage.getItem('assistantConversationSort') || 'updated';
+let bulkMode = false;
+const selectedConversationIds = new Set();
+let pendingImport = null;
+let commandActive = false;
+let commandIdx = 0;
+let tokenInfoRequestId = 0;
 let lastSearchStatus = { ok: null, error: null, at: null, query: '' };
 let openModalStack = [];
 const modalFocusReturn = new WeakMap();
+let transientDialogFocusReturn = null;
+let transientDialogClose = null;
+let toolbarMenuFocusReturn = null;
+let composerToolsFocusReturn = null;
 let globalSearchDismiss = null;
 let debugLogBuffer = [];
 let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-08-11',
+  buildDate: '2026-08-12',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -42,11 +54,102 @@ const SYNC_SETTINGS_KEYS = [
   'llmEnableStMacros', 'llmRpUserName', 'llmInputCost', 'llmOutputCost',
   'llmWebSearch', 'llmForceSearch', 'llmMemoryEnabled', 'llmHoldScreenshot',
   'llmCacheEnabled', 'llmPromptEntries', 'assistantPresets', 'assistantProfiles', 'assistantTheme',
-  'assistantCustomTheme', 'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth'
+  'assistantCustomTheme', 'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth',
+  'llmContextWindow', 'llmUrlFetch', 'llmToolConfirm'
 ];
 const SYNC_PROFILE_SECRET_KEYS = [
-  'llmApiKey', 'llmSearchApiKey', 'llmProxyUrl', 'llmCorsProxy', 'llmSearchApiUrl'
+  'llmApiKey', 'llmSearchApiKey', 'assistantSyncGistToken', 'assistantSyncPassphrase'
 ];
+const PROFILE_SECRET_KEY_RE = /(?:api[-_ ]?key|token|secret|passphrase|password|authorization|credential|cookie)/i;
+
+function isCredentialSettingKey(key) {
+  return SYNC_PROFILE_SECRET_KEYS.includes(key) || PROFILE_SECRET_KEY_RE.test(String(key || ''));
+}
+
+function stripCredentialSettings(settings) {
+  const safe = {};
+  Object.entries(settings && typeof settings === 'object' ? settings : {}).forEach(([key, value]) => {
+    if (!isCredentialSettingKey(key)) safe[key] = value;
+  });
+  return safe;
+}
+
+function sanitizeStoredUrl(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  try {
+    const url = new URL(text);
+    if (!['http:', 'https:'].includes(url.protocol)) return '';
+    url.username = '';
+    url.password = '';
+    Array.from(url.searchParams.keys()).forEach(key => {
+      if (/(?:^|[-_])key$|(?:api[-_ ]?key|token|secret|password|auth)/i.test(key)) url.searchParams.delete(key);
+    });
+    return url.toString();
+  } catch (e) {
+    return '';
+  }
+}
+
+function safeHttpUrl(value) {
+  return sanitizeStoredUrl(value);
+}
+
+function safeDataUrl(value, mediaOnly = false) {
+  const text = String(value || '').trim();
+  const pattern = mediaOnly
+    ? /^data:image\/(?:avif|gif|jpe?g|png|webp);base64,[A-Za-z0-9+/=\s]+$/i
+    : /^data:(?:image\/[A-Za-z0-9.+-]+|application\/(?:pdf|json|octet-stream)|text\/[A-Za-z0-9.+-]+);base64,[A-Za-z0-9+/=\s]+$/i;
+  return pattern.test(text) ? text : '';
+}
+
+function safeMediaUrl(value) {
+  const text = String(value || '').trim();
+  if (/^blob:/i.test(text)) return text;
+  return safeHttpUrl(text) || safeDataUrl(text, true);
+}
+
+function safeFileUrl(value) {
+  const text = String(value || '').trim();
+  if (/^blob:/i.test(text)) return text;
+  return safeDataUrl(text);
+}
+
+function sanitizeProfileSettings(settings) {
+  const safe = stripCredentialSettings(settings);
+  ['llmProxyUrl', 'llmSearchApiUrl', 'llmCorsProxy'].forEach(key => {
+    if (safe[key] != null) safe[key] = sanitizeStoredUrl(safe[key]);
+  });
+  return safe;
+}
+
+function sanitizeProfileRecord(profile) {
+  const source = profile && typeof profile === 'object' ? profile : {};
+  const createdAt = Number(source.createdAt) || Date.now();
+  return {
+    id: String(source.id || ('profile_' + createdAt)),
+    name: String(source.name || 'Unnamed profile').slice(0, 120),
+    createdAt,
+    updatedAt: Number(source.updatedAt) || createdAt,
+    settings: sanitizeProfileSettings(source.settings)
+  };
+}
+
+const PROVIDER_PRESETS = {
+  openai: { label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', apiFormat: 'openai', keyRequired: true },
+  anthropic: { label: 'Anthropic', baseUrl: 'https://api.anthropic.com/v1', apiFormat: 'anthropic', keyRequired: true },
+  openrouter: { label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', apiFormat: 'openai', keyRequired: true },
+  ollama: { label: 'Ollama', baseUrl: 'http://localhost:11434/v1', apiFormat: 'openai', keyRequired: false },
+  lmstudio: { label: 'LM Studio', baseUrl: 'http://localhost:1234/v1', apiFormat: 'openai', keyRequired: false },
+  custom: { label: 'Custom', baseUrl: '', apiFormat: 'auto', keyRequired: false }
+};
+
+const COMMAND_REGISTRY = [
+  { name: 'search', aliases: ['web', 's'], usage: '/search <query>', description: 'Search the web directly' },
+  { name: 'files', aliases: ['file', 'docs', 'doc'], usage: '/files <query>', description: 'Search attached text locally' }
+];
+
+const SOURCE_CITATION_INSTRUCTION = 'When you use web sources, cite them inline as [1], [2], etc. using the numbered results supplied. Do not invent source numbers.';
 
 const TAG_COLORS = [
   { name: 'Red', color: '#ef4444' },
@@ -99,6 +202,37 @@ function closeTopModal(restoreFocus = true) {
   return true;
 }
 
+function openTransientDialog(overlay, popup, focusTarget = popup) {
+  if (transientDialogClose) transientDialogClose();
+  transientDialogFocusReturn = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  popup.setAttribute('role', 'dialog');
+  popup.setAttribute('aria-modal', 'true');
+  if (!popup.hasAttribute('tabindex')) popup.setAttribute('tabindex', '-1');
+  const close = () => {
+    overlay.remove();
+    popup.remove();
+    document.removeEventListener('keydown', onKey);
+    const previous = transientDialogFocusReturn;
+    transientDialogFocusReturn = null;
+    if (transientDialogClose === close) transientDialogClose = null;
+    if (previous && document.contains(previous)) previous.focus();
+  };
+  const onKey = event => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      close();
+      return;
+    }
+    trapFocus(popup, event);
+  };
+  overlay.onclick = event => { if (event.target === overlay) close(); };
+  document.body.append(overlay, popup);
+  document.addEventListener('keydown', onKey);
+  requestAnimationFrame(() => (focusTarget || popup).focus());
+  transientDialogClose = close;
+  return close;
+}
+
 function initModalAccessibility() {
   document.querySelectorAll('.modal-overlay').forEach(modal => {
     const dialog = modal.querySelector('.modal') || modal;
@@ -137,6 +271,186 @@ function prefersReducedMotion() {
 
 function getScrollBehavior() {
   return prefersReducedMotion() ? 'auto' : 'smooth';
+}
+
+function announce(message) {
+  const live = document.getElementById('liveStatus');
+  if (!live) return;
+  live.textContent = '';
+  requestAnimationFrame(() => { live.textContent = String(message || ''); });
+}
+
+function sanitizeErrorDetail(error) {
+  if (error == null || String(error?.message || error || '').trim() === '') return '';
+  let text = String(error?.message || error);
+  text = text.replace(/(authorization|x-api-key|api[-_ ]?key|token|secret)\s*[:=]\s*[^\s,;]+/ig, '$1: [redacted]');
+  text = text.replace(/https?:\/\/[^\s]+/ig, match => {
+    try { const url = new URL(match); return url.origin + url.pathname; } catch { return '[url]'; }
+  });
+  return text.length > 240 ? text.slice(0, 237) + '...' : text;
+}
+
+function renderConnectionChip() {
+  const providerEl = document.getElementById('connectionChipProvider');
+  const modelEl = document.getElementById('connectionChipModel');
+  const chip = document.getElementById('connectionChip');
+  if (!providerEl || !modelEl) return;
+  const model = localStorage.getItem('llmModel') || '';
+  const format = localStorage.getItem('llmApiFormat') || detectApiFormat(model);
+  const provider = getLlmProviderInfo(model, format, localStorage.getItem('llmProxyUrl') || '');
+  const profile = getActiveProfileSummary();
+  providerEl.textContent = model ? provider.name : 'Not connected';
+  modelEl.textContent = model ? (formatModelForDisplay(model, 25) + (profile?.name ? ' · ' + profile.name : '')) : 'Set up a provider';
+  if (chip) chip.setAttribute('aria-label', model ? 'API connection: ' + provider.name + ', ' + model + (profile?.name ? ', profile ' + profile.name : '') : 'Open API settings');
+}
+
+function getKeyStorageMode() {
+  const saved = localStorage.getItem('llmKeyStorage');
+  if (saved === 'session' || saved === 'remember') return saved;
+  // Legacy llmApiKey was always localStorage, so keep it remembered.
+  return localStorage.getItem('llmApiKey') ? 'remember' : (sessionStorage.getItem('llmApiKey') ? 'session' : 'remember');
+}
+
+function getApiKey() {
+  return (sessionStorage.getItem('llmApiKey') || localStorage.getItem('llmApiKey') || '').trim();
+}
+
+function setApiKey(key, mode = getKeyStorageMode()) {
+  const value = String(key || '').trim();
+  localStorage.setItem('llmKeyStorage', mode === 'session' ? 'session' : 'remember');
+  localStorage.removeItem('llmApiKey');
+  sessionStorage.removeItem('llmApiKey');
+  if (value) (mode === 'session' ? sessionStorage : localStorage).setItem('llmApiKey', value);
+  if (mode === 'session') scrubProfileSecrets('llmApiKey');
+}
+
+function scrubProfileSecrets(field = null) {
+  const profiles = loadProfiles();
+  let changed = false;
+  profiles.forEach(profile => {
+    if (!profile.settings) return;
+    const safe = field
+      ? Object.fromEntries(Object.entries(profile.settings).filter(([key]) => key !== field))
+      : stripCredentialSettings(profile.settings);
+    if (JSON.stringify(safe) !== JSON.stringify(profile.settings)) {
+      profile.settings = safe;
+      changed = true;
+    }
+  });
+  if (changed) saveProfiles(profiles);
+}
+
+function getSelectedKeyStorage(target) {
+  const name = target === 'setup' ? 'setupKeyStorage' : 'settingsKeyStorage';
+  return document.querySelector('input[name="' + name + '"]:checked')?.value || getKeyStorageMode();
+}
+
+function setKeyStorageInputs(mode) {
+  document.querySelectorAll('input[name="setupKeyStorage"], input[name="settingsKeyStorage"]').forEach(input => {
+    input.checked = input.value === mode;
+  });
+}
+
+function getProviderPreset(name) {
+  return PROVIDER_PRESETS[name] || PROVIDER_PRESETS.custom;
+}
+
+function inferProviderKey(settings = {}) {
+  const explicit = settings.llmProvider || localStorage.getItem('llmProvider') || '';
+  if (explicit && PROVIDER_PRESETS[explicit]) return explicit;
+  const base = String(settings.llmProxyUrl || localStorage.getItem('llmProxyUrl') || '').toLowerCase();
+  const format = settings.llmApiFormat || localStorage.getItem('llmApiFormat') || 'auto';
+  if (base.includes('openrouter')) return 'openrouter';
+  if (base.includes('anthropic') || format === 'anthropic') return 'anthropic';
+  if (base.includes('11434') || base.includes('ollama')) return 'ollama';
+  if (base.includes('1234') || base.includes('lmstudio')) return 'lmstudio';
+  if (base.includes('openai.com')) return 'openai';
+  return 'custom';
+}
+
+function providerRequiresKey(settings = {}) {
+  return getProviderPreset(inferProviderKey(settings)).keyRequired;
+}
+
+function normalizeConversationRecord(raw) {
+  const conv = raw && typeof raw === 'object' ? raw : {};
+  const normalized = { ...conv };
+  normalized.id = String(normalized.id || genId());
+  normalized.title = String(normalized.title || 'New Chat');
+  normalized.createdAt = Number(normalized.createdAt) || Date.now();
+  normalized.updatedAt = Number(normalized.updatedAt) || normalized.createdAt;
+  normalized.messages = Array.isArray(normalized.messages) ? normalized.messages : [];
+  normalized.messages = normalized.messages.filter(m => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'system'));
+  normalized.messages.forEach(message => {
+    if (Array.isArray(message.content)) {
+      message.content = message.content.map(part => {
+        if (part?.type === 'image_url') return { ...part, image_url: { ...(part.image_url || {}), url: safeMediaUrl(part.image_url?.url) } };
+        if (part?.type === 'file') return { ...part, file: { ...(part.file || {}), url: safeFileUrl(part.file?.url) } };
+        return part;
+      });
+    }
+    if (Array.isArray(message.images)) message.images = message.images.map(safeMediaUrl).filter(Boolean);
+    if (Array.isArray(message.swipeImages)) message.swipeImages = message.swipeImages.map(images => (Array.isArray(images) ? images.map(safeMediaUrl).filter(Boolean) : []));
+    if (Array.isArray(message.swipeSources)) message.swipeSources = message.swipeSources.map(sources => (Array.isArray(sources) ? sources.map(source => ({ ...source, url: safeHttpUrl(source?.url) })).filter(source => source.url) : []));
+    if (Array.isArray(message.swipeToolUse)) message.swipeToolUse = message.swipeToolUse.map(blocks => (Array.isArray(blocks) ? blocks.map(block => ({
+      ...block,
+      url: block?.url ? safeHttpUrl(block.url) : block?.url,
+      results: Array.isArray(block?.results) ? block.results.map(result => ({ ...result, url: safeHttpUrl(result?.url) })).filter(result => result.url || result.title) : block?.results
+    })) : []));
+    if (message.role === 'assistant') {
+      if (!Array.isArray(message.swipes) || message.swipes.length === 0) message.swipes = [typeof message.content === 'string' ? message.content : ''];
+      if (!Number.isInteger(message.swipeIndex)) message.swipeIndex = 0;
+      message.swipeIndex = Math.max(0, Math.min(message.swipes.length - 1, message.swipeIndex));
+    }
+    if (message.includeInContext !== false) message.includeInContext = true;
+  });
+  if (normalized.characterAvatar) normalized.characterAvatar = safeMediaUrl(normalized.characterAvatar);
+  if (!normalized.toolPolicy || typeof normalized.toolPolicy !== 'object') normalized.toolPolicy = null;
+  if (!normalized.draft || typeof normalized.draft !== 'object') normalized.draft = { text: '', attachments: [] };
+  normalized.draft.attachments = cloneDraftAttachments(normalized.draft.attachments);
+  return normalized;
+}
+
+function normalizeToolPolicy(policy) {
+  const source = policy && typeof policy === 'object' ? policy : {};
+  const fallback = getGlobalToolPolicy();
+  return {
+    webSearch: Object.prototype.hasOwnProperty.call(source, 'webSearch') ? source.webSearch !== false : fallback.webSearch,
+    urlFetch: Object.prototype.hasOwnProperty.call(source, 'urlFetch') ? source.urlFetch !== false : fallback.urlFetch,
+    confirm: Object.prototype.hasOwnProperty.call(source, 'confirm') ? source.confirm === true : fallback.confirm
+  };
+}
+
+function getGlobalToolPolicy() {
+  return {
+    webSearch: localStorage.getItem('llmWebSearch') === 'true',
+    urlFetch: localStorage.getItem('llmUrlFetch') !== 'false',
+    confirm: localStorage.getItem('llmToolConfirm') === 'true'
+  };
+}
+
+function getToolPolicy(conv = getActiveConv()) {
+  if (conv && conv.toolPolicy) return normalizeToolPolicy(conv.toolPolicy);
+  return getGlobalToolPolicy();
+}
+
+function canUseTool(toolName, conv = getActiveConv()) {
+  const policy = getToolPolicy(conv);
+  return toolName === 'web_search' ? policy.webSearch : toolName === 'url_fetch' ? policy.urlFetch : false;
+}
+
+function saveConversationImmediately() {
+  if (readOnlyShare) return Promise.resolve();
+  if (!db) {
+    try {
+      localStorage.setItem('assistantConversations', JSON.stringify(conversations));
+      localStorage.setItem('assistantActiveConvId', activeConvId || '');
+    } catch(e) { return Promise.reject(e); }
+    return Promise.resolve();
+  }
+  try { localStorage.setItem('assistantActiveConvId', activeConvId || ''); } catch(e) {}
+  return idbPutAll('conversations', conversations)
+    .then(() => idbPut('meta', { key: 'activeConvId', value: activeConvId || '' }));
 }
 
 function scrollMessagesToBottom() {
@@ -539,11 +853,19 @@ function showUpdateInstructions(newVersion) {
 // ============================================
 // Toast Notifications
 // ============================================
-function showToast(message, type = 'info', duration = 3000) {
+function showToast(message, type = 'info', duration = 3000, action = null) {
   const container = document.getElementById('toastContainer');
   const toast = document.createElement('div');
   toast.className = 'toast ' + type;
   toast.textContent = message;
+  if (action?.label && typeof action.onClick === 'function') {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'toast-action';
+    button.textContent = action.label;
+    button.onclick = () => { action.onClick(); toast.remove(); };
+    toast.appendChild(button);
+  }
   toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
   toast.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
   toast.setAttribute('aria-atomic', 'true');
@@ -645,7 +967,7 @@ function applyTheme(name) {
   s.setProperty('--danger-color', bgLight ? '#dc2626' : '#ef4444');
   s.setProperty('--danger-hover', bgLight ? '#b91c1c' : '#dc2626');
   s.setProperty('--success-color', '#22c55e');
-  localStorage.setItem('assistantTheme', name);
+  if (!readOnlyShare) localStorage.setItem('assistantTheme', name);
 
   const btn = document.getElementById('themeToggle');
   if (btn) {
@@ -669,6 +991,7 @@ function applyMsgOverrides() {
 }
 
 function toggleTheme() {
+  if (readOnlyShare) return;
   const current = localStorage.getItem('assistantTheme') || 'dark';
   let order = [...themeOrder];
   const hasCustom = localStorage.getItem('assistantCustomTheme');
@@ -698,7 +1021,10 @@ function loadTheme() {
     joker:'acidGlow', nordicBlue:'fjord'
   };
   let name = localStorage.getItem('assistantTheme') || 'dark';
-  if (migrationMap[name]) { name = migrationMap[name]; localStorage.setItem('assistantTheme', name); }
+  if (migrationMap[name]) {
+    name = migrationMap[name];
+    if (!readOnlyShare) localStorage.setItem('assistantTheme', name);
+  }
   applyTheme(name);
 }
 
@@ -706,6 +1032,7 @@ function loadTheme() {
 // Custom Theme Helpers
 // ============================================
 function onThemeSelectChange() {
+  if (readOnlyShare) return;
   const val = document.getElementById('setTheme').value;
   document.getElementById('customThemeColors').style.display = val === 'custom' ? 'grid' : 'none';
   if (val === 'custom') {
@@ -800,7 +1127,7 @@ const DEFAULT_CORS_PROXY_URL = 'https://corsproxy.io/?url=';
 
 function normalizeCorsProxyUrl(url) {
   const trimmed = String(url || '').trim();
-  return trimmed || DEFAULT_CORS_PROXY_URL;
+  return safeHttpUrl(trimmed) || DEFAULT_CORS_PROXY_URL;
 }
 
 function getCorsProxyUrl() {
@@ -904,14 +1231,45 @@ async function fetchApiWithHttpSupport(url, options, baseUrl) {
 // ============================================
 // Model Fetching
 // ============================================
-async function fetchAvailableModels(baseUrl, apiKey) {
-  const url = baseUrl.replace(/\/+$/, '') + '/models';
+function buildProviderHeaders(provider, apiKey) {
+  if (provider === 'anthropic') {
+    return { 'x-api-key': apiKey || '', 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' };
+  }
+  return apiKey ? { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
+}
+
+function normalizeModelMetadata(data) {
+  const list = Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : (Array.isArray(data?.models) ? data.models : []));
+  return list.map(item => {
+    if (typeof item === 'string') return { id: item };
+    const id = item?.id || item?.name || item?.model;
+    if (!id) return null;
+    const contextLength = Number(item.context_length ?? item.contextLength ?? item.num_ctx ?? item.context_window);
+    return { id: String(id), ...(Number.isFinite(contextLength) && contextLength > 0 ? { context_length: contextLength } : {}) };
+  }).filter(Boolean);
+}
+
+async function fetchAvailableModelMetadata(baseUrl, apiKey, providerName = inferProviderKey({ llmProxyUrl: baseUrl }), apiFormat = '') {
+  const provider = getProviderPreset(providerName);
+  const normalizedBase = String(baseUrl || '').replace(/\/+$/, '');
+  const url = providerName === 'ollama' && /\/v1$/i.test(normalizedBase)
+    ? normalizedBase.replace(/\/v1$/i, '') + '/api/tags'
+    : normalizedBase + '/models';
   const resp = await fetchApiWithHttpSupport(url, {
-    headers: { 'Authorization': 'Bearer ' + apiKey }
+    headers: buildProviderHeaders(providerName === 'anthropic' || apiFormat === 'anthropic' ? 'anthropic' : provider.apiFormat, apiKey)
   }, baseUrl);
   if (!resp.ok) throw new Error('HTTP ' + resp.status);
   const data = await resp.json();
-  return data.data?.map(m => m.id) || [];
+  return normalizeModelMetadata(data);
+}
+
+async function fetchAvailableModels(baseUrl, apiKey) {
+  const providerName = inferProviderKey({ llmProxyUrl: baseUrl });
+  const metadata = await fetchAvailableModelMetadata(baseUrl, apiKey, providerName, localStorage.getItem('llmApiFormat') || '');
+  const map = {};
+  metadata.forEach(model => { if (model.context_length) map[model.id] = model.context_length; });
+  try { localStorage.setItem('llmModelMetadata', JSON.stringify({ ...(JSON.parse(localStorage.getItem('llmModelMetadata') || '{}')), ...map })); } catch(e) {}
+  return metadata.map(model => model.id);
 }
 
 function populateModelSelect(target, models) {
@@ -932,7 +1290,8 @@ async function refreshModels(target, btnEl) {
   const keyInput = document.getElementById(target === 'setup' ? 'setupKey' : 'setKey');
   let baseUrl = proxyInput.value.trim().replace(/\/(chat\/completions|messages)\/?$/, '');
   const apiKey = keyInput.value.trim();
-  if (!baseUrl || !apiKey) { showToast('Enter Base URL and API Key first.', 'error'); return; }
+  const providerName = document.getElementById(target === 'setup' ? 'setupProvider' : 'setProvider')?.value || inferProviderKey({ llmProxyUrl: baseUrl });
+  if (!baseUrl || (providerRequiresKey({ llmProvider: providerName }) && !apiKey)) { showToast(providerRequiresKey({ llmProvider: providerName }) ? 'Enter Base URL and API Key first.' : 'Enter Base URL first.', 'error'); return; }
   const btn = btnEl || document.activeElement;
   btn.classList.add('spinning');
   btn.disabled = true;
@@ -1048,6 +1407,7 @@ async function loadMemories() {
 }
 
 async function saveMemories(memories) {
+  if (readOnlyShare) return;
   const normalized = normalizeMemoryList(memories).memories;
   if (!db) {
     localStorage.setItem('assistantMemories', JSON.stringify(normalized));
@@ -1066,19 +1426,20 @@ async function getMemoryPrompt() {
 
 async function callApiNonStreaming(messages) {
   const baseUrl = (localStorage.getItem('llmProxyUrl') || '').replace(/\/+$/, '');
-  const apiKey = localStorage.getItem('llmApiKey');
-  const model = localStorage.getItem('llmModel') || 'gpt-4o';
-  const format = detectApiFormat(model);
+  const apiKey = getApiKey();
+  const model = localStorage.getItem('llmModel') || '';
+  const format = localStorage.getItem('llmApiFormat') && localStorage.getItem('llmApiFormat') !== 'auto'
+    ? localStorage.getItem('llmApiFormat') : detectApiFormat(model);
 
   let url, headers, body;
   if (format === 'anthropic') {
     url = baseUrl + '/messages';
-    headers = { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' };
+    headers = buildProviderHeaders('anthropic', apiKey);
     const prepared = prepareAnthropicMessages(messages);
     body = { model, system: prepared.system, messages: prepared.messages, max_tokens: 512, stream: false };
   } else {
     url = baseUrl + '/chat/completions';
-    headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey };
+    headers = buildProviderHeaders('openai', apiKey);
     body = { model, messages, stream: false, max_tokens: 512 };
   }
 
@@ -1164,6 +1525,9 @@ function openManageMemories() {
 
   const popup = document.createElement('div');
   popup.className = 'char-info-popup';
+  popup.setAttribute('role', 'dialog');
+  popup.setAttribute('aria-modal', 'true');
+  popup.setAttribute('aria-labelledby', 'sourcesDrawerTitle');
 
   async function renderMemoryList() {
     const memories = await loadMemories();
@@ -1241,11 +1605,11 @@ function openSearchTest() {
     }
     resultsEl.innerHTML = results.map(r => {
       const title = esc(r.title || r.url || 'Result');
-      const url = esc(r.url || '#');
+      const safeUrl = safeHttpUrl(r.url);
       const snippet = esc(r.snippet || '');
       const displayUrl = esc((r.url || '').replace(/^https?:\/\//, '').replace(/\/+$/, ''));
       return '<div style="padding:10px;border:1px solid var(--card-border);border-radius:10px;background:var(--hover)">' +
-        '<a href="' + url + '" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;font-weight:600">' + title + '</a>' +
+        (safeUrl ? '<a href="' + esc(safeUrl) + '" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;font-weight:600">' + title + '</a>' : '<span style="font-weight:600">' + title + '</span>') +
         (displayUrl ? '<div style="color:var(--text-secondary);font-size:0.75em;margin-top:4px">' + displayUrl + '</div>' : '') +
         (snippet ? '<div style="color:var(--text-secondary);font-size:0.85em;margin-top:6px">' + snippet + '</div>' : '') +
       '</div>';
@@ -1259,7 +1623,8 @@ function openSearchTest() {
     resultsEl.innerHTML = '';
     runBtn.disabled = true;
     try {
-      const { results, error } = await executeWebSearch(q);
+      if (!canUseTool('web_search', getActiveConv())) throw new Error('Web search is disabled for this conversation.');
+      const { results, error } = await executeAuthorizedTool('web_search', { query: q }, getActiveConv(), null, { confirmed: null });
       if (error) {
         statusEl.textContent = 'Error: ' + error;
       } else {
@@ -1283,29 +1648,40 @@ function openSearchTest() {
 
 function openSourcesDrawer(msg) {
   document.querySelectorAll('.char-info-overlay,.char-info-popup').forEach(el => el.remove());
-  const toolBlocks = msg?.swipeToolUse?.[msg.swipeIndex] || [];
+  const swipeIdx = msg?.swipeIndex || 0;
+  const toolBlocks = msg?.swipeToolUse?.[swipeIdx] || [];
+  const persistedSources = msg?.swipeSources?.[swipeIdx] || [];
 
   const overlay = document.createElement('div');
   overlay.className = 'char-info-overlay';
   const popup = document.createElement('div');
   popup.className = 'char-info-popup';
 
-  let html = '<h3>Sources</h3>';
-  if (!toolBlocks.length || toolBlocks.every(tb => tb.type === 'url_fetch' ? (!tb.content && !tb.error) : !(tb.results || []).length)) {
+  let html = '<h3 id="sourcesDrawerTitle">Sources</h3>';
+  if (persistedSources.length) {
+    persistedSources.forEach(source => {
+      const title = escapeHTML(source.title || source.url || 'Source');
+      const safeUrl = safeHttpUrl(source.url);
+      const snippet = source.snippet ? escapeHTML(source.snippet) : '';
+      html += '<div class="source-drawer-item"><span class="source-number">[' + Number(source.number || 0) + ']</span>' +
+        (safeUrl ? '<a href="' + escapeHTML(safeUrl) + '" target="_blank" rel="noopener">' + title + '</a>' : '<span>' + title + '</span>') +
+        (snippet ? '<div class="source-snippet">' + snippet + '</div>' : '') + '</div>';
+    });
+  } else if (!toolBlocks.length || toolBlocks.every(tb => tb.type === 'url_fetch' ? (!tb.content && !tb.error) : !(tb.results || []).length)) {
     html += '<div style="color:var(--text-secondary);font-size:0.85em;margin-bottom:12px">No sources available.</div>';
   } else {
     toolBlocks.forEach(tb => {
       // --- url_fetch blocks ---
       if (tb.type === 'url_fetch') {
-        const escapedUrl = escapeHTML(tb.url || '');
-        const displayUrl = escapeHTML((tb.url || '').replace(/^https?:\/\//, '').replace(/\/+$/, ''));
+        const safeUrl = safeHttpUrl(tb.url);
+        const displayUrl = escapeHTML((safeUrl || String(tb.url || '')).replace(/^https?:\/\//, '').replace(/\/+$/, ''));
         html += '<div style="margin:10px 0 6px;font-weight:600;font-size:0.9em">\u{1F310} ' + displayUrl + '</div>';
         if (tb.error) {
           html += '<div style="padding:10px;border:1px solid var(--card-border);border-radius:10px;background:var(--hover);margin-bottom:8px;color:var(--error-color,#ff7777);font-size:0.85em">' + escapeHTML(tb.error) + '</div>';
         } else if (tb.content) {
           const preview = escapeHTML(tb.content.slice(0, 500));
           html += '<div style="padding:10px;border:1px solid var(--card-border);border-radius:10px;background:var(--hover);margin-bottom:8px">' +
-            '<a href="' + escapedUrl + '" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;font-weight:600">' + displayUrl + '</a>' +
+            (safeUrl ? '<a href="' + escapeHTML(safeUrl) + '" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;font-weight:600">' + displayUrl + '</a>' : '<span style="font-weight:600">' + displayUrl + '</span>') +
             '<div style="color:var(--text-secondary);font-size:0.8em;margin-top:6px;white-space:pre-wrap;max-height:150px;overflow-y:auto">' + preview + (tb.content.length > 500 ? '\u2026' : '') + '</div>' +
           '</div>';
         }
@@ -1318,11 +1694,11 @@ function openSourcesDrawer(msg) {
       html += '<div style="margin:10px 0 6px;font-weight:600;font-size:0.9em">🔎 ' + q + '</div>';
       results.forEach(r => {
         const title = escapeHTML(r.title || r.url || 'Result');
-        const url = escapeHTML(r.url || '#');
-        const displayUrl = escapeHTML((r.url || '').replace(/^https?:\/\//, '').replace(/\/+$/, ''));
+        const safeUrl = safeHttpUrl(r.url);
+        const displayUrl = escapeHTML((safeUrl || String(r.url || '')).replace(/^https?:\/\//, '').replace(/\/+$/, ''));
         const snippet = r.snippet ? escapeHTML(r.snippet) : '';
         html += '<div style="padding:10px;border:1px solid var(--card-border);border-radius:10px;background:var(--hover);margin-bottom:8px">' +
-          '<a href="' + url + '" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;font-weight:600">' + title + '</a>' +
+          (safeUrl ? '<a href="' + escapeHTML(safeUrl) + '" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;font-weight:600">' + title + '</a>' : '<span style="font-weight:600">' + title + '</span>') +
           (displayUrl ? '<div style="color:var(--text-secondary);font-size:0.75em;margin-top:4px">' + displayUrl + '</div>' : '') +
           (snippet ? '<div style="color:var(--text-secondary);font-size:0.85em;margin-top:6px">' + snippet + '</div>' : '') +
         '</div>';
@@ -1330,12 +1706,11 @@ function openSourcesDrawer(msg) {
     });
   }
 
-  html += '<button class="btn btn-primary" style="width:100%;padding:8px" onclick="this.closest(\'.char-info-popup\').previousElementSibling.click()">Close</button>';
+  html += '<button class="btn btn-primary" type="button" data-close-sources style="width:100%;padding:8px">Close</button>';
   popup.innerHTML = html;
 
-  overlay.onclick = () => { overlay.remove(); popup.remove(); };
-  document.body.appendChild(overlay);
-  document.body.appendChild(popup);
+  const close = openTransientDialog(overlay, popup, popup.querySelector('[data-close-sources]'));
+  popup.querySelector('[data-close-sources]').onclick = close;
 }
 
 function buildSnippet(text, idx, windowSize = 90) {
@@ -1490,7 +1865,7 @@ function openSummaryModal() {
   genBtn.onclick = async () => {
     if (!conv) return;
     const baseUrl = (localStorage.getItem('llmProxyUrl') || '').trim();
-    const apiKey = (localStorage.getItem('llmApiKey') || '').trim();
+    const apiKey = getApiKey();
     if (!baseUrl || !apiKey) { showToast('Set API Base URL and Key first.', 'error'); return; }
     genBtn.disabled = true;
     genBtn.textContent = 'Generating...';
@@ -1553,7 +1928,12 @@ function openStatusPanel() {
     testBtn.onclick = async () => {
       testBtn.disabled = true;
       testBtn.textContent = 'Testing...';
-      try { await executeWebSearch('test'); } catch(e) {}
+      try {
+        if (!canUseTool('web_search', getActiveConv())) throw new Error('Web search is disabled for this conversation.');
+        await executeAuthorizedTool('web_search', { query: 'test' }, getActiveConv(), null, { confirmed: null });
+      } catch(e) {
+        lastSearchStatus = { ok: false, error: sanitizeErrorDetail(e), at: Date.now(), query: 'test' };
+      }
       testBtn.disabled = false;
       testBtn.textContent = 'Test Search';
       render();
@@ -1567,11 +1947,79 @@ function openStatusPanel() {
 }
 
 function parseCommand(text) {
-  const match = text.trim().match(/^\/(search|web|s|files|file|docs|doc)\s+(.+)/i);
+  const match = text.trim().match(/^\/([\w-]+)(?:\s+(.+))?$/i);
   if (!match) return null;
-  const cmd = match[1].toLowerCase();
-  const query = match[2].trim();
-  return { cmd, query };
+  const token = match[1].toLowerCase();
+  const definition = COMMAND_REGISTRY.find(command => command.name === token || command.aliases.includes(token));
+  if (!definition) return null;
+  return { cmd: definition.name, query: (match[2] || '').trim(), definition };
+}
+
+function closeCommandDropdown() {
+  const dropdown = document.getElementById('commandDropdown');
+  if (dropdown) dropdown.classList.remove('open');
+  document.getElementById('chatInput')?.setAttribute('aria-expanded', 'false');
+  commandActive = false;
+  commandIdx = 0;
+}
+
+function renderCommandMenu(ta, query = '') {
+  const dropdown = document.getElementById('commandDropdown');
+  if (!dropdown) return;
+  const token = query.toLowerCase();
+  const commands = COMMAND_REGISTRY.filter(command => [command.name, ...command.aliases].some(name => name.includes(token)));
+  dropdown.innerHTML = '';
+  commands.forEach((command, index) => {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'command-item' + (index === 0 ? ' active' : '');
+    item.setAttribute('role', 'menuitem');
+    item.dataset.command = command.name;
+    item.innerHTML = '<strong></strong><span></span><small></small>';
+    item.querySelector('strong').textContent = '/' + command.name;
+    item.querySelector('span').textContent = command.description;
+    item.querySelector('small').textContent = command.usage + (command.aliases.length ? ' · aliases: ' + command.aliases.join(', ') : '');
+    item.onclick = () => {
+      ta.value = '/' + command.name + ' ';
+      ta.focus();
+      closeCommandDropdown();
+      persistDraftFromUI();
+    };
+    dropdown.appendChild(item);
+  });
+  commandIdx = 0;
+  commandActive = commands.length > 0;
+  dropdown.classList.toggle('open', commandActive);
+  ta.setAttribute('aria-expanded', String(commandActive));
+}
+
+function handleCommandInput(ta) {
+  const before = ta.value.slice(0, ta.selectionStart);
+  const match = before.match(/^\/([\w-]*)$/);
+  if (!match) { closeCommandDropdown(); return; }
+  renderCommandMenu(ta, match[1]);
+}
+
+function handleCommandKeydown(event, ta) {
+  const dropdown = document.getElementById('commandDropdown');
+  const items = dropdown?.querySelectorAll('.command-item') || [];
+  if (!commandActive || !items.length) return;
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault();
+    items[commandIdx]?.classList.remove('active');
+    commandIdx = (commandIdx + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+    items[commandIdx]?.classList.add('active');
+    return;
+  }
+  if (event.key === 'Enter' || event.key === 'Tab') {
+    event.preventDefault();
+    items[commandIdx]?.click();
+    return;
+  }
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeCommandDropdown();
+  }
 }
 
 async function handleCommand(cmd, conv) {
@@ -1595,20 +2043,31 @@ async function handleManualSearch(query, conv) {
     swipeToolUse: [[{ query, results: [], searching: true }]]
   };
   messages.push(assistantMsg);
+  const request = createRequestMetadata(assistantMsg, 0);
+  request.status = 'streaming';
+  await saveConversationImmediately().catch(() => {});
   renderMessages();
 
   try {
-    const { results, error } = await executeWebSearch(query);
+    const response = await executeAuthorizedTool('web_search', { query }, conv, null, { confirmed: null });
+    const { results, error } = response;
     const tb = assistantMsg.swipeToolUse[0][0];
     tb.results = results;
     tb.searching = false;
     if (error) tb.error = error;
     assistantMsg.content = error ? ('Search error: ' + error) : ('Search results for "' + query + '".');
+    assistantMsg.swipes[0] = assistantMsg.content;
+    const registry = sourceRegistryFor(assistantMsg, 0);
+    registerSources(registry, results).forEach((result, index) => { results[index].sourceNumber = result.sourceNumber; });
+    persistSwipeSources(assistantMsg, 0, registry);
+    finishRequestMetadata(request, error ? 'failed' : 'complete', error || '', null);
   } catch (e) {
     const tb = assistantMsg.swipeToolUse[0][0];
     tb.searching = false;
     tb.error = e.message || 'Search failed';
     assistantMsg.content = 'Search error: ' + (e.message || 'Unknown error');
+    assistantMsg.swipes[0] = assistantMsg.content;
+    finishRequestMetadata(request, 'failed', e.message || 'Search failed', null);
   }
 
   if (conv) conv.updatedAt = Date.now();
@@ -1630,6 +2089,8 @@ async function handleFileSearch(query, conv) {
     timestamp: Date.now(),
     swipeToolUse: [[{ query, results: toolResults, searching: false }]]
   };
+  assistantMsg.swipes[0] = assistantMsg.content;
+  assistantMsg.swipeRequests = [{ status: 'complete', startedAt: ts, completedAt: Date.now(), durationMs: Math.max(0, Date.now() - ts), httpStatus: null, error: '' }];
   messages.push(assistantMsg);
   if (conv) conv.updatedAt = Date.now();
   debouncedSave();
@@ -1662,6 +2123,9 @@ function detectApiFormat(model) {
 function getLlmProviderInfo(model = '', format = detectApiFormat(model), baseUrl = localStorage.getItem('llmProxyUrl') || '') {
   const modelText = String(model || '').toLowerCase();
   const baseText = String(baseUrl || '').toLowerCase();
+  const explicitProvider = localStorage.getItem('llmProvider') || '';
+  const explicitLabels = { openai: ['O', 'OpenAI'], anthropic: ['C', 'Anthropic'], openrouter: ['R', 'OpenRouter'], ollama: ['L', 'Ollama'], lmstudio: ['L', 'LM Studio'] };
+  if (explicitLabels[explicitProvider]) return { symbol: explicitLabels[explicitProvider][0], name: explicitLabels[explicitProvider][1] };
   const localHost = /(^|\/\/)(localhost|127\.0\.0\.1|0\.0\.0\.0|\[?::1\]?)(:|\/|$)/.test(baseText) ||
     /ollama|lmstudio|kobold|text-generation-webui/.test(baseText);
 
@@ -1707,7 +2171,7 @@ function getActiveProfileSummary() {
     name: profile.name,
     model: settings.llmModel || '',
     apiFormat: settings.llmApiFormat || 'auto',
-    provider: getLlmProviderInfo(settings.llmModel || '', settings.llmApiFormat || 'auto', settings.llmProxyUrl || '')
+    provider: getConnectionSummary(settings).provider
   };
 }
 
@@ -1715,7 +2179,11 @@ function getConnectionSummary(settings = {}) {
   const model = settings.llmModel || localStorage.getItem('llmModel') || '';
   const format = settings.llmApiFormat || localStorage.getItem('llmApiFormat') || 'auto';
   const baseUrl = settings.llmProxyUrl || localStorage.getItem('llmProxyUrl') || '';
-  const provider = getLlmProviderInfo(model, format === 'auto' ? detectApiFormat(model) : format, baseUrl);
+  const providerKey = settings.llmProvider || inferProviderKey(settings);
+  const presetSymbols = { openai: 'O', anthropic: 'C', openrouter: 'R', ollama: 'L', lmstudio: 'L' };
+  const provider = presetSymbols[providerKey]
+    ? { symbol: presetSymbols[providerKey], name: getProviderPreset(providerKey).label }
+    : getLlmProviderInfo(model, format === 'auto' ? detectApiFormat(model) : format, baseUrl);
   let host = '';
   try { host = baseUrl ? new URL(baseUrl).host : ''; } catch(e) { host = baseUrl; }
   return {
@@ -1832,14 +2300,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   readOnlyShare = !!shareId;
   if (readOnlyShare) document.body.classList.add('share-view');
 
-  // Migration: strip endpoint suffix from proxy URL
-  const storedUrl = localStorage.getItem('llmProxyUrl');
-  if (storedUrl) {
-    const cleaned = storedUrl.replace(/\/(chat\/completions|messages)\/?$/, '');
-    if (cleaned !== storedUrl) localStorage.setItem('llmProxyUrl', cleaned);
+  if (!readOnlyShare) {
+    // Migration: strip endpoint suffix from proxy URL
+    const storedUrl = localStorage.getItem('llmProxyUrl');
+    if (storedUrl) {
+      const cleaned = storedUrl.replace(/\/(chat\/completions|messages)\/?$/, '');
+      if (cleaned !== storedUrl) localStorage.setItem('llmProxyUrl', cleaned);
+    }
+    // Migration/default: keep CORS proxy enabled unless explicitly replaced.
+    localStorage.setItem('llmCorsProxy', getCorsProxyUrl());
   }
-  // Migration/default: keep CORS proxy enabled unless explicitly replaced.
-  localStorage.setItem('llmCorsProxy', getCorsProxyUrl());
 
   // Service worker: installability + offline. The protocol guard matters because
   // synapse.html is shipped as a standalone single file and gets opened over file://,
@@ -1866,6 +2336,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   loadCustomFont(localStorage.getItem('assistantFont') || '');
   loadCachedModels('setup');
   loadCachedModels('settings');
+  renderConnectionChip();
   initModalAccessibility();
   renderLocalUpdateStatus();
   checkLocalUpdateStatus(false);
@@ -1876,6 +2347,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // directly, bypassing the guard inside saveConversations.
     if (readOnlyShare) return;
     clearTimeout(_saveDebounceTimer);
+    persistDraftFromUI();
     saveConversations();
     // Only write to localStorage as fallback if IndexedDB is not available
     if (!db) {
@@ -1888,7 +2360,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Show setup modal if no API key. A visitor reading a shared link has no reason to
   // be asked for one.
-  if (!readOnlyShare && (!localStorage.getItem('llmProxyUrl') || !localStorage.getItem('llmApiKey'))) {
+  if (!readOnlyShare && (!localStorage.getItem('llmProxyUrl') || (providerRequiresKey() && !getApiKey()))) {
+    applyProviderPreset('setup', document.getElementById('setupProvider')?.value || 'openai');
+    setKeyStorageInputs(getKeyStorageMode());
     openModal('setupModal', '#setupProxy');
   }
 
@@ -1900,6 +2374,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Auto-resize textarea + character count + @model mentions
   const ta = document.getElementById('chatInput');
+  ['setupProxy', 'setProxy'].forEach(id => {
+    document.getElementById(id)?.addEventListener('input', event => {
+      delete event.currentTarget.dataset.providerPreset;
+      delete event.currentTarget.dataset.providerPresetUrl;
+    });
+  });
   let tokenDebounce;
   ta.addEventListener('input', () => {
     ta.style.height = 'auto';
@@ -1907,11 +2387,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     clearTimeout(tokenDebounce);
     tokenDebounce = setTimeout(updateTokenInfo, 300);
     handleMentionInput(ta);
+    handleCommandInput(ta);
+    persistDraftFromUI();
     updateSendBtnState();
   });
 
   // Send on Enter (with mention dropdown handling)
   ta.addEventListener('keydown', (e) => {
+    if (commandActive) {
+      handleCommandKeydown(e, ta);
+      if (e.defaultPrevented) return;
+    }
     if (mentionActive) {
       handleMentionKeydown(e, ta);
       if (e.defaultPrevented) return;
@@ -1931,6 +2417,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Global keyboard shortcuts
   document.addEventListener('keydown', (e) => {
+    if (readOnlyShare && ((e.ctrlKey && e.key.toLowerCase() === 'n') ||
+      (e.ctrlKey && e.shiftKey && ['e', 'r'].includes(e.key.toLowerCase())))) {
+      e.preventDefault();
+      return;
+    }
     // Escape - close modals / stop streaming
     if (e.key === 'Escape') {
       if (globalSearchDismiss) {
@@ -1940,6 +2431,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       if (document.getElementById('chatSearchBar').classList.contains('open')) {
         closeChatSearch();
+        return;
+      }
+      if (document.getElementById('toolbarMenu')?.classList.contains('open')) {
+        closeToolbarMenu();
+        e.preventDefault();
+        return;
+      }
+      if (document.getElementById('composerToolsPopover')) {
+        closeComposerTools();
+        e.preventDefault();
         return;
       }
       if (closeTopModal()) {
@@ -1985,6 +2486,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       e.preventDefault();
       openModal('shortcutsModal');
     }
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#composerToolsPopover, #toolsBtn')) closeComposerTools();
+    if (!e.target.closest('#commandDropdown, #chatInput')) closeCommandDropdown();
   });
 
   // Drag & drop files
@@ -2153,14 +2659,27 @@ document.addEventListener('DOMContentLoaded', async () => {
 // ============================================
 function renderGenImages(images) {
   if (!images || !images.length) return '';
-  return images.map(url => '<img src="' + url.replace(/"/g, '&quot;') + '" alt="Generated image" class="chat-inline-img chat-gen-img" loading="lazy">').join('');
+  return images.map(url => safeMediaUrl(url)).filter(Boolean)
+    .map(url => '<img src="' + escapeHTML(url) + '" alt="Generated image" class="chat-inline-img chat-gen-img" loading="lazy">').join('');
 }
 
 function buildApiContent(msg) {
-  if (!msg.images || !msg.images.length) return msg.content;
+  const baseContent = Array.isArray(msg.content) ? msg.content.map(part => {
+    if (part?.type === 'image_url') {
+      const url = safeMediaUrl(part.image_url?.url);
+      return url ? { ...part, image_url: { ...(part.image_url || {}), url } } : null;
+    }
+    if (part?.type === 'file') return { ...part, file: { ...(part.file || {}), url: safeFileUrl(part.file?.url) } };
+    return part;
+  }).filter(Boolean) : msg.content;
+  if (!msg.images || !msg.images.length) return baseContent;
   const parts = [];
-  if (msg.content) parts.push({ type: 'text', text: msg.content });
-  msg.images.forEach(url => parts.push({ type: 'image_url', image_url: { url } }));
+  if (Array.isArray(baseContent)) parts.push(...baseContent);
+  else if (baseContent) parts.push({ type: 'text', text: baseContent });
+  msg.images.forEach(url => {
+    const safeUrl = safeMediaUrl(url);
+    if (safeUrl) parts.push({ type: 'image_url', image_url: { url: safeUrl } });
+  });
   return parts;
 }
 
@@ -2374,8 +2893,14 @@ function renderMarkdown(text) {
       .replace(/\n[ \t]*/g, '');
     return '<ol>' + items + '</ol>';
   });
-  s = s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" class="chat-inline-img chat-gen-img" loading="lazy">');
-  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  s = s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, url) => {
+    const safeUrl = safeMediaUrl(url);
+    return safeUrl ? '<img src="' + escapeHTML(safeUrl) + '" alt="' + alt + '" class="chat-inline-img chat-gen-img" loading="lazy">' : alt;
+  });
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => {
+    const safeUrl = safeHttpUrl(url);
+    return safeUrl ? '<a href="' + escapeHTML(safeUrl) + '" target="_blank" rel="noopener">' + label + '</a>' : label;
+  });
   s = s.replace(/^---$/gm, '<hr>');
   // Markdown tables
   s = s.replace(/(^\|.+\|$\n?)+/gm, match => {
@@ -2728,8 +3253,103 @@ function renderMessageMeta(msg) {
   return hasMeta ? meta : null;
 }
 
-function updateTokenInfo() {
+function getSwipeRequest(msg, swipeIdx = msg?.swipeIndex || 0) {
+  return msg?.swipeRequests?.[swipeIdx] || null;
+}
+
+function renderRequestMeta(msg) {
+  const request = getSwipeRequest(msg);
+  if (!request) return null;
+  const meta = document.createElement('div');
+  meta.className = 'request-meta request-' + (request.status || 'complete');
+  const duration = Number.isFinite(request.durationMs) ? ' · ' + (request.durationMs / 1000).toFixed(1) + 's' : '';
+  const status = request.status || 'complete';
+  meta.textContent = status + duration + (request.httpStatus ? ' · HTTP ' + request.httpStatus : '');
+  meta.setAttribute('aria-label', 'Request ' + status + (duration ? duration : ''));
+  meta.title = request.error || (request.startedAt ? new Date(request.startedAt).toLocaleString() : '');
+  return meta;
+}
+
+function showRequestDetails(request) {
+  if (!request) return;
+  document.querySelectorAll('.char-info-overlay,.char-info-popup').forEach(el => el.remove());
+  const overlay = document.createElement('div');
+  overlay.className = 'char-info-overlay';
+  const popup = document.createElement('div');
+  popup.className = 'char-info-popup request-details-popup';
+  popup.setAttribute('role', 'dialog');
+  popup.setAttribute('aria-modal', 'true');
+  popup.setAttribute('aria-labelledby', 'requestDetailsTitle');
+  const rows = [
+    ['Request ID', request.requestId || '—'],
+    ['Status', request.status || 'unknown'],
+    ['Model', request.model || '—'],
+    ['API format', request.apiFormat || '—'],
+    ['Messages sent', request.messageCount ?? '—'],
+    ['Estimated prompt', request.promptTokens ? formatTokenCount(request.promptTokens) + ' tokens' : '—'],
+    ['Context window', request.contextWindow ? formatTokenCount(request.contextWindow) + ' tokens' : '—'],
+    ['Started', request.startedAt ? new Date(request.startedAt).toLocaleString() : '—'],
+    ['Completed', request.completedAt ? new Date(request.completedAt).toLocaleString() : '—'],
+    ['Duration', Number.isFinite(request.durationMs) ? (request.durationMs / 1000).toFixed(2) + ' seconds' : '—'],
+    ['HTTP status', request.httpStatus || '—'],
+    ['Error detail', request.error || '—']
+  ];
+  const heading = document.createElement('h3');
+  heading.id = 'requestDetailsTitle';
+  heading.textContent = 'Request details';
+  popup.appendChild(heading);
+  rows.forEach(([label, value]) => {
+    const row = document.createElement('div');
+    row.className = 'request-detail-row';
+    const strong = document.createElement('strong');
+    strong.textContent = label;
+    const span = document.createElement('span');
+    span.textContent = value;
+    row.append(strong, span);
+    popup.appendChild(row);
+  });
+  const close = document.createElement('button');
+  close.className = 'btn btn-primary';
+  close.type = 'button';
+  close.textContent = 'Close';
+  popup.appendChild(close);
+  const closeDialog = openTransientDialog(overlay, popup, close);
+  close.onclick = closeDialog;
+}
+
+async function retryRequest(idx) {
+  if (readOnlyShare || streaming) return;
+  const msg = messages[idx];
+  if (!msg || msg.role !== 'assistant') return;
+  const conv = getActiveConv();
+  const swipeIdx = Number.isInteger(msg.swipeIndex) ? msg.swipeIndex : 0;
+  const requestContext = await buildRequestMessages(conv, { messageList: messages, untilIndex: idx });
+  if (guardContextLimit(requestContext)) return;
+  msg.swipes = Array.isArray(msg.swipes) ? msg.swipes : [''];
+  msg.swipes[swipeIdx] = '';
+  msg.content = '';
+  if (msg.swipeThinking) msg.swipeThinking[swipeIdx] = '';
+  if (msg.swipeToolUse) msg.swipeToolUse[swipeIdx] = [];
+  if (msg.swipeImages) msg.swipeImages[swipeIdx] = [];
+  if (msg.swipeSources) msg.swipeSources[swipeIdx] = [];
+  renderMessages();
+  const wrapper = document.querySelector('.msg-wrapper[data-msg-idx="' + idx + '"]');
+  const bubble = wrapper?.querySelector('.msg-bubble');
+  if (!bubble) return;
+  bubble.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
+  announce('Retrying the failed request.');
+  await streamResponse(requestContext.messages, msg, swipeIdx, bubble, null, null, { conv });
+  if (conv) conv.updatedAt = Date.now();
+  if (getSwipeRequest(msg, swipeIdx)?.status === 'complete') extractMemories(requestContext.messages);
+  await saveConversationImmediately();
+  renderMessages();
+  updateTokenInfo();
+}
+
+async function updateTokenInfo() {
   const el = document.getElementById('tokenInfo');
+  if (!el) return;
+  const requestId = ++tokenInfoRequestId;
   const inputText = document.getElementById('chatInput').value;
   const inputChars = inputText.length;
 
@@ -2764,7 +3384,16 @@ function updateTokenInfo() {
     });
     parts.push('~$' + cost.toFixed(4));
   }
-  el.textContent = parts.join(' | ');
+  let promptPart = '';
+  try {
+    const built = await buildRequestMessages(getActiveConv(), { messageList: messages, draftMessage: buildComposerMessage() });
+    const stats = getRequestContextStats(built.messages, built.excluded);
+    const limit = stats.contextWindow ? ' / ' + formatTokenCount(stats.contextWindow) : '';
+    promptPart = 'Prompt: ~' + formatTokenCount(stats.includedTokens) + limit;
+  } catch (e) {
+    // Token display is advisory; keep the local estimate if system context is unavailable.
+  }
+  if (requestId === tokenInfoRequestId) el.textContent = parts.concat(promptPart ? [promptPart] : []).join(' | ');
 }
 
 // ============================================
@@ -2890,12 +3519,39 @@ function fallbackHash(text) {
   return 'fallback_' + (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0');
 }
 
-async function generateCacheKey(userMessage, model, systemMessages) {
+function getRequestAffectingSettings(model, format, toolPolicy = getToolPolicy()) {
+  let extraParams = {};
+  try { extraParams = JSON.parse(localStorage.getItem('llmExtraParams') || '{}'); } catch (e) {}
+  const baseUrl = localStorage.getItem('llmProxyUrl') || '';
+  return {
+    cacheKeyVersion: 3,
+    model: model || '',
+    apiFormat: format || detectApiFormat(model),
+    provider: inferProviderKey({ llmProxyUrl: baseUrl, llmApiFormat: format }),
+    baseUrl,
+    searchApiUrl: sanitizeStoredUrl(localStorage.getItem('llmSearchApiUrl') || ''),
+    corsProxy: sanitizeStoredUrl(localStorage.getItem('llmCorsProxy') || ''),
+    maxTokens: resolveMaxTokens(),
+    temperature: localStorage.getItem('llmTemperature') || '',
+    extraParams: normalizeForCache(extraParams),
+    excludedParams: (localStorage.getItem('llmExcludeParams') || '').split(',').map(value => value.trim()).filter(Boolean).sort(),
+    prefill: localStorage.getItem('llmPrefill') || '',
+    thinking: localStorage.getItem('llmThinking') === 'true',
+    thinkingEffort: localStorage.getItem('llmThinkingEffort') || '',
+    forceSearch: localStorage.getItem('llmForceSearch') === 'true',
+    toolPolicy: normalizeToolPolicy(toolPolicy)
+  };
+}
+
+async function generateCacheKey(userMessage, model, systemMessages, requestContext = {}) {
   const payload = stableCacheJson({
-    version: 1,
+    version: 3,
     model: model || '',
     userMessage,
-    systemMessages: systemMessages || []
+    systemMessages: systemMessages || [],
+    messages: requestContext.messages || [],
+    settings: requestContext.settings || {},
+    credentialScope: requestContext.credentialScope || ''
   });
   if (!window.crypto?.subtle) return fallbackHash(payload);
   const digest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload));
@@ -2913,7 +3569,7 @@ function getResponseCacheRequestParts(apiMessages) {
       userMessage = { role: 'user', content: normalizeForCache(message.content) };
     }
   });
-  return { userMessage, systemMessages };
+  return { userMessage, systemMessages, messages: normalizeForCache(apiMessages || []) };
 }
 
 async function cacheLookup(cacheKey) {
@@ -3074,6 +3730,116 @@ function debouncedSave() {
   _saveDebounceTimer = setTimeout(saveConversations, 1000);
 }
 
+function recoverInterruptedRequests(convs) {
+  let changed = false;
+  (convs || []).forEach(conv => {
+    (conv.messages || []).forEach(message => {
+      if (message.role !== 'assistant') return;
+      if (!Array.isArray(message.swipeRequests)) message.swipeRequests = [];
+      const swipeIndex = Number.isInteger(message.swipeIndex) ? message.swipeIndex : 0;
+      const currentText = Array.isArray(message.swipes) ? message.swipes[swipeIndex] : message.content;
+      if (!String(currentText || '').trim() && !(message.images || []).length && !message.swipeRequests[swipeIndex]) {
+        const completedAt = Date.now();
+        message.swipeRequests[swipeIndex] = {
+          status: 'failed',
+          startedAt: Number(message.timestamp) || completedAt,
+          completedAt,
+          durationMs: Number(message.timestamp) ? Math.max(0, completedAt - Number(message.timestamp)) : null,
+          httpStatus: null,
+          error: 'No response was saved before the request ended.'
+        };
+        if (Array.isArray(message.swipes)) message.swipes[swipeIndex] = 'Request failed before a response was saved. Retry to try again.';
+        message.content = Array.isArray(message.swipes) ? message.swipes[swipeIndex] : message.content;
+        changed = true;
+      }
+      message.swipeRequests.forEach((request, index) => {
+        if (!request || !['pending', 'streaming'].includes(request.status)) return;
+        request.status = 'failed';
+        request.error = 'Interrupted before the page closed.';
+        request.completedAt = request.completedAt || Date.now();
+        request.durationMs = request.startedAt ? Math.max(0, request.completedAt - request.startedAt) : null;
+        if (Array.isArray(message.swipes) && !String(message.swipes[index] || '').trim()) {
+          message.swipes[index] = 'Request interrupted. Retry to try again.';
+          message.content = message.swipes[message.swipeIndex || 0] || '';
+        }
+        changed = true;
+      });
+    });
+  });
+  return changed;
+}
+
+function normalizeLoadedConversations(list) {
+  const source = Array.isArray(list) ? list : [];
+  const used = new Set();
+  const normalized = source.map(raw => {
+    const conv = normalizeConversationRecord(raw);
+    if (used.has(conv.id)) conv.id = genId();
+    used.add(conv.id);
+    conv.messages.forEach(message => {
+      if (message.role === 'assistant' && !message.swipes) {
+        message.swipes = [typeof message.content === 'string' ? message.content : ''];
+        message.swipeIndex = 0;
+      }
+    });
+    return conv;
+  });
+  return { conversations: normalized, changed: recoverInterruptedRequests(normalized) };
+}
+
+function cloneDraftAttachments(attachments) {
+  return (Array.isArray(attachments) ? attachments : []).map(att => ({
+    type: att.type,
+    name: att.name || 'file',
+    mime: att.mime || '',
+    dataUrl: att.type === 'image' ? safeMediaUrl(att.dataUrl) : safeFileUrl(att.dataUrl),
+    textContent: typeof att.textContent === 'string' ? att.textContent : '',
+    binary: att.binary === true
+  }));
+}
+
+function queueAttachmentForConversation(convId, attachment) {
+  const queued = cloneDraftAttachments([attachment])[0];
+  if (!queued) return;
+  if (convId === activeConvId) {
+    pendingAttachments.push(queued);
+    renderPreviews();
+    return;
+  }
+  const conv = conversations.find(item => item.id === convId);
+  if (!conv || readOnlyShare) return;
+  conv.draft = conv.draft || { text: '', attachments: [] };
+  conv.draft.attachments = cloneDraftAttachments(conv.draft.attachments).concat([queued]);
+  conv.draft.updatedAt = Date.now();
+  saveConversations();
+  announce('Attachment added to the original conversation draft.');
+}
+
+function persistDraftFromUI() {
+  const conv = getActiveConv();
+  const input = document.getElementById('chatInput');
+  if (!conv || !input || readOnlyShare) return;
+  const text = input.value;
+  const attachments = cloneDraftAttachments(pendingAttachments);
+  if (!text && attachments.length === 0) delete conv.draft;
+  else conv.draft = { text, attachments, updatedAt: Date.now() };
+  debouncedSave();
+}
+
+function restoreActiveDraft() {
+  const input = document.getElementById('chatInput');
+  const conv = getActiveConv();
+  if (!input || !conv) return;
+  const draft = conv.draft || {};
+  input.value = draft.text || '';
+  pendingAttachments = cloneDraftAttachments(draft.attachments);
+  renderPreviews();
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 150) + 'px';
+  updateTokenInfo();
+  updateSendBtnState();
+}
+
 function migratePersonaField(convs) {
   let changed = false;
   convs.forEach(c => {
@@ -3098,7 +3864,8 @@ async function loadConversations() {
   try {
     const convs = await idbGetAll('conversations');
     if (convs.length > 0) {
-      conversations = convs;
+      const normalized = normalizeLoadedConversations(convs);
+      conversations = normalized.conversations;
       const meta = await new Promise((resolve) => {
         const tx = db.transaction('meta', 'readonly');
         const req = tx.objectStore('meta').get('activeConvId');
@@ -3106,17 +3873,16 @@ async function loadConversations() {
         req.onerror = () => resolve(null);
       });
       activeConvId = meta?.value || conversations[0].id;
-      conversations.forEach(c => c.messages.forEach(m => {
-        if (m.role === 'assistant' && !m.swipes) { m.swipes = [typeof m.content === 'string' ? m.content : '']; m.swipeIndex = 0; }
-      }));
       // Migrate characterSystemPrompt → persona
       migratePersonaField(conversations);
+      if (normalized.changed) saveConversations();
       activeConvId = (conversations.find(c => c.id === activeConvId)) ? activeConvId : conversations[0].id;
       messages = getActiveConv().messages;
       renderSidebar();
       renderMessages();
       updateTokenInfo();
       updateCharacterUI();
+      restoreActiveDraft();
       return;
     }
   } catch(e) { console.error('IDB load error:', e); }
@@ -3141,10 +3907,8 @@ async function loadConversations() {
     conversations.push({ id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() });
   }
 
-  // Migrate swipes
-  conversations.forEach(c => c.messages.forEach(m => {
-    if (m.role === 'assistant' && !m.swipes) { m.swipes = [typeof m.content === 'string' ? m.content : '']; m.swipeIndex = 0; }
-  }));
+  // Normalize legacy records without changing their IDs or message history.
+  conversations = normalizeLoadedConversations(conversations).conversations;
 
   // Migrate characterSystemPrompt → persona
   migratePersonaField(conversations);
@@ -3166,11 +3930,14 @@ async function loadConversations() {
   renderMessages();
   updateTokenInfo();
   updateCharacterUI();
+  restoreActiveDraft();
 }
 
 function getActiveConv() { return conversations.find(c => c.id === activeConvId); }
 
 function createConversation(projectId) {
+  if (readOnlyShare) return;
+  persistDraftFromUI();
   const conv = { id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
   // Only ever set from the per-project "+" in the sidebar; index.html calls this with
   // no argument, and a click event must not be mistaken for a project id.
@@ -3183,12 +3950,15 @@ function createConversation(projectId) {
   renderMessages();
   updateTokenInfo();
   updateCharacterUI();
+  restoreActiveDraft();
+  announce('New conversation created.');
   if (window.innerWidth <= 768) toggleSidebar();
 }
 
 function switchConversation(id) {
   const conv = conversations.find(c => c.id === id);
   if (!conv) return;
+  persistDraftFromUI();
   activeConvId = id;
   messages = conv.messages;
   userScrolledAway = false;
@@ -3197,56 +3967,19 @@ function switchConversation(id) {
   renderMessages();
   updateTokenInfo();
   updateCharacterUI();
+  restoreActiveDraft();
+  announce('Opened conversation ' + (conv.title || 'conversation') + '.');
   if (window.innerWidth <= 768) toggleSidebar();
 }
 
 function deleteConversation(id, e) {
-  e.stopPropagation();
-  const conv = conversations.find(c => c.id === id);
-  if (!conv) return;
-  // Deleting locally does not revoke the published gist. Silently orphaning public data
-  // is worse than an extra prompt.
-  if (conv.shareGistId && !confirm(
-    'This chat has a public share link. Deleting it here does NOT revoke that link — ' +
-    'use "Unshare chat" first.\n\nDelete anyway?')) return;
-  const idx = conversations.indexOf(conv);
-  conversations.splice(idx, 1);
-  if (conversations.length === 0) {
-    createConversation();
-  } else if (activeConvId === id) {
-    switchConversation(conversations[0].id);
-  }
-  saveConversations();
-  renderSidebar();
-  // Show undo toast
-  const toast = document.createElement('div');
-  toast.className = 'toast info';
-  toast.setAttribute('role', 'status');
-  toast.setAttribute('aria-live', 'polite');
-  toast.setAttribute('aria-atomic', 'true');
-  toast.innerHTML = 'Conversation deleted. <button style="background:var(--accent);color:var(--accent-text);border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-family:inherit;font-size:0.85em;margin-left:8px" class="undo-delete-btn">Undo</button>';
-  const container = document.getElementById('toastContainer');
-  container.appendChild(toast);
-  const undoBtn = toast.querySelector('.undo-delete-btn');
-  const timer = setTimeout(() => { toast.remove(); }, 5000);
-  undoBtn.onclick = () => {
-    clearTimeout(timer);
-    conversations.splice(idx, 0, conv);
-    activeConvId = conv.id;
-    messages = conv.messages;
-    saveConversations();
-    renderSidebar();
-    renderMessages();
-    updateTokenInfo();
-    toast.remove();
-    showToast('Conversation restored.', 'success');
-  };
+  e?.stopPropagation();
+  removeConversations([id]);
 }
 
 function clearAllConversations() {
-  if (!confirm('Delete ALL conversations? This cannot be undone.')) return;
-  conversations = [];
-  createConversation();
+  if (!confirm('Delete ALL conversations? Public share links are not revoked.')) return;
+  removeConversations(conversations.map(c => c.id), false);
 }
 
 // ============================================
@@ -3280,6 +4013,7 @@ function getProject(id) {
 }
 
 function createProject(name) {
+  if (readOnlyShare) return null;
   const proj = {
     id: 'proj_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
     name: (name || 'New project').trim() || 'New project',
@@ -3295,6 +4029,7 @@ function createProject(name) {
 }
 
 function deleteProject(id) {
+  if (readOnlyShare) return;
   const proj = getProject(id);
   if (!proj) return;
   if (!confirm('Delete project "' + proj.name + '"? Its chats are kept and become unfiled.')) return;
@@ -3310,11 +4045,158 @@ function deleteProject(id) {
 }
 
 function assignConversationToProject(conv, projectId) {
+  if (readOnlyShare) return;
   if (projectId) conv.projectId = projectId;
   else delete conv.projectId;
   conv.updatedAt = Date.now();
   saveConversations();
   renderSidebar();
+}
+
+function setConversationView(view) {
+  if (readOnlyShare) return;
+  conversationView = view === 'archived' ? 'archived' : 'active';
+  localStorage.setItem('assistantConversationView', conversationView);
+  renderSidebar();
+}
+
+function setConversationSort(sort) {
+  if (readOnlyShare) return;
+  conversationSort = ['updated', 'created', 'title', 'manual'].includes(sort) ? sort : 'updated';
+  localStorage.setItem('assistantConversationSort', conversationSort);
+  renderSidebar();
+}
+
+function toggleBulkMode(enabled = !bulkMode) {
+  bulkMode = enabled;
+  if (!bulkMode) selectedConversationIds.clear();
+  const toolbar = document.getElementById('bulkToolbar');
+  if (toolbar) toolbar.hidden = !bulkMode;
+  const btn = document.getElementById('bulkModeBtn');
+  if (btn) {
+    btn.classList.toggle('active', bulkMode);
+    btn.setAttribute('aria-pressed', String(bulkMode));
+  }
+  renderSidebar();
+}
+
+function updateBulkCount() {
+  const count = document.getElementById('bulkCount');
+  if (count) count.textContent = selectedConversationIds.size + ' selected';
+  const all = document.getElementById('bulkSelectAll');
+  const visible = conversations.filter(isConversationVisibleInSidebar);
+  if (all) {
+    all.checked = visible.length > 0 && visible.every(c => selectedConversationIds.has(c.id));
+    all.indeterminate = visible.some(c => selectedConversationIds.has(c.id)) && !all.checked;
+  }
+}
+
+function toggleConversationSelection(id, checked) {
+  if (checked) selectedConversationIds.add(id);
+  else selectedConversationIds.delete(id);
+  updateBulkCount();
+}
+
+function toggleSelectAllConversations(checked) {
+  conversations.forEach(conv => {
+    if (isConversationVisibleInSidebar(conv)) {
+      if (checked) selectedConversationIds.add(conv.id);
+      else selectedConversationIds.delete(conv.id);
+    }
+  });
+  renderSidebar();
+}
+
+function archiveConversation(id) {
+  if (readOnlyShare) return;
+  const conv = conversations.find(c => c.id === id);
+  if (!conv) return;
+  if (conv.archivedAt) delete conv.archivedAt;
+  else conv.archivedAt = Date.now();
+  conv.updatedAt = Date.now();
+  saveConversations();
+  renderSidebar();
+  announce(conv.archivedAt ? 'Conversation archived.' : 'Conversation restored.');
+}
+
+function toggleActiveArchive() {
+  archiveConversation(activeConvId);
+}
+
+function duplicateConversation(id = activeConvId) {
+  if (readOnlyShare) return;
+  const source = conversations.find(c => c.id === id);
+  if (!source) return;
+  const copy = normalizeConversationRecord(JSON.parse(JSON.stringify(source)));
+  copy.id = genId();
+  copy.title = (source.title || 'Chat') + ' (copy)';
+  copy.createdAt = Date.now();
+  copy.updatedAt = Date.now();
+  delete copy.shareGistId;
+  delete copy.shareUrl;
+  delete copy.shareId;
+  conversations.unshift(copy);
+  activeConvId = copy.id;
+  messages = copy.messages;
+  saveConversations();
+  renderSidebar();
+  renderMessages();
+  updateTokenInfo();
+  restoreActiveDraft();
+  announce('Conversation duplicated.');
+}
+
+function removeConversations(ids, showUndo = true) {
+  if (readOnlyShare) return;
+  const targets = conversations.filter(c => ids.includes(c.id));
+  if (!targets.length) return;
+  const publicCount = targets.filter(c => c.shareGistId || c.shareUrl || c.shareId).length;
+  if (publicCount && !confirm(publicCount + ' selected conversation' + (publicCount === 1 ? ' has' : 's have') + ' public share IDs. Deleting locally does not revoke those links. Continue?')) return;
+  const removed = targets.map(conv => ({ conv, index: conversations.indexOf(conv) }));
+  conversations = conversations.filter(c => !ids.includes(c.id));
+  if (!conversations.length) conversations.push({ id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() });
+  if (!conversations.some(c => c.id === activeConvId)) activeConvId = conversations[0].id;
+  messages = getActiveConv()?.messages || [];
+  saveConversations();
+  renderSidebar();
+  renderMessages();
+  updateTokenInfo();
+  restoreActiveDraft();
+  selectedConversationIds.clear();
+  if (!showUndo) return;
+  showToast(targets.length + ' conversation' + (targets.length === 1 ? '' : 's') + ' deleted.', 'info', 5000, {
+    label: 'Undo',
+    onClick: () => {
+      removed.sort((a, b) => a.index - b.index).forEach(({ conv, index }) => conversations.splice(Math.min(index, conversations.length), 0, conv));
+      activeConvId = removed[0].conv.id;
+      messages = getActiveConv().messages;
+      saveConversations();
+      renderSidebar();
+      renderMessages();
+      updateTokenInfo();
+      showToast('Conversation deletion undone.', 'success');
+    }
+  });
+}
+
+function bulkArchiveSelected() {
+  if (readOnlyShare) return;
+  if (!selectedConversationIds.size) return;
+  const shouldArchive = conversationView !== 'archived';
+  conversations.forEach(conv => {
+    if (!selectedConversationIds.has(conv.id)) return;
+    if (shouldArchive) conv.archivedAt = Date.now();
+    else delete conv.archivedAt;
+    conv.updatedAt = Date.now();
+  });
+  selectedConversationIds.clear();
+  saveConversations();
+  renderSidebar();
+  announce(shouldArchive ? 'Selected conversations archived.' : 'Selected conversations restored.');
+}
+
+function bulkDeleteSelected() {
+  removeConversations([...selectedConversationIds]);
 }
 
 function projectDocsSystemText(project) {
@@ -3496,20 +4378,33 @@ function renderSidebar() {
   const list = document.getElementById('convList');
   list.innerHTML = '';
 
-  // Sort: pinned first (by updatedAt desc), then unpinned by updatedAt desc
-  // If any have sortOrder, use that instead
-  const hasSortOrder = conversations.some(c => c.sortOrder != null);
+  const activeBtn = document.getElementById('activeViewBtn');
+  const archivedBtn = document.getElementById('archivedViewBtn');
+  if (activeBtn) {
+    activeBtn.classList.toggle('active', conversationView === 'active');
+    activeBtn.setAttribute('aria-pressed', String(conversationView === 'active'));
+  }
+  if (archivedBtn) {
+    archivedBtn.classList.toggle('active', conversationView === 'archived');
+    archivedBtn.setAttribute('aria-pressed', String(conversationView === 'archived'));
+  }
+  const sortSelect = document.getElementById('conversationSort');
+  if (sortSelect) sortSelect.value = conversationSort;
+
+  const visibleConversations = conversations.filter(c => (conversationView === 'archived') === Boolean(c.archivedAt));
   // Unfiled chats sort last so the existing date groups stay where they are.
   const projectSortKey = (c) => {
     const p = getProject(c.projectId);
     return p ? p.name.toLowerCase() : '￿';
   };
-  const sorted = [...conversations].sort((a, b) => {
+  const sorted = [...visibleConversations].sort((a, b) => {
     if (a.pinned && !b.pinned) return -1;
     if (!a.pinned && b.pinned) return 1;
     const pa = projectSortKey(a), pb = projectSortKey(b);
     if (pa !== pb) return pa < pb ? -1 : 1;
-    if (hasSortOrder && a.sortOrder != null && b.sortOrder != null) return a.sortOrder - b.sortOrder;
+    if (conversationSort === 'manual') return (a.sortOrder ?? 0) - (b.sortOrder ?? 0);
+    if (conversationSort === 'created') return (b.createdAt || 0) - (a.createdAt || 0);
+    if (conversationSort === 'title') return String(a.title || '').localeCompare(String(b.title || ''));
     return (b.updatedAt || 0) - (a.updatedAt || 0);
   });
 
@@ -3563,12 +4458,12 @@ function renderSidebar() {
     }
 
     const div = document.createElement('div');
-    div.className = 'conv-item' + (c.id === activeConvId ? ' active' : '');
+    div.className = 'conv-item' + (c.id === activeConvId ? ' active' : '') + (c.archivedAt ? ' archived' : '');
     div.onclick = () => switchConversation(c.id);
     div.dataset.convId = c.id;
 
     // Drag-and-drop (desktop only)
-    div.draggable = true;
+    div.draggable = conversationSort === 'manual' && !bulkMode;
     div.addEventListener('dragstart', (e) => {
       e.dataTransfer.setData('text/plain', c.id);
       div.classList.add('dragging');
@@ -3581,6 +4476,10 @@ function renderSidebar() {
       div.classList.remove('drag-over');
       const draggedId = e.dataTransfer.getData('text/plain');
       if (draggedId === c.id) return;
+      if (conversationSort !== 'manual') {
+        setConversationSort('manual');
+        showToast('Manual sorting enabled for dragging.', 'info');
+      }
       const fromIdx = conversations.findIndex(x => x.id === draggedId);
       const toIdx = conversations.findIndex(x => x.id === c.id);
       if (fromIdx === -1 || toIdx === -1) return;
@@ -3602,6 +4501,17 @@ function renderSidebar() {
       saveConversations();
       renderSidebar();
     };
+
+    if (bulkMode) {
+      const select = document.createElement('input');
+      select.type = 'checkbox';
+      select.className = 'conv-select-checkbox';
+      select.checked = selectedConversationIds.has(c.id);
+      select.setAttribute('aria-label', 'Select ' + c.title);
+      select.onclick = e => e.stopPropagation();
+      select.onchange = () => toggleConversationSelection(c.id, select.checked);
+      div.appendChild(select);
+    }
 
     const title = document.createElement('span');
     title.className = 'conv-title';
@@ -3640,12 +4550,19 @@ function renderSidebar() {
 
     div.appendChild(pinBtn);
     if (c.characterAvatar) {
-      const avatar = document.createElement('img');
-      avatar.className = 'conv-avatar';
-      avatar.src = c.characterAvatar;
-      div.appendChild(avatar);
+      const safeAvatar = safeMediaUrl(c.characterAvatar);
+      if (safeAvatar) {
+        const avatar = document.createElement('img');
+        avatar.className = 'conv-avatar';
+        avatar.src = safeAvatar;
+        div.appendChild(avatar);
+      }
     }
     div.appendChild(title);
+    const state = document.createElement('span');
+    state.className = 'conv-state';
+    state.textContent = c.archivedAt ? 'Archived' : '';
+    if (state.textContent) div.appendChild(state);
     if (c.tag) {
       const tagEl = document.createElement('span');
       tagEl.className = 'conv-tag';
@@ -3671,11 +4588,26 @@ function renderSidebar() {
     projBtn.setAttribute('aria-label', 'Move conversation to a project');
     projBtn.onclick = (e) => { e.stopPropagation(); showProjectPicker(c, projBtn); };
     div.appendChild(projBtn);
+    const archiveBtn = document.createElement('button');
+    archiveBtn.className = 'conv-delete conv-archive';
+    archiveBtn.textContent = c.archivedAt ? '\u21A9' : '\u21E7';
+    archiveBtn.title = c.archivedAt ? 'Restore conversation' : 'Archive conversation';
+    archiveBtn.setAttribute('aria-label', archiveBtn.title);
+    archiveBtn.onclick = e => { e.stopPropagation(); archiveConversation(c.id); };
+    div.appendChild(archiveBtn);
+    const duplicateBtn = document.createElement('button');
+    duplicateBtn.className = 'conv-delete conv-duplicate';
+    duplicateBtn.textContent = '\u2398';
+    duplicateBtn.title = 'Duplicate conversation';
+    duplicateBtn.setAttribute('aria-label', 'Duplicate conversation');
+    duplicateBtn.onclick = e => { e.stopPropagation(); duplicateConversation(c.id); };
+    div.appendChild(duplicateBtn);
     div.appendChild(del);
     list.appendChild(div);
   });
   renderTagFilterBar();
   filterConversations();
+  updateBulkCount();
 }
 
 // ============================================
@@ -3753,6 +4685,13 @@ function filterConversations() {
   });
 }
 
+function isConversationVisibleInSidebar(conv) {
+  if (!conv || (conversationView === 'archived') !== Boolean(conv.archivedAt)) return false;
+  const query = document.getElementById('sidebarSearch')?.value.trim().toLowerCase() || '';
+  const title = String(conv.title || '').toLowerCase();
+  return (!query || title.includes(query)) && (!activeTagFilter || conv.tag === activeTagFilter);
+}
+
 // ============================================
 // Sidebar Toggle
 // ============================================
@@ -3768,36 +4707,121 @@ function toggleSidebar() {
 // ============================================
 function toggleToolbarMenu(e) {
   e.stopPropagation();
-  document.getElementById('toolbarMenu').classList.toggle('open');
+  const menu = document.getElementById('toolbarMenu');
+  const open = menu.classList.toggle('open');
+  document.getElementById('toolbarMoreBtn')?.setAttribute('aria-expanded', String(open));
+  if (open) {
+    toolbarMenuFocusReturn = document.activeElement;
+    menu.querySelector('[role="menuitem"]')?.focus();
+  } else {
+    toolbarMenuFocusReturn = null;
+  }
 }
 function closeToolbarMenu() {
   document.getElementById('toolbarMenu').classList.remove('open');
+  document.getElementById('toolbarMoreBtn')?.setAttribute('aria-expanded', 'false');
+  if (toolbarMenuFocusReturn && document.contains(toolbarMenuFocusReturn)) toolbarMenuFocusReturn.focus();
+  toolbarMenuFocusReturn = null;
 }
 document.addEventListener('click', () => closeToolbarMenu());
 
 // ============================================
 // Setup & Settings
 // ============================================
+function getConnectionInputs(target) {
+  const setup = target === 'setup';
+  return {
+    provider: document.getElementById(setup ? 'setupProvider' : 'setProvider'),
+    base: document.getElementById(setup ? 'setupProxy' : 'setProxy'),
+    key: document.getElementById(setup ? 'setupKey' : 'setKey'),
+    format: document.getElementById(setup ? 'setupApiFormat' : 'setApiFormat'),
+    model: document.getElementById(setup ? 'setupModelManual' : 'setModelManual')
+  };
+}
+
+function applyProviderPreset(target, providerName) {
+  const preset = getProviderPreset(providerName);
+  const inputs = getConnectionInputs(target);
+  const currentUrl = inputs.base?.value.trim() || '';
+  const previousPresetUrl = inputs.base?.dataset.providerPresetUrl || '';
+  if (inputs.base && (!currentUrl || (previousPresetUrl && currentUrl === previousPresetUrl))) {
+    inputs.base.value = preset.baseUrl;
+  }
+  if (inputs.base) {
+    inputs.base.dataset.providerPreset = providerName;
+    inputs.base.dataset.providerPresetUrl = preset.baseUrl;
+  }
+  if (inputs.format) inputs.format.value = preset.apiFormat;
+  const keyLabel = inputs.key?.closest('form')?.querySelector('label[for="' + inputs.key.id + '"]');
+  if (keyLabel) keyLabel.textContent = preset.keyRequired ? 'API Key' : 'API Key (optional)';
+  const refresh = document.querySelector('[onclick="refreshModels(\'' + target + '\', this)"]');
+  if (refresh) refresh.disabled = false;
+}
+
+function renderConnectionStatus(target, text, state = '') {
+  const el = document.getElementById(target === 'setup' ? 'setupConnectionStatus' : 'settingsConnectionStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'connection-status ' + state;
+}
+
+async function testConnection(target = 'settings') {
+  const inputs = getConnectionInputs(target);
+  const baseUrl = inputs.base?.value.trim().replace(/\/(chat\/completions|messages)\/?$/, '') || '';
+  const providerName = inputs.provider?.value || inferProviderKey({ llmProxyUrl: baseUrl });
+  const key = inputs.key?.value.trim() || '';
+  const preset = getProviderPreset(providerName);
+  if (!baseUrl || (preset.keyRequired && !key)) {
+    renderConnectionStatus(target, preset.keyRequired ? 'Base URL and key required.' : 'Base URL required.', 'error');
+    return;
+  }
+  const started = performance.now();
+  renderConnectionStatus(target, 'Testing...', 'testing');
+  announce('Testing ' + preset.label + ' connection.');
+  try {
+    const metadata = await fetchAvailableModelMetadata(baseUrl, key, providerName, inputs.format?.value || '');
+    const elapsed = Math.max(0, Math.round(performance.now() - started));
+    renderConnectionStatus(target, 'Success · ' + metadata.length + ' models · ' + elapsed + ' ms', 'success');
+    announce('Connection succeeded. ' + metadata.length + ' models discovered.');
+    if (metadata.length) {
+      const ids = metadata.map(model => model.id);
+      localStorage.setItem('llmModelList', JSON.stringify(ids));
+      localStorage.setItem('llmModelMetadata', JSON.stringify(Object.fromEntries(metadata.filter(m => m.context_length).map(m => [m.id, m.context_length]))));
+      populateModelSelect(target, ids);
+    }
+  } catch (err) {
+    const elapsed = Math.max(0, Math.round(performance.now() - started));
+    renderConnectionStatus(target, 'Failed · ' + elapsed + ' ms · ' + sanitizeErrorDetail(err), 'error');
+    announce('Connection failed.');
+  }
+}
+
 function getSelectedModel(target) {
   const manualEl = document.getElementById(target === 'setup' ? 'setupModelManual' : 'setModelManual');
   const selectEl = document.getElementById(target === 'setup' ? 'setupModelSelect' : 'setModelSelect');
   const manual = manualEl.value.trim();
   if (manual) return manual;
-  return selectEl.value || 'gpt-4o';
+  return selectEl.value || localStorage.getItem('llmModel') || '';
 }
 
 function saveSetup() {
   let proxy = document.getElementById('setupProxy').value.trim();
   const key = document.getElementById('setupKey').value.trim();
-  if (!proxy || !key) { showToast('Base URL and API Key are required.', 'error'); return; }
+  const provider = document.getElementById('setupProvider').value || 'custom';
+  if (!proxy || (providerRequiresKey({ llmProvider: provider }) && !key)) { showToast(providerRequiresKey({ llmProvider: provider }) ? 'Base URL and API Key are required.' : 'Base URL is required.', 'error'); return; }
   proxy = proxy.replace(/\/(chat\/completions|messages)\/?$/, '');
   const model = getSelectedModel('setup');
+  if (!model) { showToast('Choose or enter a model.', 'error'); return; }
   localStorage.setItem('llmProxyUrl', proxy);
-  localStorage.setItem('llmApiKey', key);
+  localStorage.setItem('llmProvider', provider);
+  setApiKey(key, getSelectedKeyStorage('setup'));
   localStorage.setItem('llmModel', model);
+  localStorage.setItem('llmApiFormat', document.getElementById('setupApiFormat')?.value || getProviderPreset(provider).apiFormat);
   closeModal('setupModal');
+  renderConnectionChip();
+  announce('Provider settings saved.');
   // Try to fetch models in the background
-  fetchAvailableModels(proxy, key).then(models => {
+  if (key || !providerRequiresKey({ llmProvider: provider })) fetchAvailableModels(proxy, key).then(models => {
     localStorage.setItem('llmModelList', JSON.stringify(models));
     loadCachedModels('settings');
   }).catch(() => {});
@@ -3808,6 +4832,7 @@ function switchSettingsTab(tabName, btn) {
   document.querySelectorAll('.settings-tab-content').forEach(t => t.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById('settingsTab-' + tabName).classList.add('active');
+  if (tabName === 'data') renderStorageSummary();
 }
 
 function toggleCache(enabled) {
@@ -3861,7 +4886,11 @@ async function updateCacheStats() {
 
 function openSettings() {
   document.getElementById('setProxy').value = localStorage.getItem('llmProxyUrl') || '';
-  document.getElementById('setKey').value = localStorage.getItem('llmApiKey') || '';
+  document.getElementById('setKey').value = getApiKey();
+  const providerSelect = document.getElementById('setProvider');
+  if (providerSelect) providerSelect.value = inferProviderKey();
+  if (providerSelect) applyProviderPreset('settings', providerSelect.value);
+  setKeyStorageInputs(getKeyStorageMode());
   const currentModel = localStorage.getItem('llmModel') || '';
   document.getElementById('setModelManual').value = currentModel;
   document.getElementById('setApiFormat').value = localStorage.getItem('llmApiFormat') || 'auto';
@@ -3877,6 +4906,7 @@ function openSettings() {
   document.getElementById('setEnterSend').checked = localStorage.getItem('llmEnterSend') !== 'false';
   document.getElementById('setTemperature').value = localStorage.getItem('llmTemperature') || '';
   document.getElementById('setMaxTokens').value = localStorage.getItem('llmMaxTokens') || '';
+  document.getElementById('setContextWindow').value = localStorage.getItem('llmContextWindow') || '';
   document.getElementById('setPromptCache').checked = localStorage.getItem('llmPromptCache') !== 'false';
   document.getElementById('setThinking').checked = localStorage.getItem('llmThinking') === 'true';
   document.getElementById('setThinkingEffort').value = localStorage.getItem('llmThinkingEffort') || '';
@@ -3887,6 +4917,8 @@ function openSettings() {
   document.getElementById('setMsgMaxWidth').value = localStorage.getItem('assistantMsgMaxWidth') || '';
   document.getElementById('setWebSearch').checked = localStorage.getItem('llmWebSearch') === 'true';
   document.getElementById('setForceSearch').checked = localStorage.getItem('llmForceSearch') === 'true';
+  document.getElementById('setUrlFetch').checked = localStorage.getItem('llmUrlFetch') !== 'false';
+  document.getElementById('setToolConfirm').checked = localStorage.getItem('llmToolConfirm') === 'true';
   document.getElementById('setSearchApiUrl').value = localStorage.getItem('llmSearchApiUrl') || '';
   document.getElementById('setSearchApiKey').value = localStorage.getItem('llmSearchApiKey') || '';
   document.getElementById('setCorsProxy').value = getCorsProxyUrl();
@@ -3933,11 +4965,15 @@ function openSettings() {
 }
 
 function loadProfiles() {
-  try { return JSON.parse(localStorage.getItem('assistantProfiles') || '[]'); } catch(e) { return []; }
+  try {
+    const raw = JSON.parse(localStorage.getItem('assistantProfiles') || '[]');
+    return Array.isArray(raw) ? raw.map(sanitizeProfileRecord) : [];
+  } catch(e) { return []; }
 }
 
 function saveProfiles(profiles) {
-  localStorage.setItem('assistantProfiles', JSON.stringify(profiles));
+  const safeProfiles = (Array.isArray(profiles) ? profiles : []).map(sanitizeProfileRecord);
+  localStorage.setItem('assistantProfiles', JSON.stringify(safeProfiles));
 }
 
 function renderProfileSelect() {
@@ -3973,14 +5009,15 @@ function renderProfileSummary() {
 
 function collectProfileSettingsFromInputs() {
   return {
+    llmProvider: document.getElementById('setProvider').value,
     llmProxyUrl: document.getElementById('setProxy').value.trim(),
-    llmApiKey: document.getElementById('setKey').value.trim(),
     llmModel: getSelectedModel('settings'),
     llmApiFormat: document.getElementById('setApiFormat').value,
     llmStreaming: document.getElementById('setStreaming').checked ? 'true' : 'false',
     llmEnterSend: document.getElementById('setEnterSend').checked ? 'true' : 'false',
     llmTemperature: document.getElementById('setTemperature').value.trim(),
     llmMaxTokens: document.getElementById('setMaxTokens').value.trim(),
+    llmContextWindow: document.getElementById('setContextWindow').value.trim(),
     llmPromptCache: document.getElementById('setPromptCache').checked ? 'true' : 'false',
     llmThinking: document.getElementById('setThinking').checked ? 'true' : 'false',
     llmThinkingEffort: document.getElementById('setThinkingEffort').value,
@@ -3989,8 +5026,9 @@ function collectProfileSettingsFromInputs() {
     llmPrefill: document.getElementById('setPrefill').value,
     llmWebSearch: document.getElementById('setWebSearch').checked ? 'true' : 'false',
     llmForceSearch: document.getElementById('setForceSearch').checked ? 'true' : 'false',
+    llmUrlFetch: document.getElementById('setUrlFetch').checked ? 'true' : 'false',
+    llmToolConfirm: document.getElementById('setToolConfirm').checked ? 'true' : 'false',
     llmSearchApiUrl: document.getElementById('setSearchApiUrl').value.trim(),
-    llmSearchApiKey: document.getElementById('setSearchApiKey').value.trim(),
     llmCorsProxy: normalizeCorsProxyUrl(document.getElementById('setCorsProxy').value),
     llmMemoryEnabled: document.getElementById('setMemory').checked ? 'true' : 'false',
     llmHoldScreenshot: document.getElementById('setHoldScreenshot').checked ? 'true' : 'false',
@@ -4003,12 +5041,15 @@ function collectProfileSettingsFromInputs() {
 
 function applyProfileToInputs(settings) {
   document.getElementById('setProxy').value = settings.llmProxyUrl || '';
-  document.getElementById('setKey').value = settings.llmApiKey || '';
+  document.getElementById('setKey').value = settings.llmApiKey || getApiKey();
+  const providerSelect = document.getElementById('setProvider');
+  if (providerSelect) providerSelect.value = settings.llmProvider || inferProviderKey(settings);
   document.getElementById('setApiFormat').value = settings.llmApiFormat || 'auto';
   document.getElementById('setStreaming').checked = settings.llmStreaming !== 'false';
   document.getElementById('setEnterSend').checked = settings.llmEnterSend !== 'false';
   document.getElementById('setTemperature').value = settings.llmTemperature || '';
   document.getElementById('setMaxTokens').value = settings.llmMaxTokens || '';
+  document.getElementById('setContextWindow').value = settings.llmContextWindow || '';
   document.getElementById('setPromptCache').checked = settings.llmPromptCache !== 'false';
   document.getElementById('setThinking').checked = settings.llmThinking === 'true';
   document.getElementById('setThinkingEffort').value = settings.llmThinkingEffort || '';
@@ -4017,6 +5058,8 @@ function applyProfileToInputs(settings) {
   document.getElementById('setPrefill').value = settings.llmPrefill || '';
   document.getElementById('setWebSearch').checked = settings.llmWebSearch === 'true';
   document.getElementById('setForceSearch').checked = settings.llmForceSearch === 'true';
+  document.getElementById('setUrlFetch').checked = settings.llmUrlFetch !== 'false';
+  document.getElementById('setToolConfirm').checked = settings.llmToolConfirm === 'true';
   document.getElementById('setSearchApiUrl').value = settings.llmSearchApiUrl || '';
   document.getElementById('setSearchApiKey').value = settings.llmSearchApiKey || '';
   document.getElementById('setCorsProxy').value = normalizeCorsProxyUrl(settings.llmCorsProxy);
@@ -4041,11 +5084,14 @@ function applyProfile(profile) {
   const settings = profile.settings || {};
   Object.entries(settings).forEach(([k, v]) => {
     if (v === null || v === undefined) return;
+    if (k === 'llmApiKey') return;
     localStorage.setItem(k, v);
   });
+  if (settings.llmApiKey) setApiKey(settings.llmApiKey, getKeyStorageMode());
   localStorage.setItem('assistantActiveProfileId', profile.id);
   applyProfileToInputs(settings);
   renderProfileSummary();
+  renderConnectionChip();
   showToast('Profile applied: ' + profile.name, 'success');
 }
 
@@ -4087,6 +5133,7 @@ function saveCurrentAsProfile() {
   localStorage.setItem('assistantActiveProfileId', profile.id);
   if (nameInput) nameInput.value = '';
   renderProfileSummary();
+  renderConnectionChip();
   showToast('Profile saved.', 'success');
 }
 
@@ -4123,9 +5170,18 @@ function saveSettings() {
 
   let proxy = document.getElementById('setProxy').value.trim();
   proxy = proxy.replace(/\/(chat\/completions|messages)\/?$/, '');
+  const providerName = document.getElementById('setProvider').value || 'custom';
+  const keyValue = document.getElementById('setKey').value.trim();
+  if (!proxy || (providerRequiresKey({ llmProvider: providerName }) && !keyValue)) {
+    showToast(providerRequiresKey({ llmProvider: providerName }) ? 'Base URL and API Key are required.' : 'Base URL is required.', 'error');
+    return;
+  }
+  const selectedModel = getSelectedModel('settings');
+  if (!selectedModel) { showToast('Choose or enter a model.', 'error'); return; }
   localStorage.setItem('llmProxyUrl', proxy);
-  localStorage.setItem('llmApiKey', document.getElementById('setKey').value.trim());
-  localStorage.setItem('llmModel', getSelectedModel('settings'));
+  localStorage.setItem('llmProvider', providerName);
+  setApiKey(keyValue, getSelectedKeyStorage('settings'));
+  localStorage.setItem('llmModel', selectedModel);
   localStorage.setItem('llmApiFormat', document.getElementById('setApiFormat').value);
   localStorage.setItem('llmExtraParams', extraParamsVal);
   localStorage.setItem('llmExcludeParams', document.getElementById('setExcludeParams').value.trim());
@@ -4143,6 +5199,7 @@ function saveSettings() {
   const tempVal = document.getElementById('setTemperature').value.trim();
   localStorage.setItem('llmTemperature', tempVal);
   localStorage.setItem('llmMaxTokens', document.getElementById('setMaxTokens').value.trim());
+  localStorage.setItem('llmContextWindow', document.getElementById('setContextWindow').value.trim());
   localStorage.setItem('llmPromptCache', document.getElementById('setPromptCache').checked ? 'true' : 'false');
   localStorage.setItem('llmThinking', document.getElementById('setThinking').checked ? 'true' : 'false');
   localStorage.setItem('llmThinkingEffort', document.getElementById('setThinkingEffort').value);
@@ -4150,6 +5207,8 @@ function saveSettings() {
   localStorage.setItem('llmOutputCost', document.getElementById('setOutputCost').value.trim());
   localStorage.setItem('llmWebSearch', document.getElementById('setWebSearch').checked ? 'true' : 'false');
   localStorage.setItem('llmForceSearch', document.getElementById('setForceSearch').checked ? 'true' : 'false');
+  localStorage.setItem('llmUrlFetch', document.getElementById('setUrlFetch').checked ? 'true' : 'false');
+  localStorage.setItem('llmToolConfirm', document.getElementById('setToolConfirm').checked ? 'true' : 'false');
   localStorage.setItem('llmSearchApiUrl', document.getElementById('setSearchApiUrl').value.trim());
   localStorage.setItem('llmSearchApiKey', document.getElementById('setSearchApiKey').value.trim());
   localStorage.setItem('llmCorsProxy', normalizeCorsProxyUrl(document.getElementById('setCorsProxy').value));
@@ -4188,13 +5247,15 @@ function saveSettings() {
 
   // Try to fetch models in background
   const key = document.getElementById('setKey').value.trim();
-  if (proxy && key) {
+  if (proxy && (key || !providerRequiresKey({ llmProvider: providerName }))) {
     fetchAvailableModels(proxy, key).then(models => {
       localStorage.setItem('llmModelList', JSON.stringify(models));
     }).catch(() => {});
   }
 
   closeModal('settingsModal');
+  renderConnectionChip();
+  announce('Settings saved.');
 }
 
 function closeSettings() {
@@ -4648,16 +5709,218 @@ async function buildSystemMessages(conv) {
   return msgs;
 }
 
+function isFailedAssistantMessage(message) {
+  if (!message || message.role !== 'assistant') return false;
+  const request = message.swipeRequests?.[message.swipeIndex || 0];
+  return ['failed', 'stopped', 'interrupted'].includes(request?.status) || /^\s*(Error:|Request failed:|Request interrupted\.)/i.test(getMsgText(message));
+}
+
+function isPendingAssistantMessage(message) {
+  if (!message || message.role !== 'assistant') return false;
+  const request = message.swipeRequests?.[message.swipeIndex || 0];
+  return !String(getMsgText(message) || '').trim() || ['pending', 'streaming'].includes(request?.status);
+}
+
+function filterRequestHistory(source, options = {}) {
+  const list = Array.isArray(source) ? source : [];
+  const end = Number.isInteger(options.untilIndex) ? options.untilIndex : list.length;
+  const includeTarget = options.includeTarget === true;
+  const included = [];
+  const excluded = [];
+  list.slice(0, end).forEach((message, index) => {
+    if (!message || !['user', 'assistant'].includes(message.role)) return;
+    const isTarget = index === options.targetIndex;
+    if (message.role === 'assistant' && (isPendingAssistantMessage(message) || isFailedAssistantMessage(message))) return;
+    if (message.includeInContext === false) {
+      excluded.push({ message, index });
+      return;
+    }
+    included.push({ message, index });
+  });
+  return { included, excluded };
+}
+
+function buildComposerMessage(text = document.getElementById('chatInput')?.value || '', attachments = pendingAttachments) {
+  const messageText = String(text || '').trim();
+  const queued = Array.isArray(attachments) ? attachments : [];
+  if (!messageText && queued.length === 0) return null;
+  if (queued.length === 0) return { role: 'user', content: messageText };
+  const content = [];
+  if (messageText) content.push({ type: 'text', text: messageText });
+  queued.forEach(att => {
+    if (att.type === 'image') {
+      content.push({ type: 'image_url', image_url: { url: att.dataUrl } });
+    } else if (typeof att.textContent === 'string') {
+      const filePart = { name: att.name, mime: att.mime, textContent: att.textContent };
+      if (att.dataUrl) filePart.url = att.dataUrl;
+      if (att.binary) filePart.binary = true;
+      content.push({ type: 'file', file: filePart });
+    } else {
+      content.push({ type: 'file', file: { url: att.dataUrl, name: att.name, mime: att.mime } });
+    }
+  });
+  return { role: 'user', content };
+}
+
+async function buildRequestMessages(conv = getActiveConv(), options = {}) {
+  const source = Array.isArray(options.messageList) ? options.messageList : messages;
+  const systemMessages = await buildSystemMessages(conv);
+  const toolPolicy = getToolPolicy(conv);
+  if (toolPolicy.webSearch || toolPolicy.urlFetch) {
+    systemMessages.push({ role: 'system', content: SOURCE_CITATION_INSTRUCTION });
+  }
+  const requestMessages = [...systemMessages];
+  const selection = filterRequestHistory(source, options);
+  selection.included = selection.included.map(({ message, index }) => {
+    const normalized = { role: message.role, content: buildApiContent(message) };
+    requestMessages.push(normalized);
+    return { message, index, normalized };
+  });
+  let draft = null;
+  if (options.draftMessage && getMsgText(options.draftMessage).trim()) {
+    draft = { message: options.draftMessage, index: source.length, normalized: { role: 'user', content: buildApiContent(options.draftMessage) } };
+    requestMessages.push(draft.normalized);
+  }
+  return { messages: requestMessages, systemMessages, included: selection.included, excluded: selection.excluded, draft, toolPolicy };
+}
+
+function getModelContextWindow(model = localStorage.getItem('llmModel') || '') {
+  const manual = Number(getActiveProfile()?.settings?.llmContextWindow || localStorage.getItem('llmContextWindow') || 0);
+  if (manual > 0) return manual;
+  try {
+    const metadata = JSON.parse(localStorage.getItem('llmModelMetadata') || '{}');
+    const value = Number(metadata[model]?.context_length ?? metadata[model]);
+    return value > 0 ? value : null;
+  } catch(e) { return null; }
+}
+
+function getRequestContextStats(requestMessages, excluded = [], model = localStorage.getItem('llmModel') || '') {
+  const includedTokens = (requestMessages || []).reduce((total, message) => {
+    if (message.role === 'system') return total + estimateTokens(typeof message.content === 'string' ? message.content : JSON.stringify(message.content || ''));
+    return total + estimateTokens(getMsgText(message));
+  }, 0);
+  const excludedTokens = (excluded || []).reduce((total, item) => total + estimateTokens(getMsgText(item.message)), 0);
+  const maxOutput = resolveMaxTokens();
+  const contextWindow = getModelContextWindow(model);
+  return { includedTokens, excludedTokens, maxOutput, contextWindow, usage: contextWindow ? (includedTokens + maxOutput) / contextWindow : null };
+}
+
+function contextLimitMessage(stats) {
+  if (!stats?.contextWindow || stats.includedTokens + stats.maxOutput <= stats.contextWindow) return '';
+  return 'This request is too large for the configured context window (' +
+    formatTokenCount(stats.includedTokens + stats.maxOutput) + ' of ' + formatTokenCount(stats.contextWindow) + ' tokens). Exclude older messages or compact the conversation.';
+}
+
+function guardContextLimit(requestContext) {
+  const stats = getRequestContextStats(requestContext?.messages, requestContext?.excluded);
+  const warning = contextLimitMessage(stats);
+  if (!warning) return false;
+  showToast(warning, 'error', 7000);
+  announce('Request blocked because the context window is too small.');
+  return true;
+}
+
+async function buildContextPreviewData() {
+  const conv = getActiveConv();
+  const draftMessage = buildComposerMessage();
+  const built = await buildRequestMessages(conv, { messageList: messages, draftMessage });
+  const all = await buildRequestMessages(conv, { messageList: messages });
+  const stats = getRequestContextStats(built.messages, built.excluded);
+  const attachments = [];
+  const collectAttachments = (message, included) => {
+    if (!Array.isArray(message.content)) return;
+    message.content.forEach(part => {
+      if (part.type === 'file') attachments.push({ name: part.file?.name || 'file', chars: String(part.file?.textContent || '').length, included });
+      if (part.type === 'image_url') attachments.push({ name: 'image attachment', chars: 0, included, image: true });
+    });
+  };
+  messages.forEach(message => collectAttachments(message, message.includeInContext !== false));
+  if (draftMessage) collectAttachments(draftMessage, true);
+  return { provider: getLlmProviderInfo(localStorage.getItem('llmModel') || '', detectApiFormat(localStorage.getItem('llmModel') || ''), localStorage.getItem('llmProxyUrl') || ''), model: localStorage.getItem('llmModel') || '(not set)', systemMessages: built.systemMessages, included: built.included, excluded: all.excluded, draft: built.draft, attachments, stats };
+}
+
+async function openContextPreview() {
+  const body = document.getElementById('contextPreviewBody');
+  if (!body) return;
+  body.textContent = 'Building request preview...';
+  openModal('contextPreviewModal');
+  try {
+    const data = await buildContextPreviewData();
+    body.innerHTML = '';
+    const summary = document.createElement('div');
+    summary.className = 'context-summary';
+    const denominator = data.stats.contextWindow ? ' / ' + formatTokenCount(data.stats.contextWindow) : '';
+    summary.textContent = data.provider.name + ' · ' + data.model + ' · ~' + formatTokenCount(data.stats.includedTokens) + ' prompt tokens' + denominator + ' · max output ' + formatTokenCount(data.stats.maxOutput) + (data.stats.usage != null ? ' · ' + Math.round(data.stats.usage * 100) + '% estimated use' : ' · context limit unknown');
+    body.appendChild(summary);
+    const addSection = (title, rows) => {
+      const section = document.createElement('section');
+      section.className = 'context-section';
+      const heading = document.createElement('h3');
+      heading.textContent = title;
+      section.appendChild(heading);
+      if (!rows.length) {
+        const empty = document.createElement('p');
+        empty.className = 'setting-hint';
+        empty.textContent = 'None';
+        section.appendChild(empty);
+      } else rows.forEach(row => { const pre = document.createElement('pre'); pre.textContent = row; section.appendChild(pre); });
+      body.appendChild(section);
+    };
+    addSection('System context', data.systemMessages.map(message => message.content));
+    addSection('Included history', data.included.map(item => item.message.role.toUpperCase() + ': ' + getMsgText(item.message)));
+    if (data.draft) addSection('Current draft', [data.draft.message.role.toUpperCase() + ': ' + getMsgText(data.draft.message)]);
+    addSection('Excluded history', data.excluded.map(item => item.message.role.toUpperCase() + ': ' + getMsgText(item.message)));
+    addSection('Attachments', data.attachments.map(att => att.name + ' · ' + (att.image ? 'image data redacted' : att.chars.toLocaleString() + ' extracted characters') + (att.included ? ' · included' : ' · excluded')));
+    if (data.stats.contextWindow && data.stats.includedTokens + data.stats.maxOutput > data.stats.contextWindow) {
+      const warning = document.createElement('p');
+      warning.className = 'context-warning';
+      warning.textContent = 'Estimated context use exceeds the configured window. Counts are advisory estimates.';
+      body.prepend(warning);
+    }
+  } catch (err) {
+    body.textContent = 'Could not build preview: ' + sanitizeErrorDetail(err);
+  }
+}
+
+async function compactOlderTurns() {
+  if (readOnlyShare) return;
+  const conv = getActiveConv();
+  const candidates = messages.map((message, index) => ({ message, index })).filter(item => item.message.role !== 'system' && item.message.includeInContext !== false && !isFailedAssistantMessage(item.message));
+  if (candidates.length <= 8) { showToast('There are not enough older turns to compact.', 'info'); return; }
+  const older = candidates.slice(0, -8);
+  const transcript = older.map(item => (item.message.role === 'assistant' ? 'Assistant: ' : 'User: ') + getMsgText(item.message)).join('\n');
+  try {
+    announce('Generating a nondestructive summary of older turns.');
+    const summary = (await callApiNonStreaming([
+      { role: 'system', content: 'Summarize these older conversation turns into a concise context note. Preserve facts, decisions, preferences, and unresolved tasks. Do not invent details.' },
+      { role: 'user', content: transcript }
+    ])).trim();
+    if (!summary) throw new Error('The provider returned an empty summary.');
+    conv.summary = conv.summary ? conv.summary + '\n\n' + summary : summary;
+    conv.summaryUpdatedAt = Date.now();
+    older.forEach(item => { item.message.includeInContext = false; });
+    conv.updatedAt = Date.now();
+    await saveConversationImmediately();
+    showToast('Older turns summarized and excluded from future requests. History remains intact.', 'success');
+    announce('Older turns compacted successfully.');
+    await openContextPreview();
+  } catch (err) {
+    showToast('Compaction failed: ' + sanitizeErrorDetail(err), 'error');
+  }
+}
+
 // ============================================
 // Render Messages
 // ============================================
 function maybeAddAvatar(wrapper) {
   const conv = getActiveConv();
   if (conv && conv.characterAvatar) {
+    const safeAvatar = safeMediaUrl(conv.characterAvatar);
+    if (!safeAvatar) return;
     wrapper.classList.add('has-avatar');
     const avatar = document.createElement('img');
     avatar.className = 'msg-avatar';
-    avatar.src = conv.characterAvatar;
+    avatar.src = safeAvatar;
     avatar.alt = '';
     wrapper.appendChild(avatar);
   }
@@ -4680,8 +5943,11 @@ function renderMessages() {
     }
 
     const wrapper = document.createElement('div');
-    wrapper.className = 'msg-wrapper ' + msg.role;
+    wrapper.className = 'msg-wrapper ' + msg.role + (msg.includeInContext === false ? ' excluded' : '');
     wrapper.dataset.msgIdx = idx;
+    wrapper.setAttribute('role', 'article');
+    wrapper.setAttribute('tabindex', '0');
+    wrapper.setAttribute('aria-label', (msg.role === 'user' ? 'User message' : 'Assistant message') + (msg.includeInContext === false ? ', excluded from context' : ''));
 
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble ' + msg.role;
@@ -4695,18 +5961,21 @@ function renderMessages() {
             bubble.appendChild(sp);
           } else if (part.type === 'image_url') {
             const img = document.createElement('img');
-            img.src = part.image_url.url;
+            const safeUrl = safeMediaUrl(part.image_url.url);
+            if (!safeUrl) return;
+            img.src = safeUrl;
             img.className = 'chat-inline-img';
             img.alt = 'User uploaded image';
             bubble.appendChild(img);
           } else if (part.type === 'file') {
             const fileName = part.file?.name || 'file';
             const fileUrl = part.file?.url;
-            const badge = document.createElement(fileUrl ? 'a' : 'span');
+            const safeUrl = safeFileUrl(fileUrl);
+            const badge = document.createElement(safeUrl ? 'a' : 'span');
             badge.className = 'chat-file-badge';
             badge.textContent = '\u{1F4C4} ' + fileName;
-            if (fileUrl) {
-              badge.href = fileUrl;
+            if (safeUrl) {
+              badge.href = safeUrl;
               badge.download = fileName;
               badge.title = 'Download ' + fileName;
             } else {
@@ -4757,10 +6026,10 @@ function renderMessages() {
       actions.appendChild(speakBtn);
 
       const toolData = msg.swipeToolUse && msg.swipeToolUse[msg.swipeIndex];
-      const hasSources = toolData && toolData.some(tb =>
+      const hasSources = (msg.swipeSources?.[msg.swipeIndex]?.length > 0) || (toolData && toolData.some(tb =>
         (tb.type === 'url_fetch' && (tb.content || tb.url)) ||
         (tb.results || []).some(r => r.url)
-      );
+      ));
       if (hasSources) {
         const srcBtn = document.createElement('button');
         srcBtn.className = 'msg-action-btn';
@@ -4770,6 +6039,19 @@ function renderMessages() {
         actions.appendChild(srcBtn);
       }
     }
+
+    const contextBtn = document.createElement('button');
+    contextBtn.className = 'msg-action-btn context-toggle-btn';
+    contextBtn.textContent = msg.includeInContext === false ? 'Include' : 'Exclude';
+    contextBtn.setAttribute('aria-label', (msg.includeInContext === false ? 'Include ' : 'Exclude ') + msg.role + ' message from context');
+    contextBtn.onclick = () => {
+      msg.includeInContext = msg.includeInContext === false;
+      saveConversations();
+      renderMessages();
+      updateTokenInfo();
+      announce(msg.includeInContext === false ? 'Message excluded from future context.' : 'Message included in future context.');
+    };
+    actions.appendChild(contextBtn);
 
     if (msg.role === 'user') {
       const editBtn = document.createElement('button');
@@ -4826,6 +6108,8 @@ function renderMessages() {
 
     const metaEl = renderMessageMeta(msg);
     if (metaEl) wrapper.appendChild(metaEl);
+    const requestMeta = renderRequestMeta(msg);
+    if (requestMeta) wrapper.appendChild(requestMeta);
 
     // Branch controls for user messages
     if (msg.role === 'user' && msg.branches && msg.branches.length > 1) {
@@ -4850,6 +6134,21 @@ function renderMessages() {
     }
 
     if (msg.role === 'assistant') {
+      const request = getSwipeRequest(msg);
+      if (request && ['failed', 'interrupted', 'stopped'].includes(request.status)) {
+        const retryBtn = document.createElement('button');
+        retryBtn.className = 'msg-action-btn retry-btn';
+        retryBtn.textContent = 'Retry';
+        retryBtn.setAttribute('aria-label', 'Retry failed request');
+        retryBtn.onclick = () => retryRequest(idx);
+        actions.appendChild(retryBtn);
+        const detailsBtn = document.createElement('button');
+        detailsBtn.className = 'msg-action-btn';
+        detailsBtn.textContent = 'Details';
+        detailsBtn.setAttribute('aria-label', 'Show request details');
+        detailsBtn.onclick = () => showRequestDetails(request);
+        actions.appendChild(detailsBtn);
+      }
       // Swipe controls
       const swipeDiv = document.createElement('div');
       swipeDiv.className = 'swipe-controls' + (msg.swipes && msg.swipes.length > 1 ? ' has-swipes' : '');
@@ -4876,7 +6175,11 @@ function renderMessages() {
       regen.setAttribute('aria-label', 'Regenerate response');
       regen.onclick = () => regenerate();
 
-      if (idx === messages.length - 1) {
+      const requestStatus = getSwipeRequest(msg)?.status;
+      const canContinue = idx === messages.length - 1 &&
+        Boolean(String(getMsgText(msg) || '').trim()) &&
+        (!requestStatus || requestStatus === 'complete');
+      if (canContinue) {
         const continueBtn = document.createElement('button');
         continueBtn.className = 'regen-btn';
         continueBtn.textContent = 'Continue';
@@ -4929,7 +6232,9 @@ function renderEditMode(area, msg, idx) {
       attachments.forEach(part => {
         if (part.type === 'image_url') {
           const img = document.createElement('img');
-          img.src = part.image_url.url;
+          const safeUrl = safeMediaUrl(part.image_url.url);
+          if (!safeUrl) return;
+          img.src = safeUrl;
           img.className = 'chat-inline-img';
           img.style.cssText = 'max-width:80px;max-height:80px;border-radius:6px;opacity:0.8';
           img.alt = 'Attached image';
@@ -5001,10 +6306,11 @@ function renderEditMode(area, msg, idx) {
 }
 
 async function resendAfterEdit() {
+  if (readOnlyShare) return;
   const proxyUrl = localStorage.getItem('llmProxyUrl');
-  const apiKey = localStorage.getItem('llmApiKey');
+  const apiKey = getApiKey();
   const conv = getActiveConv();
-  if (!proxyUrl || !apiKey) return;
+  if (!proxyUrl || (providerRequiresKey() && !apiKey)) return;
 
   const assistantMsg = { role: 'assistant', content: '', swipes: [''], swipeIndex: 0, timestamp: Date.now() };
   messages.push(assistantMsg);
@@ -5020,12 +6326,18 @@ async function resendAfterEdit() {
   area.appendChild(wrapper);
   area.scrollTop = area.scrollHeight;
 
-  const apiMessages = await buildSystemMessages(conv);
-  messages.forEach(m => { if (m.role !== 'system') apiMessages.push({ role: m.role, content: buildApiContent(m) }); });
+  const requestContext = await buildRequestMessages(conv, { messageList: messages });
+  const apiMessages = requestContext.messages;
+  if (guardContextLimit(requestContext)) {
+    messages.pop();
+    renderMessages();
+    return;
+  }
 
-  await streamResponse(apiMessages, assistantMsg, 0, bubble, null, null);
+  await saveConversationImmediately().catch(error => { throw new Error('Could not save the edited prompt: ' + sanitizeErrorDetail(error)); });
+  await streamResponse(apiMessages, assistantMsg, 0, bubble, null, null, { conv });
 
-  if (assistantMsg._responseCacheHit) {
+  if (assistantMsg._responseCacheHit || getSwipeRequest(assistantMsg)?.status !== 'complete') {
     delete assistantMsg._responseCacheHit;
   } else {
     extractMemories(apiMessages);
@@ -5072,7 +6384,7 @@ function switchBranch(msgIdx, dir) {
 }
 
 function forkBranch(msgIdx) {
-  if (streaming) return;
+  if (readOnlyShare || streaming) return;
   const conv = getActiveConv();
   if (!conv) return;
 
@@ -5135,55 +6447,52 @@ function renderToolBlocksHTML(toolBlocks) {
   return toolBlocks.map((tb, i) => {
     // --- url_fetch blocks ---
     if (tb.type === 'url_fetch') {
-      const escapedUrl = escapeHTML(tb.url || '');
-      const displayUrl = escapeHTML((tb.url || '').replace(/^https?:\/\//, '').replace(/\/+$/, ''));
+      const safeUrl = safeHttpUrl(tb.url);
+      const displayUrl = escapeHTML((safeUrl || String(tb.url || '')).replace(/^https?:\/\//, '').replace(/\/+$/, ''));
       if (tb.searching) {
-        return '<div class="tool-use-block"><div class="tool-use-header">\u{1F310} Reading ' + displayUrl + '\u2026</div></div>';
+        return '<div class="tool-use-block" role="status" aria-live="polite"><div class="tool-use-header">\u{1F310} Reading ' + displayUrl + '\u2026</div></div>';
       }
       if (tb.error) {
-        return '<div class="tool-use-block"><div class="tool-use-header">\u{1F310} ' + displayUrl + ' \u00B7 <span style="color:var(--error-color,#ff7777)">' + escapeHTML(tb.error) + '</span></div></div>';
+        return '<div class="tool-use-block" role="status" aria-live="polite"><div class="tool-use-header">\u{1F310} ' + displayUrl + ' \u00B7 <span style="color:var(--error-color,#ff7777)">' + escapeHTML(tb.error) + '</span></div></div>';
       }
       const charCount = (tb.content || '').length;
       const preview = escapeHTML((tb.content || '').slice(0, 300));
-      return '<div class="tool-use-block">' +
-        '<div class="tool-use-header" onclick="this.nextElementSibling.classList.toggle(\'open\');this.querySelector(\'.tool-use-arrow\').textContent=this.nextElementSibling.classList.contains(\'open\')?\'\u25BE\':\'\u25B8\'">' +
-        '\u{1F310} Fetched ' + displayUrl + ' \u00B7 ' + charCount.toLocaleString() + ' chars' +
-        ' <span class="tool-use-arrow">\u25B8</span></div>' +
-        '<div class="tool-use-results"><div class="tool-result-snippet" style="max-height:200px;overflow-y:auto;white-space:pre-wrap;font-size:0.8em;padding:8px">' + preview + (charCount > 300 ? '\u2026' : '') + '</div></div></div>';
+      return '<details class="tool-use-block" aria-label="URL fetch result">' +
+        '<summary class="tool-use-header">\u{1F310} Fetched ' + displayUrl + ' \u00B7 ' + charCount.toLocaleString() + ' chars</summary>' +
+        '<div class="tool-use-results"><div class="tool-result-snippet" style="max-height:200px;overflow-y:auto;white-space:pre-wrap;font-size:0.8em;padding:8px">' + preview + (charCount > 300 ? '\u2026' : '') + '</div></div></details>';
     }
     // --- web_search blocks (default) ---
     const query = tb.query || '';
     const results = tb.results || [];
     const searching = tb.searching;
     if (searching) {
-      return '<div class="tool-use-block"><div class="tool-use-header">\u{1F50D} Searching\u2026</div></div>';
+      return '<div class="tool-use-block" role="status" aria-live="polite"><div class="tool-use-header">\u{1F50D} Searching\u2026</div></div>';
     }
     const escapedQuery = escapeHTML(query);
     if (tb.error) {
-      return '<div class="tool-use-block"><div class="tool-use-header">\u{1F50D} Searched "' + escapedQuery + '" \u00B7 <span style="color:var(--error-color,#ff7777)">' + escapeHTML(tb.error) + '</span></div></div>';
+      return '<div class="tool-use-block" role="status" aria-live="polite"><div class="tool-use-header">\u{1F50D} Searched "' + escapedQuery + '" \u00B7 <span style="color:var(--error-color,#ff7777)">' + escapeHTML(tb.error) + '</span></div></div>';
     }
     const count = results.length;
     const resultsHTML = results.map(r => {
       const title = r.title || r.url || 'Result';
       const url = r.url || '';
-      const hasUrl = url && url !== '#';
-      const displayUrl = hasUrl ? url.replace(/^https?:\/\//, '').replace(/\/+$/, '') : '';
+      const safeUrl = safeHttpUrl(url);
+      const hasUrl = Boolean(safeUrl);
+      const displayUrl = hasUrl ? safeUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '') : '';
       const snippetText = r.snippet ? escapeHTML(r.snippet) : '';
-      const snippetHtml = snippetText ? '<div class="tool-result-snippet" title="Click to expand" onclick="this.classList.toggle(\'open\')">' + snippetText + '</div>' : '';
+      const snippetHtml = snippetText ? '<div class="tool-result-snippet">' + snippetText + '</div>' : '';
       const titleHtml = hasUrl
-        ? '<a href="' + escapeHTML(url) + '" target="_blank" rel="noopener">' + escapeHTML(title) + '</a>'
+        ? '<a href="' + escapeHTML(safeUrl) + '" target="_blank" rel="noopener">' + escapeHTML(title) + '</a>'
         : '<span class="tool-result-title">' + escapeHTML(title) + '</span>';
       return '<div class="tool-use-result">' +
-        titleHtml +
+        (r.sourceNumber ? '<span class="source-number">[' + Number(r.sourceNumber) + ']</span> ' : '') + titleHtml +
         (displayUrl ? '<span class="tool-result-url">' + escapeHTML(displayUrl) + '</span>' : '') +
         snippetHtml + '</div>';
     }).join('');
     const headerText = '\u{1F50D} Searched "' + escapedQuery + '" \u00B7 ' + count + ' result' + (count !== 1 ? 's' : '');
-    return '<div class="tool-use-block">' +
-      '<div class="tool-use-header" onclick="this.nextElementSibling.classList.toggle(\'open\');this.querySelector(\'.tool-use-arrow\').textContent=this.nextElementSibling.classList.contains(\'open\')?\'\u25BE\':\'\u25B8\'">' +
-      headerText +
-      ' <span class="tool-use-arrow">\u25B8</span></div>' +
-      '<div class="tool-use-results">' + resultsHTML + '</div></div>';
+    return '<details class="tool-use-block" aria-label="Web search results">' +
+      '<summary class="tool-use-header">' + headerText + '</summary>' +
+      '<div class="tool-use-results">' + resultsHTML + '</div></details>';
   }).join('');
 }
 
@@ -5356,12 +6665,15 @@ async function executeWebSearch(query, signal) {
   }
 }
 
-function formatSearchResultsForModel(results, error) {
+let activeSourceRegistry = null;
+function formatSearchResultsForModel(results, error, registry = null) {
   if (error) return 'Web search error: ' + error;
   if (!results.length) return 'No search results found.';
-  return results.map((r, i) =>
-    (i + 1) + '. ' + r.title + '\n   URL: ' + r.url + (r.snippet ? '\n   ' + r.snippet : '')
-  ).join('\n\n');
+  const numbered = (registry || activeSourceRegistry) ? registerSources(registry || activeSourceRegistry, results) : results.map((r, i) => ({ ...r, sourceNumber: i + 1 }));
+  numbered.forEach((result, index) => { if (results[index] && result.sourceNumber) results[index].sourceNumber = result.sourceNumber; });
+  return numbered.map((r, i) =>
+    '[' + (r.sourceNumber || i + 1) + '] ' + r.title + '\n   URL: ' + r.url + (r.snippet ? '\n   ' + r.snippet : '')
+  ).join('\n\n') + '\n\n' + SOURCE_CITATION_INSTRUCTION;
 }
 
 // ============================================
@@ -5393,6 +6705,16 @@ const ANTHROPIC_URL_FETCH_TOOL = {
       url: { type: 'string', description: 'The URL to fetch' }
     },
     required: ['url']
+  }
+};
+
+const ANTHROPIC_WEB_SEARCH_TOOL = {
+  name: 'web_search',
+  description: 'Search the web for current information and return concise results with URLs.',
+  input_schema: {
+    type: 'object',
+    properties: { query: { type: 'string', description: 'The search query' } },
+    required: ['query']
   }
 };
 
@@ -5524,8 +6846,8 @@ function stripReaderMirrorPreamble(text) {
 }
 
 async function executeUrlFetch(url, signal) {
-  const targetUrl = String(url || '').trim();
-  if (!/^https?:\/\//i.test(targetUrl)) {
+  const targetUrl = safeHttpUrl(url);
+  if (!targetUrl) {
     return { content: '', error: 'Invalid URL. Use a full URL starting with http:// or https://.' };
   }
 
@@ -5589,20 +6911,139 @@ async function executeUrlFetch(url, signal) {
 }
 
 function formatUrlFetchResultForModel(content, error, url) {
-  if (error) return 'Error fetching ' + url + ': ' + error;
-  if (!content) return 'No content found at ' + url;
-  return 'Content from ' + url + ':\n\n' + content;
+  const safeUrl = safeHttpUrl(url) || '[invalid URL]';
+  const source = activeSourceRegistry ? registerSources(activeSourceRegistry, [{ title: safeUrl, url: safeUrl, snippet: error || '' }])[0] : null;
+  const label = source?.sourceNumber ? '[' + source.sourceNumber + '] ' : '';
+  if (error) return label + 'Error fetching ' + safeUrl + ': ' + error;
+  if (!content) return label + 'No content found at ' + safeUrl;
+  return label + 'Content from ' + safeUrl + ':\n\n' + content;
+}
+
+function createRequestMetadata(assistantMsg, swipeIdx, metadata = {}) {
+  assistantMsg.swipeRequests = assistantMsg.swipeRequests || [];
+  const request = {
+    requestId: 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+    status: 'pending',
+    startedAt: Date.now(),
+    completedAt: null,
+    durationMs: null,
+    httpStatus: null,
+    error: '',
+    model: metadata.model || '',
+    apiFormat: metadata.apiFormat || '',
+    messageCount: Number.isFinite(metadata.messageCount) ? metadata.messageCount : null,
+    promptTokens: Number.isFinite(metadata.promptTokens) ? metadata.promptTokens : null,
+    contextWindow: Number.isFinite(metadata.contextWindow) ? metadata.contextWindow : null
+  };
+  assistantMsg.swipeRequests[swipeIdx] = request;
+  return request;
+}
+
+function finishRequestMetadata(request, status, error = '', httpStatus = null) {
+  if (!request) return;
+  request.status = status;
+  request.completedAt = Date.now();
+  request.durationMs = request.startedAt ? Math.max(0, request.completedAt - request.startedAt) : null;
+  request.httpStatus = Number.isFinite(Number(httpStatus)) ? Number(httpStatus) : request.httpStatus || null;
+  request.error = sanitizeErrorDetail(error);
+}
+
+async function authorizeExternalTool(toolName, conv, authorization) {
+  if (!canUseTool(toolName, conv)) return false;
+  const policy = getToolPolicy(conv);
+  if (!policy.confirm) return true;
+  if (authorization.confirmed == null) {
+    authorization.confirmed = window.confirm('The assistant wants to use ' + (toolName === 'web_search' ? 'web search' : 'URL fetching') + ' for this response. Allow it?');
+    announce(authorization.confirmed ? 'External tool approved for this response.' : 'External tool denied.');
+  }
+  return authorization.confirmed;
+}
+
+async function executeAuthorizedTool(toolName, args, conv, signal, authorization) {
+  if (!(await authorizeExternalTool(toolName, conv, authorization))) {
+    return { results: [], content: '', error: 'Tool call denied by user; no external request was made.', denied: true };
+  }
+  if (toolName === 'web_search') return executeWebSearch(extractWebSearchQueryFromArgs(args), signal);
+  return executeUrlFetch(args?.url || '', signal);
+}
+
+function sourceRegistryFor(assistantMsg, swipeIdx) {
+  const registry = { byUrl: new Map(), sources: [] };
+  const existing = assistantMsg.swipeSources?.[swipeIdx] || [];
+  existing.forEach(source => {
+    const key = sourceUrlKey(source?.url);
+    if (!key || registry.byUrl.has(key)) return;
+    const normalized = { ...source, number: registry.sources.length + 1 };
+    registry.byUrl.set(key, normalized.number);
+    registry.sources.push(normalized);
+  });
+  return registry;
+}
+
+function sourceUrlKey(url) {
+  try {
+    const parsed = new URL(String(url || '').trim());
+    parsed.hash = '';
+    return parsed.toString().replace(/\/$/, '');
+  } catch (e) {
+    return String(url || '').trim().replace(/#.*$/, '').replace(/\/$/, '');
+  }
+}
+
+function registerSources(registry, results = []) {
+  return (results || []).map(result => {
+    const url = safeHttpUrl(result.url);
+    if (!url) return result;
+    const key = sourceUrlKey(url);
+    let number = registry.byUrl.get(key);
+    if (!number) {
+      number = registry.sources.length + 1;
+      registry.byUrl.set(key, number);
+      registry.sources.push({ number, url, title: result.title || url, snippet: result.snippet || '' });
+    }
+    return { ...result, sourceNumber: number };
+  });
+}
+
+function persistSwipeSources(assistantMsg, swipeIdx, registry) {
+  const toolBlocks = assistantMsg.swipeToolUse?.[swipeIdx] || [];
+  toolBlocks.forEach(block => {
+    if (block.type !== 'url_fetch' && Array.isArray(block.results)) {
+      const numbered = registerSources(registry, block.results);
+      numbered.forEach((result, index) => { if (block.results[index]) block.results[index].sourceNumber = result.sourceNumber; });
+    }
+  });
+  toolBlocks.filter(block => block.type === 'url_fetch' && block.url).forEach(block => {
+    registerSources(registry, [{ title: block.url, url: block.url, snippet: block.error || '' }]);
+  });
+  if (!registry?.sources?.length) return;
+  assistantMsg.swipeSources = assistantMsg.swipeSources || [];
+  assistantMsg.swipeSources[swipeIdx] = registry.sources.map(source => ({ ...source }));
 }
 
 // ============================================
 // Streaming
 // ============================================
-async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, overrideModel, prefixText) {
+async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, overrideModel, prefixText, requestOptions = {}) {
   const baseUrl = (localStorage.getItem('llmProxyUrl') || '').replace(/\/+$/, '');
-  const apiKey = localStorage.getItem('llmApiKey');
-  const model = overrideModel || localStorage.getItem('llmModel') || 'gpt-4o';
+  const apiKey = getApiKey();
+  const model = overrideModel || localStorage.getItem('llmModel') || '';
   const format = detectApiFormat(model);
+  const requestConv = requestOptions.conv || getActiveConv();
+  const toolPolicy = getToolPolicy(requestConv);
+  const authorization = { confirmed: null };
+  const contextStats = getRequestContextStats(apiMessages, [], model);
+  const request = createRequestMetadata(assistantMsg, swipeIdx, {
+    model,
+    apiFormat: format,
+    messageCount: apiMessages?.length || 0,
+    promptTokens: contextStats.includedTokens,
+    contextWindow: contextStats.contextWindow
+  });
+  const sourceRegistry = sourceRegistryFor(assistantMsg, swipeIdx);
+  activeSourceRegistry = sourceRegistry;
   setAssistantLlmMetadata(assistantMsg, swipeIdx, model, format);
+  saveConversationImmediately().catch(error => console.warn('Could not persist pending request:', error));
 
   // Extra params & excludes
   let extra = {};
@@ -5618,10 +7059,16 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       responseCacheUserMessage = cacheParts.userMessage;
       responseCacheSystemMessages = cacheParts.systemMessages;
       if (responseCacheUserMessage) {
-        responseCacheKey = await generateCacheKey(responseCacheUserMessage, model, responseCacheSystemMessages);
+        responseCacheKey = await generateCacheKey(responseCacheUserMessage, model, responseCacheSystemMessages, {
+          messages: cacheParts.messages,
+          settings: getRequestAffectingSettings(model, format, toolPolicy),
+          credentialScope: fallbackHash(getApiKey() + '\0' + (localStorage.getItem('llmSearchApiKey') || ''))
+        });
         const cached = await cacheLookup(responseCacheKey);
         if (cached) {
           restoreCachedResponse(cached, assistantMsg, swipeIdx, bubbleEl);
+          finishRequestMetadata(request, 'complete');
+          activeSourceRegistry = null;
           showToast('Loaded cached response.', 'success');
           return;
         }
@@ -5634,6 +7081,8 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
 
   abortController = new AbortController();
   streaming = true;
+  request.status = 'streaming';
+  announce('Generating response.');
   userScrolledAway = false;
   const btn = document.getElementById('sendBtn');
   btn.textContent = 'Stop';
@@ -5650,6 +7099,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
   let currentToolUseId = null;
   let currentToolUseName = null;
   let pendingAnthropicToolCalls = [];
+  let responseStatus = null;
 
   try {
     let url, headers, body;
@@ -5667,11 +7117,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
 
     if (format === 'anthropic') {
       url = baseUrl + '/messages';
-      headers = {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
-      };
+      headers = buildProviderHeaders('anthropic', apiKey);
       const prepared = prepareAnthropicMessages(apiMessages);
       const thinkingOn = localStorage.getItem('llmThinking') === 'true';
       const thinkingEffort = localStorage.getItem('llmThinkingEffort') || '';
@@ -5687,12 +7133,12 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
         ...(thinkingEffort ? { output_config: { effort: thinkingEffort } } : {}),
         ...extra
       };
-      if (resolveWebSearchEnabled()) {
+      if (toolPolicy.webSearch || toolPolicy.urlFetch) {
         body.tools = (body.tools || []).concat([
-          { type: 'web_search_20250305', name: 'web_search', max_uses: 20 },
-          ANTHROPIC_URL_FETCH_TOOL
+          ...(toolPolicy.webSearch ? [toolPolicy.confirm ? ANTHROPIC_WEB_SEARCH_TOOL : { type: 'web_search_20250305', name: 'web_search', max_uses: 20 }] : []),
+          ...(toolPolicy.urlFetch ? [ANTHROPIC_URL_FETCH_TOOL] : [])
         ]);
-        if (localStorage.getItem('llmForceSearch') === 'true') {
+        if (toolPolicy.webSearch && localStorage.getItem('llmForceSearch') === 'true') {
           body.tool_choice = { type: 'any' };
           body.system = (body.system || '') + '\n\nIMPORTANT: You MUST call the web_search tool to look up information before answering. Do NOT answer from memory or training data. Always search first, then synthesize your answer from the results.';
         }
@@ -5706,10 +7152,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       }
     } else {
       url = baseUrl + '/chat/completions';
-      headers = {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + apiKey
-      };
+      headers = buildProviderHeaders('openai', apiKey);
       const processedMessages = apiMessages.map(m => {
         if (!Array.isArray(m.content)) return m;
         // Strip image parts from assistant messages — most APIs don't accept them
@@ -5740,10 +7183,12 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       });
       body = { model, messages: processedMessages, stream: useStream, ...extra };
       // Inject web search tool for OpenAI-compatible models
-      if (resolveWebSearchEnabled()) {
-        body.tools = (body.tools || []).concat([OPENAI_WEB_SEARCH_TOOL]);
-        body.tools = (body.tools || []).concat([OPENAI_URL_FETCH_TOOL]);
-        if (localStorage.getItem('llmForceSearch') === 'true') {
+      if (toolPolicy.webSearch || toolPolicy.urlFetch) {
+        body.tools = (body.tools || []).concat([
+          ...(toolPolicy.webSearch ? [OPENAI_WEB_SEARCH_TOOL] : []),
+          ...(toolPolicy.urlFetch ? [OPENAI_URL_FETCH_TOOL] : [])
+        ]);
+        if (toolPolicy.webSearch && localStorage.getItem('llmForceSearch') === 'true') {
           body.tool_choice = 'required';
           // Reinforce via system prompt — some providers (e.g. Gemini) ignore tool_choice
           body.messages = body.messages.concat([{
@@ -5772,6 +7217,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       body: JSON.stringify(body),
       signal: abortController.signal
     }, baseUrl);
+    responseStatus = resp.status;
 
     // If tool_choice caused a 400 (e.g. Gemini doesn't support "required"), retry without it
     if (!resp.ok && resp.status === 400 && body.tool_choice) {
@@ -5784,6 +7230,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
         body: JSON.stringify(body),
         signal: abortController.signal
       }, baseUrl);
+      responseStatus = resp.status;
     }
 
     if (!resp.ok) {
@@ -5797,7 +7244,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     if (ct.includes('application/json')) {
       const data = await resp.json();
       if (format === 'anthropic') {
-        fullText = (data.content || []).filter(c => c.type === 'text').map(c => c.text).join('') || 'No response.';
+        fullText = (data.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
         // Extract thinking blocks from non-streaming response
         thinkingText = (data.content || []).filter(c => c.type === 'thinking').map(c => c.thinking).join('');
         // Extract tool blocks from non-streaming response
@@ -5832,7 +7279,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               const tb = toolBlocks[call.toolBlockIndex];
               const fetchUrl = call.input?.url || '';
               bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
-              const { content, error } = await executeUrlFetch(fetchUrl, abortController.signal);
+              const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
               if (tb) { tb.content = content; tb.searching = false; if (error) tb.error = error; }
               bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
               toolResultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: formatUrlFetchResultForModel(content, error, fetchUrl) });
@@ -5840,7 +7287,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               const tb = toolBlocks[call.toolBlockIndex];
               const query = extractWebSearchQueryFromArgs(call.input);
               bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
-              const { results, error } = await executeWebSearch(query, abortController.signal);
+              const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
               if (tb) { tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet })); tb.searching = false; if (error) tb.error = error; }
               bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
               toolResultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: formatSearchResultsForModel(results, error) });
@@ -5919,7 +7366,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               const fetchUrl = args.url || '';
               toolBlocks.push({ type: 'url_fetch', url: fetchUrl, content: '', searching: true });
               bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
-              const { content, error } = await executeUrlFetch(fetchUrl, abortController.signal);
+              const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
               const tb = toolBlocks[toolBlocks.length - 1];
               tb.content = content;
               tb.searching = false;
@@ -5930,7 +7377,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               const query = extractWebSearchQueryFromArgs(args);
               toolBlocks.push({ query, results: [], searching: true });
               bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
-              const { results, error } = await executeWebSearch(query, abortController.signal);
+              const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
               const tb = toolBlocks[toolBlocks.length - 1];
               tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
               tb.searching = false;
@@ -5984,7 +7431,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               const fetchUrl = args.url || '';
               toolBlocks.push({ type: 'url_fetch', url: fetchUrl, content: '', searching: true });
               bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
-              const { content, error } = await executeUrlFetch(fetchUrl, abortController.signal);
+              const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
               const tb = toolBlocks[toolBlocks.length - 1];
               tb.content = content; tb.searching = false;
               if (error) tb.error = error;
@@ -5993,7 +7440,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               const query = extractWebSearchQueryFromArgs(args);
               toolBlocks.push({ query, results: [], searching: true });
               bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
-              const { results, error } = await executeWebSearch(query, abortController.signal);
+              const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
               const tb = toolBlocks[toolBlocks.length - 1];
               tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
               tb.searching = false;
@@ -6021,7 +7468,10 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
           } catch(e) { console.warn('Text tool call follow-up failed:', e); }
           if (!fullText) fullText = savedText;
         }
-        if (!fullText) fullText = 'No response.';
+        if (!fullText && !toolBlocks.some(block => block.content || (block.results || []).length)) {
+          fullText = 'No response received. Retry to try again.';
+          finishRequestMetadata(request, 'failed', 'Provider returned an empty response.', responseStatus);
+        }
       }
       const stripped = stripThinkTags(fullText);
       if (stripped.thinking) thinkingText += stripped.thinking;
@@ -6315,7 +7765,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
           const savedScrollTop = userScrolledAway ? msgsArea.scrollTop : null;
           // Preserve open/closed state of thinking & tool blocks
           const thinkingOpen = bubbleEl.querySelector('.thinking-content.open') !== null;
-          const toolOpen = Array.from(bubbleEl.querySelectorAll('.tool-use-results')).map(el => el.classList.contains('open'));
+          const toolOpen = Array.from(bubbleEl.querySelectorAll('details.tool-use-block')).map(el => el.open);
           _suppressScrollFlag = true;
           const _st = stripThinkTags(fullText);
           const _displayText = _st.content;
@@ -6329,10 +7779,8 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
           }
           toolOpen.forEach((open, i) => {
             if (open) {
-              const results = bubbleEl.querySelectorAll('.tool-use-results')[i];
-              const arrow = bubbleEl.querySelectorAll('.tool-use-arrow')[i];
-              if (results) results.classList.add('open');
-              if (arrow) arrow.textContent = '\u25BE';
+              const details = bubbleEl.querySelectorAll('details.tool-use-block')[i];
+              if (details) details.open = true;
             }
           });
           if (savedScrollTop !== null) {
@@ -6359,7 +7807,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
             const msgsAreaTmp = document.getElementById('messagesArea');
             if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
-            const { content, error } = await executeUrlFetch(fetchUrl, abortController.signal);
+            const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
             if (tb) {
               tb.content = content;
               tb.searching = false;
@@ -6375,7 +7823,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
             const msgsAreaTmp = document.getElementById('messagesArea');
             if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
-            const { results, error } = await executeWebSearch(query, abortController.signal);
+            const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
             if (tb) {
               tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
               tb.searching = false;
@@ -6580,7 +8028,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               const fetchUrl = args.url || '';
               toolBlocks.push({ type: 'url_fetch', url: fetchUrl, content: '', searching: true });
               bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
-              const { content, error } = await executeUrlFetch(fetchUrl, abortController.signal);
+            const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
               const tb = toolBlocks[toolBlocks.length - 1];
               tb.content = content; tb.searching = false;
               if (error) tb.error = error;
@@ -6589,7 +8037,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               const query = extractWebSearchQueryFromArgs(args);
               toolBlocks.push({ query, results: [], searching: true });
               bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
-              const { results, error } = await executeWebSearch(query, abortController.signal);
+            const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
               const tb = toolBlocks[toolBlocks.length - 1];
               tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
               tb.searching = false;
@@ -6674,7 +8122,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             toolBlocks.push({ type: 'url_fetch', url: fetchUrl, content: '', searching: true });
             bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
             if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
-            const { content, error } = await executeUrlFetch(fetchUrl, abortController.signal);
+            const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
             const tb = toolBlocks[toolBlocks.length - 1];
             tb.content = content;
             tb.searching = false;
@@ -6689,7 +8137,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
             if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
             // Execute search
-            const { results, error } = await executeWebSearch(query, abortController.signal);
+            const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
             const tb = toolBlocks[toolBlocks.length - 1];
             tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
             tb.searching = false;
@@ -6808,7 +8256,11 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
         }
         if (!fullText && preToolText) fullText = preToolText;
       }
-      if (!fullText) fullText = 'No response.';
+      const emptyResponse = !String(fullText || '').trim() && !streamImages.length && !toolBlocks.some(block => block.content || (block.results || []).length);
+      if (emptyResponse) {
+        fullText = 'No response received. Retry to try again.';
+        finishRequestMetadata(request, 'failed', 'Provider returned an empty response.', responseStatus);
+      }
       const stripped = stripThinkTags(fullText);
       if (stripped.thinking) thinkingText += stripped.thinking;
       fullText = stripped.content;
@@ -6861,8 +8313,13 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
   } catch (e) {
     if (e.name === 'AbortError') {
       if (!fullText) fullText = '(stopped)';
+      finishRequestMetadata(request, 'stopped', 'Generation stopped by the user.', responseStatus);
+      announce('Generation stopped.');
     } else {
-      fullText = 'Error: ' + e.message;
+      const detail = sanitizeErrorDetail(e);
+      fullText = 'Request failed: ' + detail;
+      finishRequestMetadata(request, 'failed', detail, responseStatus);
+      announce('Request failed. Retry is available.');
     }
     const strippedErr = stripThinkTags(fullText);
     if (strippedErr.thinking) thinkingText += strippedErr.thinking;
@@ -6888,6 +8345,9 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     }
     _suppressScrollFlag = false;
   } finally {
+    persistSwipeSources(assistantMsg, swipeIdx, sourceRegistry);
+    if (request.status === 'pending' || request.status === 'streaming') finishRequestMetadata(request, abortController?.signal?.aborted ? 'stopped' : 'complete', '', responseStatus);
+    if (request.status === 'complete') announce('Response complete.');
     updateMessageTokenMetadata(assistantMsg, swipeIdx);
     debugLog('API response', {
       model,
@@ -6901,6 +8361,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     btn.classList.remove('streaming');
     btn.disabled = false;
     updateSendBtnState();
+    activeSourceRegistry = null;
   }
 }
 
@@ -6920,8 +8381,63 @@ function updateSendBtnState() {
   }
 }
 
-function resolveWebSearchEnabled() {
-  return localStorage.getItem('llmWebSearch') === 'true';
+function resolveWebSearchEnabled(conv = getActiveConv()) {
+  return canUseTool('web_search', conv);
+}
+
+function closeComposerTools() {
+  const popover = document.getElementById('composerToolsPopover');
+  if (popover) popover.remove();
+  const button = document.getElementById('toolsBtn');
+  if (button) button.setAttribute('aria-expanded', 'false');
+  if (composerToolsFocusReturn && document.contains(composerToolsFocusReturn)) composerToolsFocusReturn.focus();
+  composerToolsFocusReturn = null;
+}
+
+function toggleComposerTools(event) {
+  event?.stopPropagation();
+  const existing = document.getElementById('composerToolsPopover');
+  if (existing) { closeComposerTools(); return; }
+  const conv = getActiveConv();
+  if (!conv) return;
+  const policy = getToolPolicy(conv);
+  const popover = document.createElement('div');
+  popover.id = 'composerToolsPopover';
+  composerToolsFocusReturn = document.activeElement;
+  popover.className = 'composer-tools-popover';
+  popover.setAttribute('role', 'dialog');
+  popover.setAttribute('aria-label', 'Conversation tool policy');
+  popover.innerHTML =
+    '<strong>Tools for this chat</strong>' +
+    '<label><input type="checkbox" data-tool="webSearch" ' + (policy.webSearch ? 'checked' : '') + '> Web search</label>' +
+    '<label><input type="checkbox" data-tool="urlFetch" ' + (policy.urlFetch ? 'checked' : '') + '> URL fetching</label>' +
+    '<label><input type="checkbox" data-tool="confirm" ' + (policy.confirm ? 'checked' : '') + '> Ask before external tools</label>' +
+    '<small>Global Tools settings are defaults. This choice applies only to this conversation.</small>' +
+    '<div class="composer-tools-actions"><button type="button" class="btn btn-secondary" data-tool-cancel>Cancel</button><button type="button" class="btn btn-primary" data-tool-save>Save</button></div>';
+  document.querySelector('.input-row')?.appendChild(popover);
+  const button = document.getElementById('toolsBtn');
+  if (button) button.setAttribute('aria-expanded', 'true');
+  popover.querySelector('[data-tool-cancel]').onclick = closeComposerTools;
+  popover.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeComposerTools();
+      button?.focus();
+    }
+  });
+  popover.querySelector('[data-tool-save]').onclick = async () => {
+    conv.toolPolicy = {
+      webSearch: popover.querySelector('[data-tool="webSearch"]').checked,
+      urlFetch: popover.querySelector('[data-tool="urlFetch"]').checked,
+      confirm: popover.querySelector('[data-tool="confirm"]').checked
+    };
+    conv.updatedAt = Date.now();
+    await saveConversationImmediately();
+    closeComposerTools();
+    announce('Conversation tool policy saved.');
+    showToast('Tools updated for this conversation.', 'success');
+  };
+  popover.querySelector('[data-tool-save]').focus();
 }
 
 // ============================================
@@ -6929,6 +8445,7 @@ function resolveWebSearchEnabled() {
 // ============================================
 async function sendMessage() {
   if (streaming && abortController) { streaming = false; abortController.abort(); return; }
+  if (readOnlyShare) return;
 
   const input = document.getElementById('chatInput');
   const text = input.value.trim();
@@ -6937,25 +8454,31 @@ async function sendMessage() {
   if (!text && pendingAttachments.length === 0 && !isRegenFromFork) return;
 
   const proxyUrl = localStorage.getItem('llmProxyUrl');
-  const apiKey = localStorage.getItem('llmApiKey');
+  const apiKey = getApiKey();
   const conv = getActiveConv();
 
   if (!isRegenFromFork) {
     const cmd = parseCommand(text);
     if (cmd) {
       if (pendingAttachments.length > 0) { showToast('Commands cannot include attachments.', 'error'); return; }
+      if (!cmd.query) { renderCommandMenu(input, cmd.cmd); return; }
       input.value = '';
       input.style.height = 'auto';
+      closeCommandDropdown();
+      persistDraftFromUI();
       await handleCommand(cmd, conv);
       return;
     }
   }
 
-  if (!proxyUrl || !apiKey) {
+  if (!proxyUrl || (providerRequiresKey() && !apiKey)) {
     openModal('setupModal', '#setupProxy');
     return;
   }
 
+  const queuedAttachments = cloneDraftAttachments(pendingAttachments);
+  const addedDocs = [];
+  const previousTitle = conv?.title;
   if (!isRegenFromFork) {
     let userContent;
     if (pendingAttachments.length > 0) {
@@ -6964,31 +8487,18 @@ async function sendMessage() {
         pendingAttachments.forEach(att => {
           if (att && att.textContent && !att.binary) {
             const text = att.textContent.length > 20000 ? att.textContent.slice(0, 20000) : att.textContent;
-            docs.push({
+            const doc = {
               id: 'doc_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
               name: att.name || 'file',
               text: text,
               createdAt: Date.now()
-            });
+            };
+            docs.push(doc);
+            addedDocs.push(doc);
           }
         });
       }
-      userContent = [];
-      if (text) userContent.push({ type: 'text', text });
-      pendingAttachments.forEach(att => {
-        if (att.type === 'image') {
-          userContent.push({ type: 'image_url', image_url: { url: att.dataUrl } });
-        } else if (typeof att.textContent === 'string') {
-          const filePart = { name: att.name, mime: att.mime, textContent: att.textContent };
-          if (att.dataUrl) filePart.url = att.dataUrl;
-          if (att.binary) filePart.binary = true;
-          userContent.push({ type: 'file', file: filePart });
-        } else {
-          userContent.push({ type: 'file', file: { url: att.dataUrl, name: att.name, mime: att.mime } });
-        }
-      });
-      pendingAttachments = [];
-      document.getElementById('imagePreview').innerHTML = '';
+      userContent = buildComposerMessage(text, pendingAttachments).content;
     } else {
       userContent = text;
     }
@@ -6996,6 +8506,23 @@ async function sendMessage() {
     const userMsg = { role: 'user', content: userContent, timestamp: Date.now() };
     updateMessageTokenMetadata(userMsg);
     messages.push(userMsg);
+    if (conv) {
+      delete conv.draft;
+      conv.updatedAt = Date.now();
+    }
+    try {
+      await saveConversationImmediately();
+    } catch (err) {
+      if (conv) conv.draft = { text: input.value, attachments: queuedAttachments, updatedAt: Date.now() };
+      if (conv && addedDocs.length) conv.docs = (conv.docs || []).filter(doc => !addedDocs.includes(doc));
+      messages.pop();
+      pendingAttachments = queuedAttachments;
+      renderPreviews();
+      showToast('Could not save your message before sending: ' + sanitizeErrorDetail(err), 'error');
+      return;
+    }
+    pendingAttachments = [];
+    document.getElementById('imagePreview').innerHTML = '';
     input.value = '';
     input.style.height = 'auto';
 
@@ -7023,16 +8550,32 @@ async function sendMessage() {
   area.appendChild(wrapper);
   area.scrollTop = area.scrollHeight;
 
-  const apiMessages = await buildSystemMessages(conv);
-  messages.forEach(m => { if (m.role !== 'system') apiMessages.push({ role: m.role, content: buildApiContent(m) }); });
+  const requestContext = await buildRequestMessages(conv, { messageList: messages });
+  const apiMessages = requestContext.messages;
+  if (guardContextLimit(requestContext)) {
+    messages.pop();
+    if (!isRegenFromFork) {
+      messages.pop();
+      if (conv) {
+        if (addedDocs.length) conv.docs = (conv.docs || []).filter(doc => !addedDocs.includes(doc));
+        conv.draft = { text, attachments: queuedAttachments, updatedAt: Date.now() };
+        if (previousTitle) conv.title = previousTitle;
+      }
+      pendingAttachments = queuedAttachments;
+      renderPreviews();
+    }
+    saveConversationImmediately().catch(() => {});
+    renderMessages();
+    return;
+  }
 
   // Capture and clear model override
   const overrideModel = modelOverride;
   clearModelOverride();
 
-  await streamResponse(apiMessages, assistantMsg, 0, bubble, overrideModel, null);
+  await streamResponse(apiMessages, assistantMsg, 0, bubble, overrideModel, null, { conv });
 
-  if (assistantMsg._responseCacheHit) {
+  if (assistantMsg._responseCacheHit || getSwipeRequest(assistantMsg)?.status !== 'complete') {
     delete assistantMsg._responseCacheHit;
   } else {
     extractMemories(apiMessages);
@@ -7047,7 +8590,7 @@ async function sendMessage() {
 // Regenerate
 // ============================================
 async function regenerate() {
-  if (streaming) return;
+  if (readOnlyShare || streaming) return;
   let lastIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === 'assistant') { lastIdx = i; break; }
@@ -7055,6 +8598,9 @@ async function regenerate() {
   if (lastIdx === -1) return;
 
   const msg = messages[lastIdx];
+  const conv = getActiveConv();
+  const requestContext = await buildRequestMessages(conv, { messageList: messages, untilIndex: lastIdx });
+  if (guardContextLimit(requestContext)) return;
   if (!msg.swipes) msg.swipes = [msg.content];
   msg.swipes.push('');
   msg.swipeIndex = msg.swipes.length - 1;
@@ -7067,13 +8613,10 @@ async function regenerate() {
   const bubble = lastWrapper.querySelector('.msg-bubble');
   bubble.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
 
-  const conv = getActiveConv();
-  const apiMessages = await buildSystemMessages(conv);
-  for (let i = 0; i < lastIdx; i++) {
-    if (messages[i].role !== 'system') apiMessages.push({ role: messages[i].role, content: buildApiContent(messages[i]) });
-  }
+  const apiMessages = requestContext.messages;
 
-  await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, null);
+  await saveConversationImmediately();
+  await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, null, { conv });
   if (msg._responseCacheHit) delete msg._responseCacheHit;
 
   if (conv) conv.updatedAt = Date.now();
@@ -7086,7 +8629,7 @@ async function regenerate() {
 // Continue Message
 // ============================================
 async function continueMessage() {
-  if (streaming) return;
+  if (readOnlyShare || streaming) return;
   let lastIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === 'assistant') { lastIdx = i; break; }
@@ -7098,19 +8641,22 @@ async function continueMessage() {
   if (!existingText.trim()) return;
 
   const conv = getActiveConv();
-  const apiMessages = await buildSystemMessages(conv);
-  for (let i = 0; i <= lastIdx; i++) {
-    if (messages[i].role !== 'system') {
-      apiMessages.push({ role: messages[i].role, content: buildApiContent(messages[i]) });
-    }
-  }
+  const requestContext = await buildRequestMessages(conv, {
+    messageList: messages,
+    untilIndex: lastIdx + 1,
+    targetIndex: lastIdx,
+    includeTarget: true
+  });
+  const apiMessages = requestContext.messages;
+  if (guardContextLimit(requestContext)) return;
 
   const area = document.getElementById('messagesArea');
   const wrappers = area.querySelectorAll('.msg-wrapper.assistant');
   const lastWrapper = wrappers[wrappers.length - 1];
   const bubble = lastWrapper.querySelector('.msg-bubble');
 
-  await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, existingText);
+  await saveConversationImmediately();
+  await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, existingText, { conv });
   if (msg._responseCacheHit) delete msg._responseCacheHit;
 
   if (conv) conv.updatedAt = Date.now();
@@ -7123,6 +8669,7 @@ async function continueMessage() {
 // Clear Chat
 // ============================================
 function clearChat() {
+  if (readOnlyShare) return;
   if (!confirm('Clear this conversation?')) return;
   const conv = getActiveConv();
   if (conv) {
@@ -7142,10 +8689,48 @@ function clearChat() {
 // ============================================
 // Export / Import
 // ============================================
+const EXPORT_SCHEMA = 'synapse-export';
+const EXPORT_VERSION = 2;
+const IMPORT_SETTING_ALLOWLIST = [
+  'llmProvider', 'llmProxyUrl', 'llmModel', 'llmApiFormat', 'llmStreaming', 'llmEnterSend',
+  'llmTemperature', 'llmMaxTokens', 'llmContextWindow', 'llmPromptCache', 'llmThinking',
+  'llmThinkingEffort', 'llmExtraParams', 'llmExcludeParams', 'llmPrefill', 'llmPersona',
+  'llmEnableStMacros', 'llmRpUserName', 'llmInputCost', 'llmOutputCost', 'llmWebSearch',
+  'llmForceSearch', 'llmMemoryEnabled', 'llmHoldScreenshot', 'llmCacheEnabled', 'llmPromptEntries',
+  'llmUrlFetch', 'llmToolConfirm', 'llmSearchApiUrl', 'llmCorsProxy',
+  'assistantTheme', 'assistantCustomTheme', 'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth'
+];
+const IMPORT_SETTING_URL_KEYS = new Set(['llmProxyUrl', 'llmSearchApiUrl', 'llmCorsProxy']);
+
+function buildSafeExportSettings() {
+  const settings = {};
+  IMPORT_SETTING_ALLOWLIST.forEach(key => {
+    const value = localStorage.getItem(key);
+    if (value !== null) settings[key] = IMPORT_SETTING_URL_KEYS.has(key) ? sanitizeStoredUrl(value) : value;
+  });
+  return settings;
+}
+
+function buildSafeExportProfiles() {
+  return loadProfiles().map(sanitizeProfileRecord);
+}
+
+function shareSafeText(text) {
+  return stripThinkTags(String(text || '')).content;
+}
+
 function exportConversation() {
   const conv = getActiveConv();
   if (!conv) return;
-  const data = { title: conv.title, messages: conv.messages, model: localStorage.getItem('llmModel') || '', promptEntries: loadPromptEntries(), exportedAt: new Date().toISOString() };
+  const data = {
+    schema: EXPORT_SCHEMA,
+    version: EXPORT_VERSION,
+    conversation: normalizeConversationRecord(JSON.parse(JSON.stringify(conv))),
+    title: conv.title,
+    messages: conv.messages,
+    model: localStorage.getItem('llmModel') || '',
+    exportedAt: new Date().toISOString()
+  };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -7157,89 +8742,280 @@ function exportConversation() {
 
 function exportAllConversations() {
   const data = {
+    schema: EXPORT_SCHEMA,
+    version: EXPORT_VERSION,
     conversations: conversations,
     // Advertised as a full backup, so project instructions and files ride along too.
     projects: projects,
+    memories: [],
+    drafts: conversations.filter(conv => conv.draft).map(conv => ({ conversationId: conv.id, ...conv.draft })),
     exportedAt: new Date().toISOString(),
-    settings: {
-      model: localStorage.getItem('llmModel') || '',
-      promptEntries: loadPromptEntries(),
-      persona: localStorage.getItem('llmPersona') || '',
-      apiFormat: localStorage.getItem('llmApiFormat') || 'auto',
-      theme: localStorage.getItem('assistantTheme') || 'dark',
-      font: localStorage.getItem('assistantFont') || ''
-    }
+    settings: buildSafeExportSettings(),
+    profiles: buildSafeExportProfiles()
   };
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'assistant-export-' + new Date().toISOString().slice(0, 10) + '.json';
-  a.click();
-  URL.revokeObjectURL(url);
+  loadMemories().then(memories => {
+    data.memories = memories;
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'assistant-export-' + new Date().toISOString().slice(0, 10) + '.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  }).catch(() => showToast('Could not prepare export.', 'error'));
+}
+
+function normalizeImportedData(data) {
+  if (!data || typeof data !== 'object') throw new Error('The file is not a JSON object.');
+  if (data.schema && data.schema !== EXPORT_SCHEMA) throw new Error('Unsupported export schema.');
+  if (data.version != null && (!Number.isInteger(Number(data.version)) || Number(data.version) < 1 || Number(data.version) > EXPORT_VERSION)) throw new Error('Unsupported export version.');
+  let rawConversations = Array.isArray(data.conversations) ? data.conversations : [];
+  if (!rawConversations.length && data.conversation && typeof data.conversation === 'object') rawConversations = [data.conversation];
+  if (!rawConversations.length && Array.isArray(data.messages)) rawConversations = [{ id: genId(), title: data.title || 'Imported Chat', messages: data.messages }];
+  const importedConversations = rawConversations.map(raw => normalizeConversationRecord(JSON.parse(JSON.stringify(raw))));
+  if (!importedConversations.length) throw new Error('No conversations found in this file.');
+  importedConversations.forEach(conv => conv.messages.forEach(message => {
+    if (message.role === 'assistant' && !Array.isArray(message.swipes)) {
+      message.swipes = [typeof message.content === 'string' ? message.content : ''];
+      message.swipeIndex = 0;
+    }
+  }));
+  const importedProjects = (Array.isArray(data.projects) ? data.projects : []).filter(project => project && project.id).map(project => ({
+    ...JSON.parse(JSON.stringify(project)),
+    docs: Array.isArray(project.docs) ? project.docs : []
+  }));
+  const importedMemories = normalizeMemoryList(Array.isArray(data.memories) ? data.memories : []).memories;
+  const drafts = Array.isArray(data.drafts) ? data.drafts.map(draft => ({ ...draft })) : [];
+  const settings = {};
+  Object.keys(data.settings || {}).forEach(key => {
+    if (IMPORT_SETTING_ALLOWLIST.includes(key)) {
+      const value = String(data.settings[key] ?? '');
+      settings[key] = IMPORT_SETTING_URL_KEYS.has(key) ? sanitizeStoredUrl(value) : value;
+    }
+  });
+  const profiles = Array.isArray(data.profiles) ? data.profiles.map(sanitizeProfileRecord) : [];
+  return { conversations: importedConversations, projects: importedProjects, memories: importedMemories, drafts, settings, profiles };
+}
+
+function renderImportPreview(data) {
+  const body = document.getElementById('importPreviewBody');
+  if (!body) return;
+  body.innerHTML = '';
+  const rows = [
+    ['Conversations', data.conversations.length],
+    ['Projects', data.projects.length],
+    ['Messages', data.conversations.reduce((total, conv) => total + conv.messages.length, 0)],
+    ['Drafts', data.drafts.length + data.conversations.filter(conv => conv.draft).length],
+    ['Memories', data.memories.length],
+    ['Safe settings', Object.keys(data.settings).length]
+  ];
+  const intro = document.createElement('p');
+  intro.textContent = 'Parsed successfully. API keys, search keys, sync tokens, and other secret profile fields will not be imported.';
+  body.appendChild(intro);
+  rows.forEach(([label, value]) => {
+    const row = document.createElement('div');
+    row.className = 'import-preview-row';
+    row.innerHTML = '<strong></strong><span></span>';
+    row.querySelector('strong').textContent = label;
+    row.querySelector('span').textContent = String(value);
+    body.appendChild(row);
+  });
 }
 
 function importConversation(event) {
+  if (readOnlyShare) return;
   const file = event.target.files[0];
   if (!file) return;
   const reader = new FileReader();
   reader.onload = (e) => {
     try {
-      const data = JSON.parse(e.target.result);
-      // Handle bulk export format { conversations: [...] }
-      if (data.conversations && Array.isArray(data.conversations)) {
-        let count = 0;
-        // Restore projects first so imported conversations resolve their projectId.
-        // Existing projects win on id collision — an import shouldn't clobber local edits.
-        if (Array.isArray(data.projects)) {
-          data.projects.forEach(p => {
-            if (p && p.id && !getProject(p.id)) {
-              projects.push({ ...p, docs: Array.isArray(p.docs) ? p.docs : [] });
-            }
-          });
-          saveProjects();
-        }
-        data.conversations.forEach(conv => {
-          conv.id = conv.id || genId();
-          conv.createdAt = conv.createdAt || Date.now();
-          conv.updatedAt = conv.updatedAt || Date.now();
-          conv.messages = conv.messages || [];
-          conv.messages.forEach(m => {
-            if (m.role === 'assistant' && !m.swipes) { m.swipes = [m.content]; m.swipeIndex = 0; }
-          });
-          conversations.unshift(conv);
-          count++;
-        });
-        if (count > 0) {
-          activeConvId = conversations[0].id;
-          messages = getActiveConv().messages;
-          saveConversations();
-          renderSidebar();
-          renderMessages();
-          updateTokenInfo();
-          showToast('Imported ' + count + ' conversations.', 'success');
-        } else {
-          showToast('No conversations found in file.', 'error');
-        }
-        return;
-      }
-      // Handle single conversation format { messages: [...] }
-      if (!data.messages || !Array.isArray(data.messages)) throw new Error('Invalid format');
-      const conv = { id: genId(), title: data.title || 'Imported Chat', messages: data.messages, createdAt: Date.now(), updatedAt: Date.now() };
-      conv.messages.forEach(m => {
-        if (m.role === 'assistant' && !m.swipes) { m.swipes = [m.content]; m.swipeIndex = 0; }
-      });
-      conversations.unshift(conv);
-      activeConvId = conv.id;
-      messages = conv.messages;
-      saveConversations();
-      renderSidebar();
-      renderMessages();
-      updateTokenInfo();
-    } catch (err) { showToast('Error importing: ' + err.message, 'error'); }
+      pendingImport = normalizeImportedData(JSON.parse(e.target.result));
+      renderImportPreview(pendingImport);
+      openModal('importPreviewModal');
+    } catch (err) { showToast('Could not parse import: ' + sanitizeErrorDetail(err), 'error'); }
   };
   reader.readAsText(file);
   event.target.value = '';
+}
+
+function mergeConversationRecords(localList, importedList) {
+  const byId = new Map((localList || []).map(raw => {
+    const conv = normalizeConversationRecord(raw);
+    return [conv.id, conv];
+  }));
+  (importedList || []).forEach(raw => {
+    const incoming = normalizeConversationRecord(raw);
+    const current = byId.get(incoming.id);
+    if (!current || Number(incoming.updatedAt) > Number(current.updatedAt)) byId.set(incoming.id, incoming);
+  });
+  return Array.from(byId.values());
+}
+
+function applySafeImportedSettings(settings, profiles = []) {
+  Object.entries(settings || {}).forEach(([key, value]) => {
+    if (IMPORT_SETTING_ALLOWLIST.includes(key)) {
+      const safeValue = IMPORT_SETTING_URL_KEYS.has(key) ? sanitizeStoredUrl(value) : String(value);
+      localStorage.setItem(key, safeValue);
+    }
+  });
+  if (profiles.length) {
+    const existing = loadProfiles();
+    const merged = mergeByUpdatedId(existing, profiles);
+    saveProfiles(merged);
+  }
+}
+
+function mergeByUpdatedId(localList, incomingList) {
+  const byId = new Map((localList || []).filter(item => item?.id).map(item => [item.id, item]));
+  (incomingList || []).filter(item => item?.id).forEach(item => {
+    const existing = byId.get(item.id);
+    if (!existing || Number(item.updatedAt || item.createdAt || 0) > Number(existing.updatedAt || existing.createdAt || 0)) byId.set(item.id, item);
+  });
+  return Array.from(byId.values());
+}
+
+function hasPublicShareIds(list) {
+  return (list || []).some(conv => conv.shareGistId || conv.shareUrl || conv.shareId);
+}
+
+async function applyImport(mode = 'merge') {
+  if (readOnlyShare || !pendingImport) return;
+  if (!['merge', 'copy', 'replace'].includes(mode)) return;
+  const imported = pendingImport;
+  if (mode === 'replace' && !confirm('Replace imported categories? This removes local conversations, projects, memories, and drafts.')) return;
+  if ((mode === 'replace' && hasPublicShareIds(conversations)) || (mode !== 'replace' && hasPublicShareIds(imported.conversations))) {
+    if (!confirm('Some records have public share IDs. Deleting or replacing them does not revoke the public links. Continue?')) return;
+  }
+  let importedConversations = imported.conversations.map(conv => normalizeConversationRecord(JSON.parse(JSON.stringify(conv))));
+  let importedProjects = JSON.parse(JSON.stringify(imported.projects));
+  let importedMemories = imported.memories.slice();
+  const copyConversationIds = new Map();
+  if (mode === 'copy') {
+    const projectIds = new Map();
+    importedProjects = importedProjects.map(project => {
+      const copy = { ...project, id: 'proj_' + genId(), updatedAt: Date.now() };
+      projectIds.set(project.id, copy.id);
+      return copy;
+    });
+    importedConversations = importedConversations.map(conv => {
+      const copy = normalizeConversationRecord(JSON.parse(JSON.stringify(conv)));
+      copyConversationIds.set(conv.id, copy.id = genId());
+      copy.updatedAt = Date.now();
+      if (copy.projectId) copy.projectId = projectIds.get(copy.projectId) || copy.projectId;
+      delete copy.shareGistId;
+      delete copy.shareUrl;
+      delete copy.shareId;
+      copy.messages.forEach(message => delete message._editing);
+      return copy;
+    });
+    importedMemories = importedMemories.map(memory => ({ ...memory, id: 'mem_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7) }));
+  }
+  if (mode === 'replace') {
+    conversations = importedConversations;
+    projects = importedProjects;
+    await saveMemories(importedMemories);
+  } else {
+    conversations = mode === 'copy' ? conversations.concat(importedConversations) : mergeConversationRecords(conversations, importedConversations);
+    projects = mode === 'copy' ? projects.concat(importedProjects) : mergeByUpdatedId(projects, importedProjects);
+    const localMemories = await loadMemories();
+    await saveMemories(mode === 'copy' ? localMemories.concat(importedMemories) : syncMergeMemoryLists(localMemories, importedMemories));
+  }
+  imported.drafts.forEach(draft => {
+    const conversationId = mode === 'copy' ? copyConversationIds.get(draft.conversationId) : draft.conversationId;
+    const conv = conversations.find(item => item.id === conversationId);
+    if (conv && (!conv.draft || Number(draft.updatedAt || 0) > Number(conv.draft.updatedAt || 0))) conv.draft = { text: draft.text || '', attachments: cloneDraftAttachments(draft.attachments), updatedAt: draft.updatedAt || Date.now() };
+  });
+  applySafeImportedSettings(imported.settings, imported.profiles);
+  activeConvId = conversations[0]?.id || null;
+  messages = getActiveConv()?.messages || [];
+  await saveConversationImmediately();
+  saveProjects();
+  pendingImport = null;
+  closeModal('importPreviewModal');
+  renderSidebar();
+  renderMessages();
+  restoreActiveDraft();
+  updateTokenInfo();
+  renderConnectionChip();
+  showToast('Import applied (' + mode + ').', 'success');
+}
+
+async function renderStorageSummary() {
+  const el = document.getElementById('storageSummary');
+  if (!el) return;
+  const approximate = [
+    ['Conversations', JSON.stringify(conversations).length],
+    ['Projects', JSON.stringify(projects).length],
+    ['Drafts', JSON.stringify(conversations.map(conv => conv.draft || null)).length],
+    ['Memories', (await loadMemories()).reduce((total, memory) => total + JSON.stringify(memory).length, 0)]
+  ];
+  const cacheStats = await cacheGetStats();
+  approximate.push(['Response cache', cacheStats.sizeBytes]);
+  let usageText = 'Storage estimate unavailable.';
+  try {
+    const estimate = await navigator.storage?.estimate?.();
+    if (estimate?.usage != null) usageText = 'Browser storage: ' + formatCacheBytes(estimate.usage) + (estimate.quota ? ' used of ' + formatCacheBytes(estimate.quota) : ' used');
+  } catch (e) {}
+  el.innerHTML = approximate.map(([label, bytes]) => '<div><span>' + escapeHTML(label) + '</span><strong>' + formatCacheBytes(bytes * 2) + '</strong></div>').join('') + '<p>' + escapeHTML(usageText) + '</p>';
+}
+
+async function clearDataCategory(category) {
+  if (readOnlyShare) return;
+  const labels = { conversations: 'conversations', drafts: 'drafts', memories: 'memories', cache: 'response cache', credentials: 'provider, search, and sync credentials' };
+  if (!labels[category] || !confirm('Clear ' + labels[category] + '? This cannot be undone.')) return;
+  if (category === 'conversations') {
+    if (hasPublicShareIds(conversations) && !confirm('Some links may remain public after local deletion. Continue?')) return;
+    conversations = [];
+    activeConvId = null;
+    await idbClear('conversations').catch(() => {});
+    createConversation();
+  } else if (category === 'drafts') {
+    conversations.forEach(conv => delete conv.draft);
+    pendingAttachments = [];
+    const input = document.getElementById('chatInput');
+    if (input) input.value = '';
+    renderPreviews();
+    await saveConversationImmediately();
+  } else if (category === 'memories') {
+    await saveMemories([]);
+  } else if (category === 'cache') {
+    await cacheClear();
+  } else if (category === 'credentials') {
+    ['llmApiKey', 'llmSearchApiKey'].forEach(key => { localStorage.removeItem(key); sessionStorage.removeItem(key); });
+    ['assistantSyncGistToken', 'assistantSyncPassphrase', 'assistantSyncGistId', 'assistantSyncSalt', 'assistantSyncLastHash'].forEach(key => localStorage.removeItem(key));
+    scrubProfileSecrets();
+  }
+  await renderStorageSummary();
+  renderConnectionChip();
+  showToast('Cleared ' + labels[category] + '.', 'success');
+}
+
+function synapseSelfTest() {
+  const assert = (condition, message) => { if (!condition) throw new Error(message); };
+  try {
+    const sample = normalizeConversationRecord({ id: 'selftest', messages: [
+      { role: 'user', content: 'included' },
+      { role: 'assistant', content: 'excluded', includeInContext: false },
+      { role: 'assistant', content: 'failed', swipeRequests: [{ status: 'failed' }], swipes: ['failed'], swipeIndex: 0 }
+    ] });
+    const filtered = filterRequestHistory(sample.messages);
+    assert(filtered.included.length === 1 && filtered.included[0].message.content === 'included', 'context filtering');
+    assert(filtered.excluded.length === 1, 'excluded history');
+    const registry = sourceRegistryFor({ swipeSources: [[{ number: 1, url: 'https://example.test/page' }]] }, 0);
+    const numbered = registerSources(registry, [{ url: 'https://example.test/page#section', title: 'same' }, { url: 'https://example.test/other', title: 'other' }]);
+    assert(numbered[0].sourceNumber === 1 && numbered[1].sourceNumber === 2, 'source numbering');
+    const imported = normalizeImportedData({ messages: [{ role: 'user', content: 'legacy' }] });
+    assert(imported.conversations.length === 1 && imported.conversations[0].messages.length === 1, 'legacy import');
+    const merged = mergeConversationRecords([{ id: 'same', updatedAt: 1, messages: [] }], [{ id: 'same', updatedAt: 2, messages: [{ role: 'user', content: 'newer' }] }]);
+    assert(merged[0].messages.length === 1, 'import merge');
+    const result = { ok: true, checks: ['normalization', 'context filtering', 'source numbering', 'legacy import', 'updatedAt merge'] };
+    console.info('Synapse self-test passed', result);
+    return result;
+  } catch (error) {
+    const result = { ok: false, error: error.message || String(error) };
+    console.error('Synapse self-test failed', result);
+    return result;
+  }
 }
 
 // ============================================
@@ -7508,13 +9284,7 @@ function syncNormalizeConversation(conv) {
 }
 
 function syncScrubProfileSecrets(profile) {
-  if (!profile || typeof profile !== 'object') return {};
-  const cleaned = syncCloneJson(profile);
-  if (!cleaned || typeof cleaned !== 'object') return {};
-  if (cleaned.settings && typeof cleaned.settings === 'object') {
-    SYNC_PROFILE_SECRET_KEYS.forEach(key => delete cleaned.settings[key]);
-  }
-  return cleaned;
+  return sanitizeProfileRecord(profile);
 }
 
 function syncPreserveLocalProfileSecrets(remoteProfiles) {
@@ -8004,7 +9774,11 @@ function shareSafeContent(content) {
   return content.map(part => {
     if (part.type === 'file') return { type: 'file', file: { name: (part.file && part.file.name) || 'file' } };
     if (part.type === 'text') return { type: 'text', text: stripThinkTags(part.text || '').content };
-    return part; // image_url parts are already just a data/remote URL the user chose to send
+    if (part.type === 'image_url') {
+      const url = safeMediaUrl(part.image_url?.url);
+      return url ? { type: 'image_url', image_url: { url } } : { type: 'text', text: '[Image attachment omitted]' };
+    }
+    return { type: 'text', text: '[Unsupported content omitted]' };
   });
 }
 
@@ -8015,13 +9789,13 @@ function buildSharePayload(conv) {
     app: 'Synapse',
     schema: SHARE_SCHEMA,
     sharedAt: Date.now(),
-    title: conv.title || 'Shared chat',
+    title: shareSafeText(conv.title || 'Shared chat'),
     messages: (conv.messages || [])
       .filter(m => m.role === 'user' || m.role === 'assistant')
       .map(m => {
         const out = { role: m.role, content: shareSafeContent(m.content) };
         if (m.role === 'assistant') {
-          const images = (m.swipeImages && m.swipeImages[m.swipeIndex || 0]) || m.images || [];
+          const images = ((m.swipeImages && m.swipeImages[m.swipeIndex || 0]) || m.images || []).map(safeMediaUrl).filter(Boolean);
           if (images.length) { out.swipeImages = [images]; out.swipeIndex = 0; }
         }
         return out;
@@ -8131,7 +9905,7 @@ async function initShareView(gistId) {
     if (!payload || payload.schema !== SHARE_SCHEMA || !Array.isArray(payload.messages)) {
       throw new Error('Unrecognised share format');
     }
-    messages = payload.messages;
+    messages = normalizeConversationRecord({ messages: payload.messages }).messages;
     document.title = (payload.title || 'Shared chat') + ' — Synapse';
     const titleEl = document.querySelector('.toolbar-title');
     if (titleEl) titleEl.textContent = payload.title || 'Shared chat';
@@ -8765,9 +10539,9 @@ function extractLegacyDocText(arrayBuffer) {
 async function readAttachmentFile(file) {
   const mime = (file.type || '').toLowerCase();
   const name = file.name || 'file';
+  const originConvId = activeConvId;
   const fail = (message) => {
-    pendingAttachments.push({ type: 'file', name, mime: file.type || 'application/octet-stream', textContent: message });
-    renderPreviews();
+    queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'application/octet-stream', textContent: message });
   };
 
   try {
@@ -8775,40 +10549,33 @@ async function readAttachmentFile(file) {
     if (isImage) {
       const resizedUrl = await resizeImageIfNeeded(file, 1536, 0.85);
       if (resizedUrl) {
-        pendingAttachments.push({ type: 'image', dataUrl: resizedUrl, name, mime: 'image/jpeg' });
+        queueAttachmentForConversation(originConvId, { type: 'image', dataUrl: resizedUrl, name, mime: 'image/jpeg' });
       } else {
-        pendingAttachments.push({ type: 'image', dataUrl: await readFileAsDataURL(file), name, mime: file.type });
+        queueAttachmentForConversation(originConvId, { type: 'image', dataUrl: await readFileAsDataURL(file), name, mime: file.type });
       }
-      renderPreviews();
     } else if (mime === 'application/pdf' || /\.pdf$/i.test(name)) {
       const text = await extractPdfText(await file.arrayBuffer());
-      pendingAttachments.push({ type: 'file', name, mime: file.type || 'application/pdf', textContent: limitAttachmentText(text, name) || '[PDF contains no extractable text]' });
-      renderPreviews();
+      queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'application/pdf', textContent: limitAttachmentText(text, name) || '[PDF contains no extractable text]' });
     } else if (DOCX_EXTENSIONS.test(name) || DOCX_MIMES.has(mime)) {
       const text = await extractDocxText(await file.arrayBuffer());
-      pendingAttachments.push({ type: 'file', name, mime: file.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', textContent: limitAttachmentText(text, name) || '[DOCX contains no extractable text]' });
-      renderPreviews();
+      queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', textContent: limitAttachmentText(text, name) || '[DOCX contains no extractable text]' });
     } else if (/\.rtf$/i.test(name) || RTF_MIMES.has(mime)) {
       const text = extractRtfText(await file.text());
-      pendingAttachments.push({ type: 'file', name, mime: file.type || 'text/rtf', textContent: limitAttachmentText(text, name) || '[RTF contains no extractable text]' });
-      renderPreviews();
+      queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'text/rtf', textContent: limitAttachmentText(text, name) || '[RTF contains no extractable text]' });
     } else if (DOC_EXTENSIONS.test(name) || DOC_MIMES.has(mime)) {
       const text = extractLegacyDocText(await file.arrayBuffer());
-      pendingAttachments.push({ type: 'file', name, mime: file.type || 'application/msword', textContent: limitAttachmentText(text, name) || '[Legacy DOC could not be read as text]' });
-      renderPreviews();
+      queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'application/msword', textContent: limitAttachmentText(text, name) || '[Legacy DOC could not be read as text]' });
     } else if (isTextLikeFile(file)) {
       const text = await file.text();
-      pendingAttachments.push({ type: 'file', name, mime: file.type || 'text/plain', textContent: limitAttachmentText(text, name) });
-      renderPreviews();
+      queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'text/plain', textContent: limitAttachmentText(text, name) });
     } else {
       const buffer = await file.arrayBuffer();
       if (isProbablyTextBuffer(buffer)) {
         const text = new TextDecoder('utf-8').decode(buffer);
-        pendingAttachments.push({ type: 'file', name, mime: file.type || 'text/plain', textContent: limitAttachmentText(text, name) });
-        renderPreviews();
+        queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'text/plain', textContent: limitAttachmentText(text, name) });
         return;
       }
-      pendingAttachments.push({
+      queueAttachmentForConversation(originConvId, {
         type: 'file',
         dataUrl: await readFileAsDataURL(file),
         name,
@@ -8816,7 +10583,6 @@ async function readAttachmentFile(file) {
         binary: true,
         textContent: `[Binary file attached: ${name} (${file.type || 'unknown type'}, ${file.size.toLocaleString()} bytes). This provider may only receive file contents if it supports document uploads.]`
       });
-      renderPreviews();
     }
   } catch (e) {
     console.error('File attachment failed:', e);
@@ -8850,11 +10616,12 @@ function renderPreviews() {
     rm.title = 'Remove ' + (att.name || 'attachment');
     rm.setAttribute('aria-label', 'Remove ' + (att.name || 'attachment'));
     rm.innerHTML = '&times;';
-    rm.onclick = () => { pendingAttachments.splice(idx, 1); renderPreviews(); };
+    rm.onclick = () => { pendingAttachments.splice(idx, 1); renderPreviews(); persistDraftFromUI(); };
     thumb.appendChild(rm);
     container.appendChild(thumb);
   });
   updateSendBtnState();
+  persistDraftFromUI();
 }
 
 // ============================================
@@ -8914,6 +10681,7 @@ function selectMention(ta, model, atStart) {
   ta.value = ta.value.slice(0, atStart) + after;
   ta.focus();
   setModelOverride(model);
+  persistDraftFromUI();
 }
 
 function handleMentionKeydown(e, ta) {
@@ -9095,12 +10863,14 @@ function showCharacterInfo() {
 
   const popup = document.createElement('div');
   popup.className = 'char-info-popup';
+  popup.setAttribute('aria-labelledby', 'characterInfoTitle');
 
   let html = '';
   if (conv.characterAvatar) {
-    html += '<img class="char-info-avatar" src="' + conv.characterAvatar.replace(/"/g, '&quot;') + '">';
+    const safeAvatar = safeMediaUrl(conv.characterAvatar);
+    if (safeAvatar) html += '<img class="char-info-avatar" src="' + escapeHTML(safeAvatar) + '" alt="">';
   }
-  html += '<h3>' + (card.name || 'Character').replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</h3>';
+  html += '<h3 id="characterInfoTitle">' + (card.name || 'Character').replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</h3>';
 
   const fields = [
     ['Description', card.description],
@@ -9117,11 +10887,10 @@ function showCharacterInfo() {
       '<div class="char-info-value">' + value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div></div>';
   });
 
-  html += '<button class="btn btn-primary" style="margin-top:12px;width:100%" onclick="this.parentElement.previousElementSibling.click()">Close</button>';
+  html += '<button class="btn btn-primary" type="button" data-close-character style="margin-top:12px;width:100%">Close</button>';
   popup.innerHTML = html;
-
-  document.body.appendChild(overlay);
-  document.body.appendChild(popup);
+  const close = openTransientDialog(overlay, popup, popup.querySelector('[data-close-character]'));
+  popup.querySelector('[data-close-character]').onclick = close;
 }
 
 // ============================================
@@ -9154,6 +10923,7 @@ function toggleVoice() {
     input.value = startText + transcript;
     input.style.height = 'auto';
     input.style.height = Math.min(input.scrollHeight, 150) + 'px';
+    persistDraftFromUI();
   };
 
   voiceRec.onend = () => { btn.classList.remove('recording'); voiceRec = null; };
@@ -9189,6 +10959,7 @@ const __windowBridge = {
   formatRelativeTime,
   prefersReducedMotion,
   getScrollBehavior,
+  announce,
   scrollMessagesToBottom,
   isDebugLoggingEnabled,
   isDebugTextIncluded,
@@ -9247,6 +11018,13 @@ const __windowBridge = {
   getActiveProfileSummary,
   getConnectionSummary,
   suggestProfileName,
+  getApiKey,
+  setApiKey,
+  getKeyStorageMode,
+  getProviderPreset,
+  applyProviderPreset,
+  testConnection,
+  renderConnectionChip,
   setAssistantLlmMetadata,
   prepareAnthropicMessages,
   renderGenImages,
@@ -9265,6 +11043,9 @@ const __windowBridge = {
   updateMessageTokenMetadata,
   getMessageLlmInfo,
   renderMessageMeta,
+  renderRequestMeta,
+  retryRequest,
+  showRequestDetails,
   updateTokenInfo,
   openDB,
   idbPut,
@@ -9294,6 +11075,17 @@ const __windowBridge = {
   switchConversation,
   deleteConversation,
   clearAllConversations,
+  setConversationView,
+  setConversationSort,
+  toggleBulkMode,
+  toggleConversationSelection,
+  toggleSelectAllConversations,
+  bulkArchiveSelected,
+  bulkDeleteSelected,
+  archiveConversation,
+  toggleActiveArchive,
+  duplicateConversation,
+  removeConversations,
   renderSidebar,
   showTagPicker,
   renderTagFilterBar,
@@ -9332,6 +11124,12 @@ const __windowBridge = {
   togglePromptEntry,
   updatePromptEntry,
   buildSystemMessages,
+  buildRequestMessages,
+  filterRequestHistory,
+  openContextPreview,
+  compactOlderTurns,
+  toggleComposerTools,
+  closeComposerTools,
   maybeAddAvatar,
   renderMessages,
   renderEditMode,
@@ -9359,6 +11157,14 @@ const __windowBridge = {
   exportConversation,
   exportAllConversations,
   importConversation,
+  normalizeImportedData,
+  applyImport,
+  renderStorageSummary,
+  clearDataCategory,
+  synapseSelfTest,
+  closeCommandDropdown,
+  handleCommandInput,
+  handleCommandKeydown,
   syncSaveSettings,
   renderSyncSettings,
   syncPushToGist,

@@ -8,20 +8,25 @@ Use it from GitHub Pages, run it from a local server, or download the standalone
 
 ### Providers and Models
 
-- Works with OpenAI, Anthropic, and OpenAI-compatible endpoints.
+- Setup and API settings include OpenAI, Anthropic, OpenRouter, Ollama, LM Studio, and Custom presets.
+- Test a connection and discover models without saving settings. Model metadata is used for context estimates when the provider supplies a context length.
 - Supports local model servers such as LM Studio, Ollama, and text-generation-webui.
-- Lets you save connection profiles for different base URLs, keys, models, and request settings.
+- Lets you save connection profiles for different base URLs, models, and request settings; API keys stay in the selected device/tab credential store and are scrubbed from profiles, exports, and sync payloads.
 - Supports streaming responses, stop generation, and one-message model overrides with `@model-name`.
-- Shows which model answered and an estimated token count on each message.
+- The toolbar chip shows the active provider, model, and profile. Each assistant swipe records lifecycle, timing, HTTP, and sanitized error metadata.
+
+API keys can be saved as **Remember on this device** (`localStorage`) or **This tab only** (`sessionStorage`). Legacy `llmApiKey` values remain remembered until changed. Browser storage is not an encrypted vault.
 
 ### Chats
 
-- Create, rename, tag, search, import, and export conversations.
+- Create, rename, tag, search, import, and export conversations. Active and Archived views, duplicate/archive/restore, bulk selection, and Updated/Created/Title/Manual sorting are available in the sidebar.
 - Export one chat as JSON or Markdown, or export everything at once.
 - Edit a user message and resend from that point.
 - Regenerate assistant messages and switch between swipes.
 - Fork a chat from any message.
 - Generate and save a conversation summary for context.
+- Open **Context** to inspect the exact provider/model, system context, included/excluded history, attachment sizes, estimated tokens, output limit, and context-window usage. Individual messages can be included or excluded; compaction summarizes older turns without deleting them.
+- Draft text and pending attachments are saved per conversation and restored after switching chats or reloading.
 - Select message ranges for screenshots.
 
 ### Files
@@ -42,6 +47,8 @@ Use it from GitHub Pages, run it from a local server, or download the standalone
 ### Tools and Diagnostics
 
 - Web search through Anthropic tools, SearXNG, Brave, or a custom search endpoint.
+- `/search` (aliases `/web`, `/s`) and `/files` (aliases `/file`, `/docs`, `/doc`) are discoverable from the composer. Per-chat web-search, URL-fetch, and confirmation policies override global defaults.
+- Tool calls show their state, require one confirmation per response when enabled, and persist deduplicated numbered sources for citations and the Sources drawer.
 - Optional memory across conversations.
 - Status and diagnostics panel for connection/search checks.
 - Debug tab with redacted request logging, optional full text logging, and a snapshot copy button.
@@ -70,6 +77,8 @@ Use it from GitHub Pages, run it from a local server, or download the standalone
 | `Ctrl+Shift+R` | Regenerate last response |
 | `Escape` | Close modal or stop generation |
 | `@model` | Override the model for one message |
+
+Typing `/` in the composer opens the command menu with usage and aliases. Focus a message with Tab to reveal its actions, including Include/Exclude, Retry, and request Details.
 
 ## Run It
 
@@ -115,11 +124,11 @@ php -S localhost:8000 -t assistant
 
 ## Setup
 
-On first launch, enter:
+On first launch, choose a provider preset, test the connection if desired, then enter:
 
-1. Base URL, for example `https://api.openai.com/v1` or `http://localhost:1234/v1`.
-2. API key.
-3. Model name, either fetched from the provider or typed manually.
+1. Base URL (presets fill the common values).
+2. API key when the provider requires one.
+3. Model name, either fetched from the provider or typed manually. Synapse does not assume a model name.
 
 Keys and settings stay in your browser. Synapse does not run a server and does not proxy your traffic.
 
@@ -129,15 +138,16 @@ Synapse uses browser storage:
 
 | Storage | Contents |
 |---|---|
-| IndexedDB | Conversations, messages, and memories |
+| IndexedDB | Conversations, messages, drafts, and memories |
 | `localStorage` | API settings, themes, profiles, prompt entries, presets, cached model list, and UI preferences |
+| `sessionStorage` | A key selected as “This tab only” |
 
 Important keys include:
 
 | Key | Contents |
 |---|---|
 | `llmProxyUrl` | API base URL |
-| `llmApiKey` | API key |
+| `llmApiKey` | Remembered API key (legacy and current compatibility key) |
 | `llmModel` | Active model |
 | `assistantProfiles` | Saved connection profiles |
 | `assistantTheme` | Current theme |
@@ -146,6 +156,8 @@ Important keys include:
 | `assistantDebug` | Debug logging toggle |
 
 Use "Export all chats" from the toolbar menu if you want a backup.
+
+The Data settings tab reports approximate category sizes and browser usage/quota, provides separate confirmed clear actions, and previews imports before applying them. Imports accept schema-less legacy single-chat files and current bulk files. Merge uses newer `updatedAt` values; Copy remaps IDs; Replace requires an additional confirmation. Export schema version is `synapse-export` version 2. Credentials are excluded from settings/profiles in exports and imports.
 
 ## Project Files
 
