@@ -15,7 +15,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="./styles.css?v=20260812b">
+<link rel="stylesheet" href="./styles.css?v=20260813">
 </head>
 <body>
 
@@ -30,8 +30,8 @@
 <aside class="sidebar" id="sidebar">
   <div class="sidebar-header">
     <button onclick="createConversation()" aria-label="New chat">+ New Chat</button>
-    <button onclick="document.getElementById('charImportInput').click()" title="Import character card" aria-label="Import character card" style="flex:0 0 auto;padding:10px 12px">&#128101;</button>
-    <button onclick="clearAllConversations()" title="Delete all conversations" aria-label="Delete all conversations" style="flex:0 0 auto;padding:10px 12px">&#128465;</button>
+    <button class="sidebar-icon-btn" onclick="document.getElementById('charImportInput').click()" title="Import character card" aria-label="Import character card" style="padding:10px 12px"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6.5" cy="5" r="2.5"/><path d="M2 13.5c0-2.5 2-4 4.5-4s4.5 1.5 4.5 4"/><path d="M12.5 4.5v4M10.5 6.5h4"/></svg></button>
+    <button class="sidebar-icon-btn" onclick="clearAllConversations()" title="Delete all conversations" aria-label="Delete all conversations" style="padding:10px 12px"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4h11M5.5 4V2.8c0-.4.3-.8.8-.8h3.4c.5 0 .8.4.8.8V4M4.2 4l.6 9.2c0 .5.5.9 1 .9h4.4c.5 0 1-.4 1-.9l.6-9.2M6.5 7v4M9.5 7v4"/></svg></button>
     <input type="file" id="charImportInput" accept=".png,.json" style="display:none" onchange="importCharacterCard(event)">
   </div>
   <nav class="sidebar-nav" aria-label="Conversation navigation">
@@ -39,7 +39,7 @@
     <input type="text" id="sidebarSearch" placeholder="Search conversations..." oninput="filterConversations()">
     <button class="search-clear-btn" onclick="document.getElementById('sidebarSearch').value='';filterConversations()" aria-label="Clear search">&times;</button>
   </div>
-  <button class="global-search-btn" onclick="openGlobalSearch()" aria-label="Search all messages">&#128269; Search all messages</button>
+  <button class="global-search-btn" onclick="openGlobalSearch()" aria-label="Search all messages"><svg class="icon" style="display:inline-block;vertical-align:-3px;width:13px;height:13px" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m13.8 13.8-3.6-3.6"/></svg> Search all messages</button>
   <div class="sidebar-organization" aria-label="Conversation organization">
     <div class="sidebar-view-row" role="group" aria-label="Conversation view">
       <button type="button" class="sidebar-view-btn active" id="activeViewBtn" onclick="setConversationView('active')">Active</button>
@@ -88,24 +88,24 @@
       <div class="toolbar-more">
         <button class="toolbar-btn" id="toolbarMoreBtn" onclick="toggleToolbarMenu(event)" title="More actions" aria-label="More actions" aria-controls="toolbarMenu" aria-expanded="false">&#8943;</button>
         <div class="toolbar-menu" id="toolbarMenu" role="menu" aria-label="More actions">
-          <button role="menuitem" onclick="exportConversation();closeToolbarMenu()">&#8615; Export chat (JSON)</button>
-          <button role="menuitem" onclick="exportMarkdown();closeToolbarMenu()">&#128221; Export as Markdown</button>
-          <button role="menuitem" onclick="exportAllConversations();closeToolbarMenu()">&#8659; Export all chats</button>
-          <button role="menuitem" onclick="document.getElementById('importInput').click();closeToolbarMenu()">&#8613; Import chat</button>
-          <button role="menuitem" onclick="shareConversation();closeToolbarMenu()">&#128279; Share chat (link)</button>
-          <button role="menuitem" onclick="unshareConversation();closeToolbarMenu()">&#128683; Unshare chat</button>
-          <button role="menuitem" onclick="openProjectsModal();closeToolbarMenu()">&#128193; Projects</button>
-          <button role="menuitem" onclick="openFileSearch();closeToolbarMenu()">&#128270; Search files</button>
-          <button role="menuitem" onclick="openSummaryModal();closeToolbarMenu()">&#128220; Conversation summary</button>
-          <button role="menuitem" onclick="duplicateConversation();closeToolbarMenu()">&#10697; Duplicate chat</button>
-          <button role="menuitem" onclick="toggleActiveArchive();closeToolbarMenu()">&#128230; Archive / restore chat</button>
-          <button role="menuitem" onclick="openStatusPanel();closeToolbarMenu()">&#9888; Status / diagnostics</button>
-          <button role="menuitem" onclick="clearChat();closeToolbarMenu()">&#128465; Clear chat</button>
-          <button role="menuitem" onclick="enterSelectMode();closeToolbarMenu()">&#128247; Screenshot messages</button>
+          <button role="menuitem" onclick="exportConversation();closeToolbarMenu()">Export chat (JSON)</button>
+          <button role="menuitem" onclick="exportMarkdown();closeToolbarMenu()">Export as Markdown</button>
+          <button role="menuitem" onclick="exportAllConversations();closeToolbarMenu()">Export all chats</button>
+          <button role="menuitem" onclick="document.getElementById('importInput').click();closeToolbarMenu()">Import chat</button>
+          <button role="menuitem" onclick="shareConversation();closeToolbarMenu()">Share chat (link)</button>
+          <button role="menuitem" onclick="unshareConversation();closeToolbarMenu()">Unshare chat</button>
+          <button role="menuitem" onclick="openProjectsModal();closeToolbarMenu()">Projects</button>
+          <button role="menuitem" onclick="openFileSearch();closeToolbarMenu()">Search files</button>
+          <button role="menuitem" onclick="openSummaryModal();closeToolbarMenu()">Conversation summary</button>
+          <button role="menuitem" onclick="duplicateConversation();closeToolbarMenu()">Duplicate chat</button>
+          <button role="menuitem" onclick="toggleActiveArchive();closeToolbarMenu()">Archive / restore chat</button>
+          <button role="menuitem" onclick="openStatusPanel();closeToolbarMenu()">Status / diagnostics</button>
+          <button role="menuitem" onclick="clearChat();closeToolbarMenu()">Clear chat</button>
+          <button role="menuitem" onclick="enterSelectMode();closeToolbarMenu()">Screenshot messages</button>
         </div>
       </div>
       <input type="file" id="importInput" accept=".json" style="display:none" onchange="importConversation(event)">
-      <button class="toolbar-btn" id="charInfoBtn" onclick="showCharacterInfo()" title="Character info" aria-label="Character info" style="display:none">&#8505;</button>
+      <button class="toolbar-btn" id="charInfoBtn" onclick="showCharacterInfo()" title="Character info" aria-label="Character info" style="display:none">&#8505;&#xFE0E;</button>
       <button class="toolbar-btn" onclick="openSettings()" title="Settings" aria-label="Settings">&#9881;</button>
       <button class="toolbar-btn" id="themeToggle" onclick="toggleTheme()" title="Theme: dark" aria-label="Toggle theme">&#9790;</button>
     </div>
@@ -115,8 +115,8 @@
   <div class="chat-search-bar" id="chatSearchBar">
     <input type="text" id="chatSearchInput" placeholder="Search in chat..." oninput="debouncedChatSearch()">
     <span class="search-count" id="chatSearchCount"></span>
-    <button onclick="navigateChatSearch(-1)" title="Previous" aria-label="Previous search result">&#9650;</button>
-    <button onclick="navigateChatSearch(1)" title="Next" aria-label="Next search result">&#9660;</button>
+    <button onclick="navigateChatSearch(-1)" title="Previous" aria-label="Previous search result">&#9650;&#xFE0E;</button>
+    <button onclick="navigateChatSearch(1)" title="Next" aria-label="Next search result">&#9660;&#xFE0E;</button>
     <button onclick="closeChatSearch()" title="Close" aria-label="Close search">&times;</button>
   </div>
 
@@ -124,7 +124,7 @@
   <section class="messages-area" id="messagesArea" role="log" aria-live="polite" aria-label="Conversation messages">
     <div class="chat-placeholder">Start a conversation...</div>
   </section>
-  <button class="scroll-fab" id="scrollFab" onclick="scrollMessagesToBottom()" title="Scroll to bottom" aria-label="Scroll to bottom">&#8595;</button>
+  <button class="scroll-fab" id="scrollFab" onclick="scrollMessagesToBottom()" title="Scroll to bottom" aria-label="Scroll to bottom">&#8595;&#xFE0E;</button>
   <div class="select-toolbar" id="selectToolbar">
     <span class="select-count" id="selectCount">0 selected</span>
     <button class="ss-btn" id="ssBtn" onclick="screenshotSelected()" disabled>Screenshot</button>
@@ -141,10 +141,10 @@
     <div class="input-row" style="position:relative">
       <div class="mention-dropdown" id="mentionDropdown"></div>
       <div class="command-dropdown" id="commandDropdown" role="menu" aria-label="Slash commands"></div>
-      <button class="input-btn" onclick="document.getElementById('fileInput').click()" title="Attach file" aria-label="Attach file">&#128206;</button>
+      <button class="input-btn" onclick="document.getElementById('fileInput').click()" title="Attach file" aria-label="Attach file"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.2 7.3 8.4 12a3.2 3.2 0 0 1-4.5-4.5l5.2-5.2a2.1 2.1 0 0 1 3 3L7 10.4a1.05 1.05 0 0 1-1.5-1.5l4.7-4.7"/></svg></button>
       <input type="file" id="fileInput" multiple style="display:none" onchange="handleFileSelect(event)">
       <textarea id="chatInput" placeholder="Type a message..." rows="1" aria-controls="commandDropdown" aria-expanded="false"></textarea>
-      <button class="input-btn" id="voiceBtn" onclick="toggleVoice()" title="Voice input" aria-label="Voice input">&#127908;</button>
+      <button class="input-btn" id="voiceBtn" onclick="toggleVoice()" title="Voice input" aria-label="Voice input"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="1.5" width="4" height="7.5" rx="2"/><path d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.5M6 14.5h4"/></svg></button>
       <button class="input-control-btn" id="contextBtn" onclick="openContextPreview()" title="Review what will be sent" aria-label="Review message context">Context</button>
       <button class="input-control-btn" id="toolsBtn" onclick="toggleComposerTools(event)" title="Conversation tool policy" aria-label="Conversation tools" aria-expanded="false">Tools</button>
       <button class="send-btn" id="sendBtn" onclick="sendMessage()" aria-label="Send message">Send</button>
@@ -189,7 +189,7 @@
     <label for="setupModelSelect">Model</label>
     <div class="model-selector-row">
       <select id="setupModelSelect" onchange="document.getElementById('setupModelManual').value=''"><option value="">-- Fetch models first --</option></select>
-      <button class="model-refresh-btn" onclick="refreshModels('setup', this)" title="Refresh model list">&#x1F504;</button>
+      <button class="model-refresh-btn" onclick="refreshModels('setup', this)" title="Refresh model list"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1M13.5 1.5v3h-3"/></svg></button>
     </div>
     <input type="text" id="setupModelManual" placeholder="Or type model name manually" oninput="document.getElementById('setupModelSelect').value=''">
     <div class="connection-test-row"><button type="button" class="btn btn-secondary" onclick="testConnection('setup')">Test connection</button><span id="setupConnectionStatus" class="connection-status" aria-live="polite"></span></div>
@@ -240,7 +240,7 @@
       <label for="setModelSelect">Model</label>
       <div class="model-selector-row">
         <select id="setModelSelect" onchange="document.getElementById('setModelManual').value=''"><option value="">-- Fetch models first --</option></select>
-        <button class="model-refresh-btn" onclick="refreshModels('settings', this)" title="Refresh model list">&#x1F504;</button>
+        <button class="model-refresh-btn" onclick="refreshModels('settings', this)" title="Refresh model list"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1M13.5 1.5v3h-3"/></svg></button>
       </div>
       <input type="text" id="setModelManual" placeholder="Or type model name manually" oninput="document.getElementById('setModelSelect').value=''">
       <div class="connection-test-row"><button type="button" class="btn btn-secondary" onclick="testConnection('settings')">Test connection</button><span id="settingsConnectionStatus" class="connection-status" aria-live="polite"></span></div>
@@ -251,8 +251,8 @@
       <label for="profileSelect">Profile</label>
       <div class="model-selector-row">
         <select id="profileSelect" onchange="applyProfileFromSelect()"><option value="">-- Select profile --</option></select>
-        <button class="model-refresh-btn" onclick="saveCurrentAsProfile()" title="Save current profile" aria-label="Save current profile">&#128190;</button>
-        <button class="model-refresh-btn" onclick="deleteSelectedProfile()" title="Delete selected profile" aria-label="Delete selected profile">&#128465;</button>
+        <button class="model-refresh-btn" onclick="saveCurrentAsProfile()" title="Save current profile" aria-label="Save current profile"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 3.5c0-.6.4-1 1-1h7.6l2.4 2.4v7.6c0 .6-.4 1-1 1h-9c-.6 0-1-.4-1-1z"/><path d="M5 2.7V6h5.5V2.7M5.5 13.3V9.5h5v3.8"/></svg></button>
+        <button class="model-refresh-btn" onclick="deleteSelectedProfile()" title="Delete selected profile" aria-label="Delete selected profile"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4h11M5.5 4V2.8c0-.4.3-.8.8-.8h3.4c.5 0 .8.4.8.8V4M4.2 4l.6 9.2c0 .5.5.9 1 .9h4.4c.5 0 1-.4 1-.9l.6-9.2M6.5 7v4M9.5 7v4"/></svg></button>
       </div>
       <div class="profile-summary" id="profileSummary">No profile selected.</div>
       <label for="profileName">Profile name</label>
@@ -309,9 +309,9 @@
         <select id="setPresetSelect" onchange="applyPreset(this.value)">
           <option value="">-- Custom --</option>
         </select>
-        <button class="model-refresh-btn" onclick="saveCurrentAsPreset()" title="Save as preset">&#128190;</button>
-        <button class="model-refresh-btn" onclick="deleteSelectedPreset()" title="Delete preset">&#128465;</button>
-        <button class="model-refresh-btn" onclick="document.getElementById('stPresetFile').click()" title="Import SillyTavern preset">&#128228;</button>
+        <button class="model-refresh-btn" onclick="saveCurrentAsPreset()" title="Save as preset"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 3.5c0-.6.4-1 1-1h7.6l2.4 2.4v7.6c0 .6-.4 1-1 1h-9c-.6 0-1-.4-1-1z"/><path d="M5 2.7V6h5.5V2.7M5.5 13.3V9.5h5v3.8"/></svg></button>
+        <button class="model-refresh-btn" onclick="deleteSelectedPreset()" title="Delete preset"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4h11M5.5 4V2.8c0-.4.3-.8.8-.8h3.4c.5 0 .8.4.8.8V4M4.2 4l.6 9.2c0 .5.5.9 1 .9h4.4c.5 0 1-.4 1-.9l.6-9.2M6.5 7v4M9.5 7v4"/></svg></button>
+        <button class="model-refresh-btn" onclick="document.getElementById('stPresetFile').click()" title="Import SillyTavern preset"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 10V2.5M4.8 5.2 8 2l3.2 3.2M2.5 10.5v2c0 .6.4 1 1 1h9c.6 0 1-.4 1-1v-2"/></svg></button>
         <input type="file" id="stPresetFile" accept=".json" style="display:none" onchange="importSTPreset(event)">
       </div>
       <label for="setPersona">Persona</label>
@@ -458,7 +458,7 @@
       <label for="setSyncPassphrase">Sync passphrase</label>
       <div class="model-selector-row sync-passphrase-row">
         <input type="password" id="setSyncPassphrase" autocomplete="off" placeholder="Used only for local encryption and decryption">
-        <button class="model-refresh-btn" type="button" onclick="syncGeneratePassphrase()" title="Generate passphrase" aria-label="Generate sync passphrase">&#9881;</button>
+        <button class="model-refresh-btn" type="button" onclick="syncGeneratePassphrase()" title="Generate passphrase" aria-label="Generate sync passphrase"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="2.5" width="11" height="11" rx="2"/><circle cx="5.6" cy="5.6" r=".9" fill="currentColor" stroke="none"/><circle cx="10.4" cy="5.6" r=".9" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="5.6" cy="10.4" r=".9" fill="currentColor" stroke="none"/><circle cx="10.4" cy="10.4" r=".9" fill="currentColor" stroke="none"/></svg></button>
       </div>
       <div class="debug-status-row">
         <span class="debug-status-pill" id="syncStatus">Not configured</span>
@@ -644,6 +644,6 @@
   </div>
 </div>
 
-<script type="module" src="./js/main.js?v=20260812b"></script>
+<script type="module" src="./js/main.js?v=20260813"></script>
 </body>
 </html>

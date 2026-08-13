@@ -954,6 +954,8 @@ function applyTheme(name) {
   s.setProperty('--accent-text', isLightColor(t.accent) ? '#101014' : '#f7f8ff');
   s.setProperty('--msg-user-text', isLightColor(t.msgUser) ? '#101014' : '#f7f8ff');
   const bgLight = isLightColor(t.bg);
+  // Lets the stylesheet re-skin the (dark-only) highlight.js token colors.
+  document.body.classList.toggle('theme-light', bgLight);
   s.setProperty('--overlay-10', bgLight ? 'rgba(0,0,0,0.1)' : 'rgba(255,255,255,0.1)');
   s.setProperty('--overlay-15', bgLight ? 'rgba(0,0,0,0.15)' : 'rgba(255,255,255,0.15)');
   s.setProperty('--overlay-25', bgLight ? 'rgba(0,0,0,0.25)' : 'rgba(255,255,255,0.25)');
@@ -1675,7 +1677,7 @@ function openSourcesDrawer(msg) {
       if (tb.type === 'url_fetch') {
         const safeUrl = safeHttpUrl(tb.url);
         const displayUrl = escapeHTML((safeUrl || String(tb.url || '')).replace(/^https?:\/\//, '').replace(/\/+$/, ''));
-        html += '<div style="margin:10px 0 6px;font-weight:600;font-size:0.9em">\u{1F310} ' + displayUrl + '</div>';
+        html += '<div style="margin:10px 0 6px;font-weight:600;font-size:0.9em">' + displayUrl + '</div>';
         if (tb.error) {
           html += '<div style="padding:10px;border:1px solid var(--card-border);border-radius:10px;background:var(--hover);margin-bottom:8px;color:var(--error-color,#ff7777);font-size:0.85em">' + escapeHTML(tb.error) + '</div>';
         } else if (tb.content) {
@@ -2515,12 +2517,27 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (window.innerWidth <= 768) {
     document.getElementById('sidebar').classList.add('collapsed');
   }
+  // Keep the sidebar overlay state sane when the viewport crosses the mobile
+  // breakpoint (rotation, window resize): otherwise the sidebar sits open over
+  // the chat with no scrim.
+  window.addEventListener('resize', () => {
+    const sb = document.getElementById('sidebar');
+    const overlay = document.getElementById('sidebarOverlay');
+    if (window.innerWidth <= 768) {
+      if (!sb.classList.contains('collapsed') && !overlay.classList.contains('open')) sb.classList.add('collapsed');
+    } else {
+      overlay.classList.remove('open');
+    }
+  });
 
   // Scroll-to-bottom FAB
   const msgsArea = document.getElementById('messagesArea');
   const scrollFab = document.getElementById('scrollFab');
+  const inputArea = document.querySelector('.input-area');
   msgsArea.addEventListener('scroll', () => {
     const atBottom = msgsArea.scrollHeight - msgsArea.scrollTop - msgsArea.clientHeight < 100;
+    // Anchor above the composer, which changes height as the textarea grows.
+    if (inputArea) scrollFab.style.bottom = (inputArea.offsetHeight + 12) + 'px';
     scrollFab.classList.toggle('visible', !atBottom);
     if (streaming && !_suppressScrollFlag) {
       userScrolledAway = !atBottom;
@@ -2798,10 +2815,12 @@ function renderMarkdown(text) {
   });
 
   const protectedBlocks = [];
+  // Block-level protections get a 'B' marker so newlines around them can be
+  // swallowed before the \n -> <br> pass; inline code ('I') keeps text flow.
   const protectBlock = (block) => {
     const idx = protectedBlocks.length;
     protectedBlocks.push(block);
-    return '\x00BLOCK' + idx + '\x00';
+    return '\x00' + (block.type === 'inline-code' ? 'I' : 'B') + idx + '\x00';
   };
   const restoreProtectedBlock = (_, idx) => {
     const block = protectedBlocks[parseInt(idx, 10)];
@@ -2847,18 +2866,18 @@ function renderMarkdown(text) {
   s = s.replace(/(?<!`)`([^`\n]+)`(?!`)/g, (_, code) =>
     protectBlock({ type: 'inline-code', code })
   );
-  // Block math $$...$$
+  // Block math $$...$$ ('MB' marker: block-level for newline swallowing)
   s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, math) => {
     const idx = mathPlaceholders.length;
     mathPlaceholders.push({ math, display: true });
-    return '\x00MATH' + idx + '\x00';
+    return '\x00MB' + idx + '\x00';
   });
   // Inline math $...$
   s = s.replace(/\$([^\$\n]+?)\$/g, (_, math) => {
     if (!looksLikeInlineMath(math)) return '$' + math + '$';
     const idx = mathPlaceholders.length;
     mathPlaceholders.push({ math, display: false });
-    return '\x00MATH' + idx + '\x00';
+    return '\x00MI' + idx + '\x00';
   });
 
   // Decode HTML entities that models sometimes output before escaping
@@ -2921,17 +2940,28 @@ function renderMarkdown(text) {
     html += '</tbody></table>';
     return protectBlock({ type: 'html', html });
   });
+  // Block elements carry their own margins; newlines around them must not
+  // also become <br>s or headings/lists/code/tables get double-spaced gaps.
+  s = s.replace(/<\/blockquote>\n<blockquote>/g, '<br>');
+  s = s.replace(/\n+(\x00(?:B|MB)\d+\x00)/g, '$1');
+  s = s.replace(/(\x00(?:B|MB)\d+\x00)\n+/g, '$1');
+  s = s.replace(/\n+(?=<(?:h[1-4]|ul|ol|blockquote|hr|table)\b)/g, '');
+  s = s.replace(/(<\/(?:h[1-4]|ul|ol|blockquote|table)>|<hr>)\n+/g, '$1');
   s = s.replace(/\n/g, '<br>');
 
   // Restore KaTeX math placeholders
-  s = s.replace(/\x00MATH(\d+)\x00/g, (_, idx) => {
+  s = s.replace(/\x00M[BI](\d+)\x00/g, (_, idx) => {
     const ph = mathPlaceholders[parseInt(idx)];
     if (typeof katex !== 'undefined') {
       try { return katex.renderToString(ph.math, { displayMode: ph.display, throwOnError: false }); } catch(e) { console.warn('KaTeX render error:', e); }
     }
     return (ph.display ? '$$' : '$') + ph.math.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + (ph.display ? '$$' : '$');
   });
-  s = s.replace(/\x00BLOCK(\d+)\x00/g, restoreProtectedBlock);
+  // Loop: restored blocks (e.g. tables) can contain inline-code placeholders
+  // from their cells, so keep restoring until none remain.
+  for (let pass = 0; pass < 5 && /\x00[BI]\d+\x00/.test(s); pass++) {
+    s = s.replace(/\x00[BI](\d+)\x00/g, restoreProtectedBlock);
+  }
 
   return s;
 }
@@ -3356,7 +3386,7 @@ async function updateTokenInfo() {
   const parts = [];
   if (inputChars > 0) {
     const inputTokens = estimateTokens(inputText);
-    parts.push(inputChars + ' chars');
+    parts.push(inputChars + (inputChars === 1 ? ' char' : ' chars'));
     parts.push('~' + (inputTokens > 999 ? (inputTokens / 1000).toFixed(1) + 'k' : inputTokens) + ' tokens');
   }
 
@@ -4374,6 +4404,17 @@ async function addProjectFiles(event) {
   if (skipped) showToast(skipped + ' file(s) skipped — no readable text (images can’t be project files).');
 }
 
+// Inline SVG icons for conversation-row controls: consistent stroke glyphs
+// instead of platform emoji (which render colored and mismatched).
+const CONV_ICONS = {
+  pin: '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.3 1.8 14.2 6.7l-2.9.7-1.2 4.1L4.5 6l4.1-1.2z"/><path d="M6.2 9.8 2.2 13.8"/></svg>',
+  tag: '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 2.5h5.2L13.8 8.6a1 1 0 0 1 0 1.4l-3.8 3.8a1 1 0 0 1-1.4 0L2.5 7.7z"/><circle cx="5.6" cy="5.6" r="1" fill="currentColor" stroke="none"/></svg>',
+  folder: '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 4.2c0-.6.4-1 1-1h3l1.5 1.9h5.5c.6 0 1 .4 1 1v6.2c0 .6-.4 1-1 1H3c-.6 0-1-.4-1-1z"/></svg>',
+  archive: '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.5" width="12" height="3" rx=".5"/><path d="M3.5 5.5v6.5c0 .6.4 1 1 1h7c.6 0 1-.4 1-1V5.5M6.5 8.2h3"/></svg>',
+  restore: '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.5" width="12" height="3" rx=".5"/><path d="M3.5 5.5v6.5c0 .6.4 1 1 1h7c.6 0 1-.4 1-1V5.5M8 11V7.2M6.3 8.9 8 7.2l1.7 1.7"/></svg>',
+  duplicate: '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M2.5 10.5v-7c0-.6.4-1 1-1h7"/></svg>'
+};
+
 function renderSidebar() {
   const list = document.getElementById('convList');
   list.innerHTML = '';
@@ -4492,7 +4533,7 @@ function renderSidebar() {
 
     const pinBtn = document.createElement('button');
     pinBtn.className = 'conv-pin' + (c.pinned ? ' pinned' : '');
-    pinBtn.innerHTML = '&#128204;';
+    pinBtn.innerHTML = CONV_ICONS.pin;
     pinBtn.title = c.pinned ? 'Unpin' : 'Pin';
     pinBtn.setAttribute('aria-label', c.pinned ? 'Unpin conversation' : 'Pin conversation');
     pinBtn.onclick = (e) => {
@@ -4574,30 +4615,28 @@ function renderSidebar() {
     }
     const tagBtn = document.createElement('button');
     tagBtn.className = 'conv-delete';
-    tagBtn.innerHTML = '&#127991;';
+    tagBtn.innerHTML = CONV_ICONS.tag;
     tagBtn.title = 'Tag';
-    tagBtn.style.fontSize = '12px';
     tagBtn.setAttribute('aria-label', 'Tag conversation');
     tagBtn.onclick = (e) => { e.stopPropagation(); showTagPicker(c, tagBtn); };
     div.appendChild(tagBtn);
     const projBtn = document.createElement('button');
     projBtn.className = 'conv-delete';
-    projBtn.innerHTML = '&#128193;';
+    projBtn.innerHTML = CONV_ICONS.folder;
     projBtn.title = 'Project';
-    projBtn.style.fontSize = '12px';
     projBtn.setAttribute('aria-label', 'Move conversation to a project');
     projBtn.onclick = (e) => { e.stopPropagation(); showProjectPicker(c, projBtn); };
     div.appendChild(projBtn);
     const archiveBtn = document.createElement('button');
     archiveBtn.className = 'conv-delete conv-archive';
-    archiveBtn.textContent = c.archivedAt ? '\u21A9' : '\u21E7';
+    archiveBtn.innerHTML = c.archivedAt ? CONV_ICONS.restore : CONV_ICONS.archive;
     archiveBtn.title = c.archivedAt ? 'Restore conversation' : 'Archive conversation';
     archiveBtn.setAttribute('aria-label', archiveBtn.title);
     archiveBtn.onclick = e => { e.stopPropagation(); archiveConversation(c.id); };
     div.appendChild(archiveBtn);
     const duplicateBtn = document.createElement('button');
     duplicateBtn.className = 'conv-delete conv-duplicate';
-    duplicateBtn.textContent = '\u2398';
+    duplicateBtn.innerHTML = CONV_ICONS.duplicate;
     duplicateBtn.title = 'Duplicate conversation';
     duplicateBtn.setAttribute('aria-label', 'Duplicate conversation');
     duplicateBtn.onclick = e => { e.stopPropagation(); duplicateConversation(c.id); };
@@ -5557,12 +5596,12 @@ function renderPromptEntries() {
     nameInput.oninput = () => updatePromptEntry(entry.id, 'name', nameInput.value);
 
     const expandBtn = document.createElement('button');
-    expandBtn.textContent = '▼';
+    expandBtn.textContent = '▾';
     expandBtn.title = 'Expand/collapse';
     expandBtn.onclick = () => {
       const body = div.querySelector('.prompt-entry-body');
       body.classList.toggle('open');
-      expandBtn.textContent = body.classList.contains('open') ? '▲' : '▼';
+      expandBtn.textContent = body.classList.contains('open') ? '▴' : '▾';
     };
 
     const delBtn = document.createElement('button');
@@ -6116,14 +6155,14 @@ function renderMessages() {
       const branchDiv = document.createElement('div');
       branchDiv.className = 'branch-controls has-branches';
       const bPrev = document.createElement('button');
-      bPrev.textContent = '\u25C0';
+      bPrev.textContent = '\u25C0\uFE0E';
       bPrev.disabled = msg.branchIndex <= 0;
       bPrev.onclick = () => switchBranch(idx, -1);
       bPrev.setAttribute('aria-label', 'Previous branch');
       const bCounter = document.createElement('span');
       bCounter.textContent = (msg.branchIndex + 1) + '/' + msg.branches.length;
       const bNext = document.createElement('button');
-      bNext.textContent = '\u25B6';
+      bNext.textContent = '\u25B6\uFE0E';
       bNext.disabled = msg.branchIndex >= msg.branches.length - 1;
       bNext.onclick = () => switchBranch(idx, 1);
       bNext.setAttribute('aria-label', 'Next branch');
@@ -6153,14 +6192,14 @@ function renderMessages() {
       const swipeDiv = document.createElement('div');
       swipeDiv.className = 'swipe-controls' + (msg.swipes && msg.swipes.length > 1 ? ' has-swipes' : '');
       const prev = document.createElement('button');
-      prev.textContent = '\u25C0';
+      prev.textContent = '\u25C0\uFE0E';
       prev.disabled = !msg.swipes || msg.swipeIndex <= 0;
       prev.onclick = () => swipeMsg(idx, -1);
       prev.setAttribute('aria-label', 'Previous swipe');
       const counter = document.createElement('span');
       counter.textContent = msg.swipes ? (msg.swipeIndex + 1) + '/' + msg.swipes.length : '1/1';
       const next = document.createElement('button');
-      next.textContent = '\u25B6';
+      next.textContent = '\u25B6\uFE0E';
       next.disabled = !msg.swipes || msg.swipeIndex >= msg.swipes.length - 1;
       next.onclick = () => swipeMsg(idx, 1);
       next.setAttribute('aria-label', 'Next swipe');
@@ -6418,7 +6457,7 @@ function renderThinkingHTML(text) {
   const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return '<div class="thinking-block">' +
     '<div class="thinking-header" onclick="this.nextElementSibling.classList.toggle(\'open\');this.querySelector(\'.thinking-arrow\').textContent=this.nextElementSibling.classList.contains(\'open\')?\'\u25BE\':\'\u25B8\'">' +
-    '\uD83D\uDCAD Thinking <span class="thinking-arrow">\u25B8</span></div>' +
+    '<span class="thinking-arrow">\u25B8</span> Thinking</div>' +
     '<div class="thinking-content">' + escaped + '</div></div>';
 }
 
@@ -6450,15 +6489,15 @@ function renderToolBlocksHTML(toolBlocks) {
       const safeUrl = safeHttpUrl(tb.url);
       const displayUrl = escapeHTML((safeUrl || String(tb.url || '')).replace(/^https?:\/\//, '').replace(/\/+$/, ''));
       if (tb.searching) {
-        return '<div class="tool-use-block" role="status" aria-live="polite"><div class="tool-use-header">\u{1F310} Reading ' + displayUrl + '\u2026</div></div>';
+        return '<div class="tool-use-block" role="status" aria-live="polite"><div class="tool-use-header">Reading ' + displayUrl + '\u2026</div></div>';
       }
       if (tb.error) {
-        return '<div class="tool-use-block" role="status" aria-live="polite"><div class="tool-use-header">\u{1F310} ' + displayUrl + ' \u00B7 <span style="color:var(--error-color,#ff7777)">' + escapeHTML(tb.error) + '</span></div></div>';
+        return '<div class="tool-use-block" role="status" aria-live="polite"><div class="tool-use-header">' + displayUrl + ' \u00B7 <span style="color:var(--error-color,#ff7777)">' + escapeHTML(tb.error) + '</span></div></div>';
       }
       const charCount = (tb.content || '').length;
       const preview = escapeHTML((tb.content || '').slice(0, 300));
       return '<details class="tool-use-block" aria-label="URL fetch result">' +
-        '<summary class="tool-use-header">\u{1F310} Fetched ' + displayUrl + ' \u00B7 ' + charCount.toLocaleString() + ' chars</summary>' +
+        '<summary class="tool-use-header">Fetched ' + displayUrl + ' \u00B7 ' + charCount.toLocaleString() + ' chars</summary>' +
         '<div class="tool-use-results"><div class="tool-result-snippet" style="max-height:200px;overflow-y:auto;white-space:pre-wrap;font-size:0.8em;padding:8px">' + preview + (charCount > 300 ? '\u2026' : '') + '</div></div></details>';
     }
     // --- web_search blocks (default) ---
@@ -6466,11 +6505,11 @@ function renderToolBlocksHTML(toolBlocks) {
     const results = tb.results || [];
     const searching = tb.searching;
     if (searching) {
-      return '<div class="tool-use-block" role="status" aria-live="polite"><div class="tool-use-header">\u{1F50D} Searching\u2026</div></div>';
+      return '<div class="tool-use-block" role="status" aria-live="polite"><div class="tool-use-header">Searching\u2026</div></div>';
     }
     const escapedQuery = escapeHTML(query);
     if (tb.error) {
-      return '<div class="tool-use-block" role="status" aria-live="polite"><div class="tool-use-header">\u{1F50D} Searched "' + escapedQuery + '" \u00B7 <span style="color:var(--error-color,#ff7777)">' + escapeHTML(tb.error) + '</span></div></div>';
+      return '<div class="tool-use-block" role="status" aria-live="polite"><div class="tool-use-header">Searched "' + escapedQuery + '" \u00B7 <span style="color:var(--error-color,#ff7777)">' + escapeHTML(tb.error) + '</span></div></div>';
     }
     const count = results.length;
     const resultsHTML = results.map(r => {
@@ -6489,7 +6528,7 @@ function renderToolBlocksHTML(toolBlocks) {
         (displayUrl ? '<span class="tool-result-url">' + escapeHTML(displayUrl) + '</span>' : '') +
         snippetHtml + '</div>';
     }).join('');
-    const headerText = '\u{1F50D} Searched "' + escapedQuery + '" \u00B7 ' + count + ' result' + (count !== 1 ? 's' : '');
+    const headerText = 'Searched "' + escapedQuery + '" \u00B7 ' + count + ' result' + (count !== 1 ? 's' : '');
     return '<details class="tool-use-block" aria-label="Web search results">' +
       '<summary class="tool-use-header">' + headerText + '</summary>' +
       '<div class="tool-use-results">' + resultsHTML + '</div></details>';
@@ -9999,7 +10038,10 @@ function enterSelectMode() {
   _justEnteredSelectMode = true;
   _selectedMsgs.clear();
   document.getElementById('messagesArea').classList.add('select-mode');
-  document.getElementById('selectToolbar').classList.add('visible');
+  const selectToolbar = document.getElementById('selectToolbar');
+  const inputArea = document.querySelector('.input-area');
+  if (inputArea) selectToolbar.style.bottom = (inputArea.offsetHeight + 16) + 'px';
+  selectToolbar.classList.add('visible');
   updateSelectCount();
 }
 
@@ -10149,7 +10191,10 @@ function performGlobalSearch(query) {
   const lq = query.toLowerCase();
   conversations.forEach(conv => {
     conv.messages.forEach((msg) => {
-      const text = typeof msg.content === 'string' ? msg.content : (Array.isArray(msg.content) ? msg.content.filter(p => p.type === 'text').map(p => p.text).join(' ') : '');
+      const raw = typeof msg.content === 'string' ? msg.content : (Array.isArray(msg.content) ? msg.content.filter(p => p.type === 'text').map(p => p.text).join(' ') : '');
+      // Search visible text only; hidden reasoning would surface unopenable hits
+      // and leak raw <think> markup into snippets.
+      const text = raw.includes('<think') ? stripThinkTags(raw).content : raw;
       const idx = text.toLowerCase().indexOf(lq);
       if (idx !== -1) {
         const start = Math.max(0, idx - 40);

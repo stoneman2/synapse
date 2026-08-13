@@ -74,6 +74,25 @@ body {
   transition: background 0.2s;
 }
 .sidebar-header button:hover { background: var(--accent-hover); }
+/* Icon utilities: one accent button per row; icon buttons stay quiet. */
+.sidebar-header .sidebar-icon-btn {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--hover);
+  color: var(--text-secondary);
+  border: 1px solid var(--card-border);
+}
+.sidebar-header .sidebar-icon-btn:hover { background: var(--overlay-10); color: var(--text-primary); }
+svg.icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: block;
+  pointer-events: none;
+}
+.conv-item svg.icon { width: 13px; height: 13px; }
 
 .sidebar-search {
   padding: 8px 8px 0;
@@ -295,6 +314,7 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 4px;
   margin-bottom: 2px;
 }
 .conv-item:hover { background: var(--hover); }
@@ -319,6 +339,8 @@ body {
 }
 .conv-item .conv-delete {
   display: none;
+  align-items: center;
+  justify-content: center;
   background: none;
   border: none;
   color: var(--text-secondary);
@@ -327,7 +349,7 @@ body {
   padding: 0 4px;
   flex-shrink: 0;
 }
-.conv-item:hover .conv-delete { display: block; }
+.conv-item:hover .conv-delete { display: flex; }
 .conv-item .conv-delete:hover { color: var(--danger-color); }
 
 /* Main Area */
@@ -373,54 +395,6 @@ body {
   font-weight: 600;
 }
 .toolbar-right { display: flex; align-items: center; gap: 8px; }
-.sync-indicator {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  height: 32px;
-  padding-left: 9px;
-  border: 1px solid var(--card-border);
-  border-radius: 8px;
-  color: var(--text-secondary);
-  background: var(--hover);
-  font-size: 0.72em;
-  font-weight: 600;
-}
-.sync-indicator[hidden] { display: none; }
-.sync-indicator-dot {
-  width: 7px;
-  height: 7px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: var(--text-secondary);
-}
-.sync-indicator.current .sync-indicator-dot { background: var(--success-color); }
-.sync-indicator.checking .sync-indicator-dot { background: var(--accent); }
-.sync-indicator.dirty .sync-indicator-dot,
-.sync-indicator.offline .sync-indicator-dot,
-.sync-indicator.paused .sync-indicator-dot { background: var(--warning-color); }
-.sync-indicator-text {
-  max-width: 150px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.sync-quick-button {
-  width: 32px;
-  height: 30px;
-  padding: 0;
-  border: 0;
-  border-left: 1px solid var(--card-border);
-  border-radius: 0 7px 7px 0;
-  color: var(--text-secondary);
-  background: transparent;
-  font: inherit;
-  font-size: 16px;
-  cursor: pointer;
-}
-.sync-quick-button:hover:not(:disabled) { color: var(--text-primary); background: var(--overlay-10); }
-.sync-quick-button:disabled { cursor: wait; opacity: 0.6; }
 .toolbar-btn {
   background: none;
   border: none;
@@ -885,7 +859,6 @@ body {
   overflow-x: auto;
 }
 .settings-tab {
-  flex: 0 0 auto;
   padding: 8px 14px;
   font-family: inherit;
   font-size: 0.8em;
@@ -951,49 +924,6 @@ body {
   width: 100%;
   margin-bottom: 10px;
 }
-.sync-device-label {
-  margin: -2px 0 10px;
-  color: var(--text-secondary);
-  font-size: 0.78em;
-}
-.sync-review-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 12px;
-  padding: 8px 10px;
-  border: 1px solid color-mix(in srgb, var(--warning-color) 40%, var(--card-border));
-  border-radius: 8px;
-  color: var(--warning-color);
-  font-size: 0.8em;
-  font-weight: 600;
-}
-.sync-review-row[hidden] { display: none; }
-.sync-review-popup { width: min(560px, calc(100vw - 32px)); }
-.sync-review-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  max-height: min(55vh, 440px);
-  margin-bottom: 12px;
-  overflow-y: auto;
-}
-.sync-review-item {
-  padding: 9px 10px;
-  border: 1px solid var(--card-border);
-  border-radius: 8px;
-  background: var(--hover);
-}
-.sync-review-label {
-  margin-bottom: 8px;
-  color: var(--text-primary);
-  font-size: 0.82em;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
-}
-.sync-review-choices { display: flex; flex-wrap: wrap; gap: 6px; }
-.sync-review-choices .btn { padding: 6px 9px; font-size: 0.75em; }
 
 /* Theme color pickers */
 .theme-colors {
@@ -1037,8 +967,17 @@ body {
   .code-block-wrapper .code-copy-btn { opacity: 1; }
   .code-block-wrapper .code-download-btn { opacity: 1; }
   .code-block-wrapper .code-preview-btn { opacity: 1; }
-  .conv-item .conv-delete { display: block; }
+  /* Only the open conversation shows its row actions; otherwise every row
+     becomes a strip of buttons and titles get crushed to nothing. The active
+     row wraps so the title keeps its own line above the actions. */
+  .conv-item.active { flex-wrap: wrap; }
+  .conv-item.active .conv-title { flex: 1 1 55%; }
+  .conv-item.active .conv-delete { display: flex; }
+  .conv-item.active .conv-pin { display: flex; }
 }
+/* Keyboard access to row actions */
+.conv-item:focus-within .conv-delete,
+.conv-item:focus-within .conv-pin { display: flex; }
 
 /* Responsive */
 @media (max-width: 768px) {
@@ -1047,7 +986,7 @@ body {
   .sidebar-header button { min-height: 44px; }
   .global-search-btn { min-height: 44px; }
   .conv-item { min-height: 44px; }
-  .settings-tab { min-height: 40px; padding-left: 6px; padding-right: 6px; font-size: 0.7em; }
+  .settings-tab { min-height: 40px; }
   .sync-actions { flex-direction: column; }
   .sync-pairing-output { grid-template-columns: 1fr; }
   .sync-pairing-output canvas { justify-self: center; width: 160px; height: 160px; }
@@ -1055,8 +994,6 @@ body {
   .msg-wrapper.user, .msg-wrapper.assistant { max-width: 95% !important; }
   .msg-avatar { width: 26px; height: 26px; margin-right: 6px; }
   .toolbar-title { font-size: 0.85em; }
-  .sync-indicator-text { display: none; }
-  .sync-indicator { padding-left: 8px; gap: 5px; }
   .input-area { padding: 8px 12px 12px; }
   .messages-area { padding: 12px; }
   .sidebar-overlay.open { display: block; }
@@ -1066,6 +1003,11 @@ body {
   .toolbar-btn { padding: 10px; min-width: 44px; min-height: 44px; display: flex; align-items: center; justify-content: center; }
   .toolbar-toggle { min-width: 44px; min-height: 44px; display: flex; align-items: center; justify-content: center; }
   .input-btn { min-width: 44px; min-height: 44px; display: flex; align-items: center; justify-content: center; }
+  /* Two-row composer: full-width textarea above, controls beneath. Five
+     fixed-width controls beside the field left it ~60px of typing room. */
+  .input-row { flex-wrap: wrap; }
+  .input-row textarea { flex: 1 1 100%; order: -1; }
+  .send-btn { margin-left: auto; }
   .img-thumb .remove-thumb { width: 28px; height: 28px; font-size: 14px; top: -4px; right: -4px; }
   .file-thumb .remove-thumb { width: 28px; height: 28px; font-size: 14px; top: -4px; right: -4px; }
   .msg-action-btn { padding: 8px 12px; font-size: 0.8em; min-height: 36px; }
@@ -1075,8 +1017,8 @@ body {
   /* Touch padding widens these buttons, so re-space them to stop the row overlapping. */
   .code-download-btn { padding: 8px 10px; font-size: 0.8em; min-height: 36px; right: 78px; }
   .code-preview-btn { padding: 8px 10px; font-size: 0.8em; min-height: 36px; right: 122px; }
-  .conv-item .conv-delete { padding: 8px; min-width: 36px; min-height: 36px; display: flex; align-items: center; justify-content: center; }
-  .conv-pin, .conv-item .conv-delete { min-width: 44px; min-height: 44px; }
+  /* Touch sizing only; visibility stays with the hover/active rules. */
+  .conv-pin, .conv-item .conv-delete { padding: 8px; min-width: 40px; min-height: 40px; }
   .input-row textarea, .modal input, .modal textarea, .modal select, .sidebar-search input, .chat-search-bar input, .msg-edit-textarea { font-size: 16px; }
   .msg-edit-textarea { min-height: 40vh; }
 }
@@ -1151,8 +1093,8 @@ body {
   max-height: none;
 }
 
-/* Settings toggle row */
-.toggle-row {
+/* Settings toggle row. label.toggle-row so it outranks the `.modal label` block rule. */
+label.toggle-row {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1166,11 +1108,14 @@ body {
   margin: 0;
   padding: 0;
   cursor: pointer;
+  accent-color: var(--accent);
+  flex-shrink: 0;
 }
 .toggle-hint {
   color: var(--text-secondary);
   font-size: 0.8em;
   margin-left: auto;
+  text-align: right;
 }
 .setting-hint {
   color: var(--text-secondary);
@@ -1255,9 +1200,6 @@ body.share-view .main { margin-left: 0; }
 .debug-status-pill.current { color: var(--success-color); border-color: color-mix(in srgb, var(--success-color) 45%, transparent); }
 .debug-status-pill.unknown { color: var(--warning-color); border-color: color-mix(in srgb, var(--warning-color) 45%, transparent); }
 .debug-status-pill.checking { color: var(--text-primary); }
-.debug-status-pill.dirty,
-.debug-status-pill.offline,
-.debug-status-pill.paused { color: var(--warning-color); border-color: color-mix(in srgb, var(--warning-color) 45%, transparent); }
 .debug-inline-btn {
   flex: 0 0 auto !important;
   padding: 7px 12px !important;
@@ -1430,10 +1372,12 @@ body.share-view .main { margin-left: 0; }
 .thinking-content { display: none; padding: 4px 12px 8px; border-top: 1px solid var(--card-border); white-space: pre-wrap; color: var(--text-secondary); max-height: 300px; overflow-y: auto; }
 .thinking-content.open { display: block; }
 
-/* Line numbers in code blocks */
-.code-line { counter-increment: code-line; display: block; }
+/* Line numbers in code blocks. The spans are display:block, so the \n text nodes
+   between them must not render as extra blank lines: the pre drops to normal
+   white-space while each line keeps pre-wrap for its own indentation. */
+.code-line { counter-increment: code-line; display: block; white-space: pre-wrap; }
 .code-line::before { content: counter(code-line); display: inline-block; width: 2.5em; margin-right: 0.8em; text-align: right; color: var(--text-secondary); opacity: 0.4; user-select: none; -webkit-user-select: none; font-size: 0.85em; }
-pre.has-line-numbers { counter-reset: code-line; }
+pre.has-line-numbers { counter-reset: code-line; white-space: normal; }
 
 /* Code download button */
 .code-download-btn {
@@ -1476,7 +1420,7 @@ pre.has-line-numbers { counter-reset: code-line; }
   width: 100%;
   height: 420px;
   margin-top: 8px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--card-border);
   border-radius: 8px;
   /* Explicit white: artifacts assume a page background and vanish on dark themes. */
   background: #fff;
@@ -1488,27 +1432,22 @@ pre.has-line-numbers { counter-reset: code-line; }
 .mermaid-container { margin: 6px 0; overflow-x: auto; }
 .mermaid-container svg { max-width: 100%; }
 
-/* Emotion sprites */
-.emotion-sprite-wrap {
-  display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  line-height: 0;
-  margin: 6px 0;
-}
-.emotion-sprite {
-  display: block;
-  width: 128px;
-  height: 128px;
-  max-width: min(128px, 100%);
-  max-height: 128px;
-  object-fit: contain;
-}
+/* Light-theme syntax colors (Atom One Light). The CDN stylesheet is dark-only;
+   applyTheme() toggles body.theme-light when the background is light. */
+body.theme-light .hljs { color: #383a42; background: transparent; }
+body.theme-light .hljs-comment, body.theme-light .hljs-quote { color: #a0a1a7; font-style: italic; }
+body.theme-light .hljs-doctag, body.theme-light .hljs-keyword, body.theme-light .hljs-formula { color: #a626a4; }
+body.theme-light .hljs-section, body.theme-light .hljs-name, body.theme-light .hljs-selector-tag, body.theme-light .hljs-deletion, body.theme-light .hljs-subst { color: #e45649; }
+body.theme-light .hljs-literal { color: #0184bb; }
+body.theme-light .hljs-string, body.theme-light .hljs-regexp, body.theme-light .hljs-addition, body.theme-light .hljs-attribute, body.theme-light .hljs-meta .hljs-string { color: #50a14f; }
+body.theme-light .hljs-built_in, body.theme-light .hljs-class .hljs-title, body.theme-light .hljs-title.class_ { color: #c18401; }
+body.theme-light .hljs-attr, body.theme-light .hljs-variable, body.theme-light .hljs-template-variable, body.theme-light .hljs-type, body.theme-light .hljs-selector-class, body.theme-light .hljs-selector-attr, body.theme-light .hljs-selector-pseudo, body.theme-light .hljs-number { color: #986801; }
+body.theme-light .hljs-symbol, body.theme-light .hljs-bullet, body.theme-light .hljs-link, body.theme-light .hljs-meta, body.theme-light .hljs-selector-id, body.theme-light .hljs-title { color: #4078f2; }
 
 /* Pin button on conversations */
-.conv-pin { display: none; background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 12px; padding: 0 4px; flex-shrink: 0; opacity: 0.6; }
-.conv-item:hover .conv-pin { display: block; }
-.conv-pin.pinned { display: block; opacity: 1; color: var(--accent); }
+.conv-pin { display: none; align-items: center; justify-content: center; background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 12px; padding: 0 4px; flex-shrink: 0; opacity: 0.6; }
+.conv-item:hover .conv-pin { display: flex; }
+.conv-pin.pinned { display: flex; opacity: 1; color: var(--accent); }
 .conv-pin:hover { opacity: 1; }
 
 /* Date group headers */
@@ -1632,7 +1571,7 @@ pre.has-line-numbers { counter-reset: code-line; }
 
 @media (hover: none) {
   .scroll-fab { width: 44px; height: 44px; }
-  .conv-pin { display: block; }
+  .conv-item.active .conv-pin { display: block; }
   .branch-controls button { padding: 8px 14px; min-height: 36px; }
 }
 
@@ -1723,23 +1662,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 
 /* Synapse workbench controls */
+/* Screen-reader announcer only. Toasts handle visible feedback; a floating pill
+   here would sit over the composer and never clear. */
 .live-status {
-  position: fixed;
-  left: 50%;
-  bottom: 12px;
-  transform: translateX(-50%);
-  z-index: 1200;
-  max-width: min(520px, calc(100vw - 24px));
-  padding: 6px 12px;
-  border: 1px solid var(--card-border);
-  border-radius: 999px;
-  background: var(--sidebar-bg);
-  color: var(--text-secondary);
-  font-size: 0.78em;
-  pointer-events: none;
-  box-shadow: 0 4px 18px rgba(0,0,0,.22);
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
-.live-status:empty { display: none; }
 .sidebar-nav { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 .sidebar-organization { padding: 8px 12px 4px; border-bottom: 1px solid var(--card-border); }
 .sidebar-view-row { display: flex; gap: 4px; }
@@ -1853,13 +1788,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .data-actions .btn { padding: 8px; font-size: .8em; text-align: left; }
 .key-storage-row { display: flex; align-items: center; flex-wrap: wrap; gap: 7px 12px; margin: 8px 0; color: var(--text-secondary); font-size: .78em; }
 .key-storage-row .settings-label { flex-basis: 100%; color: var(--text-primary); font-weight: 600; }
-.key-storage-row label { display: inline-flex; align-items: center; gap: 5px; }
+.key-storage-row label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+/* Undo the broad `.modal input` sizing so radios stay compact. */
+.key-storage-row input[type="radio"] { width: auto; margin: 0; accent-color: var(--accent); }
 .connection-test-row { display: flex; align-items: center; gap: 8px; margin: 8px 0 12px; }
 .connection-test-row .btn { padding: 7px 10px; font-size: .78em; }
 .connection-status { min-height: 1.2em; color: var(--text-secondary); font-size: .75em; }
 .connection-status.testing { color: var(--accent); }
 .connection-status.success { color: var(--success-color, #4ade80); }
 .connection-status.error { color: var(--danger-color); }
+.modal .import-actions { display: grid; grid-template-columns: 1fr 1fr; }
 .import-preview-body { display: grid; gap: 7px; max-height: 55vh; overflow-y: auto; }
 .import-preview-body p { color: var(--text-secondary); font-size: .82em; line-height: 1.4; }
 .import-preview-row { display: flex; justify-content: space-between; padding: 8px 10px; border: 1px solid var(--card-border); border-radius: 7px; background: var(--hover); color: var(--text-secondary); font-size: .82em; }
