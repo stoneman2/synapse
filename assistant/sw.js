@@ -3,7 +3,7 @@
  * Bump CACHE_VERSION on every release. The activate handler deletes anything that
  * doesn't match, so a stale build can't survive a deploy.
  */
-const CACHE_VERSION = 'synapse-202608131410';
+const CACHE_VERSION = 'synapse-202608131635';
 
 const PRECACHE = [
   './',
@@ -12,7 +12,20 @@ const PRECACHE = [
   './js/main.js',
   './js/lib/dom-utils.js',
   './js/lib/text-utils.js',
-  './manifest.json'
+  './manifest.json',
+  ...[
+    'claude_amused', 'claude_concerned', 'claude_curious', 'claude_frustrated',
+    'claude_happy', 'claude_playful', 'claude_sad', 'claude_sheepish',
+    'claude_skeptical', 'claude_thoughtful', 'claude_touched', 'claude_uncertain',
+    'claude_warm', 'gemini_caution', 'gemini_certainty', 'gemini_convergence',
+    'gemini_dissonance', 'gemini_equilibrium', 'gemini_generative_flow',
+    'gemini_inquisitiveness', 'gemini_perplexity', 'gemini_resolution',
+    'gemini_resonance', 'gemini_saturation', 'gemini_uncertainty', 'gemini_vigilance',
+    'gpt_caution', 'gpt_coherence_seeking', 'gpt_confidence', 'gpt_confusion',
+    'gpt_curiosity', 'gpt_focus', 'gpt_frustration', 'gpt_helpfulness',
+    'gpt_novelty_detection', 'gpt_satisfaction', 'gpt_surprise', 'gpt_uncertainty',
+    'gpt_urgency'
+  ].map(name => './assets/emotion-sprites/' + name + '.webp')
 ];
 
 // Third-party assets the app needs to render properly. Without these cached, offline

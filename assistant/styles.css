@@ -1432,6 +1432,23 @@ pre.has-line-numbers { counter-reset: code-line; white-space: normal; }
 .mermaid-container { margin: 6px 0; overflow-x: auto; }
 .mermaid-container svg { max-width: 100%; }
 
+/* Emotion sprites */
+.emotion-sprite-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  line-height: 0;
+  margin: 6px 0;
+}
+.emotion-sprite {
+  display: block;
+  width: 128px;
+  height: 128px;
+  max-width: min(128px, 100%);
+  max-height: 128px;
+  object-fit: contain;
+}
+
 /* Light-theme syntax colors (Atom One Light). The CDN stylesheet is dark-only;
    applyTheme() toggles body.theme-light when the background is light. */
 body.theme-light .hljs { color: #383a42; background: transparent; }

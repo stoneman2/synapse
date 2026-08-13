@@ -41,7 +41,7 @@ let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-08-13T14:10:00+08:00',
+  buildDate: '2026-08-13T16:35:07+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -56,6 +56,7 @@ const SYNC_SETTINGS_KEYS = [
   'llmExtraParams', 'llmExcludeParams', 'llmPrefill', 'llmPersona',
   'llmEnableStMacros', 'llmRpUserName', 'llmInputCost', 'llmOutputCost',
   'llmWebSearch', 'llmForceSearch', 'llmMemoryEnabled', 'llmHoldScreenshot',
+  'llmEmotionSprites', 'llmEmotionSpriteSet',
   'llmCacheEnabled', 'llmPromptEntries', 'assistantPresets', 'assistantProfiles', 'assistantTheme',
   'assistantCustomTheme', 'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth',
   'llmContextWindow', 'llmUrlFetch', 'llmToolConfirm'
@@ -164,6 +165,48 @@ const TAG_COLORS = [
   { name: 'Pink', color: '#ec4899' },
   { name: 'Teal', color: '#14b8a6' }
 ];
+
+const EMOTION_SPRITE_ASSET_PATH = './assets/emotion-sprites/';
+const EMOTION_SPRITE_ASSET_URLS = {};
+const EMOTION_SPRITE_SETS = {
+  claude: ['amused', 'concerned', 'curious', 'frustrated', 'happy', 'playful', 'sad', 'sheepish', 'skeptical', 'thoughtful', 'touched', 'uncertain', 'warm'],
+  gpt: ['caution', 'coherence_seeking', 'confidence', 'confusion', 'curiosity', 'focus', 'frustration', 'helpfulness', 'novelty_detection', 'satisfaction', 'surprise', 'uncertainty', 'urgency'],
+  gemini: ['caution', 'certainty', 'convergence', 'dissonance', 'equilibrium', 'generative_flow', 'inquisitiveness', 'perplexity', 'resolution', 'resonance', 'saturation', 'uncertainty', 'vigilance']
+};
+const EMOTION_SPRITE_NAMES = Object.fromEntries(Object.entries(EMOTION_SPRITE_SETS).flatMap(([prefix, emotions]) => emotions.map(emotion => [prefix + '_' + emotion, prefix])));
+const EMOTION_SPRITE_TAG_RE = new RegExp('<[\\s\\u200B\\u200C\\u200D\\uFEFF]*(' + Object.keys(EMOTION_SPRITE_NAMES).join('|') + ')[\\s\\u200B\\u200C\\u200D\\uFEFF]*(?:/[\\s\\u200B\\u200C\\u200D\\uFEFF]*)?>', 'g');
+
+function areEmotionSpritesEnabled() {
+  return localStorage.getItem('llmEmotionSprites') === 'true';
+}
+
+function getEmotionSpriteSet() {
+  const selected = localStorage.getItem('llmEmotionSpriteSet') || 'auto';
+  return selected === 'claude' || selected === 'gpt' || selected === 'gemini' ? selected : 'auto';
+}
+
+function getEmotionSpritePrefix() {
+  const selected = getEmotionSpriteSet();
+  if (selected !== 'auto') return selected;
+  const model = localStorage.getItem('llmModel') || '';
+  const modelText = model.toLowerCase();
+  if (/claude|anthropic/.test(modelText)) return 'claude';
+  if (/gemini|palm/.test(modelText)) return 'gemini';
+  const provider = getLlmProviderInfo(model, detectApiFormat(model), localStorage.getItem('llmProxyUrl') || '');
+  if (/claude|anthropic/.test(provider.name)) return 'claude';
+  if (provider.name === 'Gemini') return 'gemini';
+  return 'gpt';
+}
+
+function buildEmotionSpriteInstructions() {
+  const prefix = getEmotionSpritePrefix();
+  const tags = EMOTION_SPRITE_SETS[prefix].map(emotion => '<' + prefix + '_' + emotion + ' />').join(', ');
+  return 'Optional emotion sprite tags are available for visual expression. Use them sparingly, at most one per response unless the emotional tone genuinely shifts. Allowed tags for this response: ' + tags + '. Do not use these tags in code, quoted examples, or serious high-stakes situations unless the tag communicates useful caution or uncertainty. No tag is required when none fits.';
+}
+
+function getEmotionSpriteAssetUrl(name) {
+  return EMOTION_SPRITE_ASSET_URLS[name] || EMOTION_SPRITE_ASSET_PATH + name + '.webp';
+}
 
 function openModal(modalOrId, focusSelector) {
   const modal = typeof modalOrId === 'string' ? document.getElementById(modalOrId) : modalOrId;
@@ -2085,7 +2128,7 @@ async function handleManualSearch(query, conv) {
 
   if (conv) conv.updatedAt = Date.now();
   debouncedSave();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -2107,7 +2150,7 @@ async function handleFileSearch(query, conv) {
   messages.push(assistantMsg);
   if (conv) conv.updatedAt = Date.now();
   debouncedSave();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -2548,12 +2591,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   const scrollFab = document.getElementById('scrollFab');
   const inputArea = document.querySelector('.input-area');
   msgsArea.addEventListener('scroll', () => {
-    const atBottom = msgsArea.scrollHeight - msgsArea.scrollTop - msgsArea.clientHeight < 100;
+    const distanceFromBottom = msgsArea.scrollHeight - msgsArea.scrollTop - msgsArea.clientHeight;
     // Anchor above the composer, which changes height as the textarea grows.
     if (inputArea) scrollFab.style.bottom = (inputArea.offsetHeight + 12) + 'px';
-    scrollFab.classList.toggle('visible', !atBottom);
+    scrollFab.classList.toggle('visible', distanceFromBottom >= 100);
     if (streaming && !_suppressScrollFlag) {
-      userScrolledAway = !atBottom;
+      userScrolledAway = distanceFromBottom > 4;
     }
   });
 
@@ -3076,6 +3119,56 @@ async function renderMermaidBlocks(container) {
   }
 }
 
+function renderEmotionSprites(container) {
+  if (!areEmotionSpritesEnabled() || !container) return;
+  const selectedPrefix = getEmotionSpritePrefix();
+  const skipSelector = 'script,style,textarea,input,select,option,button,code,pre,.emotion-sprite-wrap';
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue || !node.nodeValue.includes('_')) return NodeFilter.FILTER_REJECT;
+      if (!node.parentElement || node.parentElement.closest(skipSelector)) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  const nodes = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) nodes.push(node);
+
+  nodes.forEach(node => {
+    EMOTION_SPRITE_TAG_RE.lastIndex = 0;
+    let match = EMOTION_SPRITE_TAG_RE.exec(node.nodeValue);
+    if (!match) return;
+    const fragment = document.createDocumentFragment();
+    let cursor = 0;
+    while (match) {
+      const raw = match[0];
+      const name = match[1];
+      if (match.index > cursor) fragment.appendChild(document.createTextNode(node.nodeValue.slice(cursor, match.index)));
+      if (EMOTION_SPRITE_NAMES[name] === selectedPrefix) {
+        const wrap = document.createElement('span');
+        wrap.className = 'emotion-sprite-wrap';
+        wrap.dataset.emotion = name;
+        const image = document.createElement('img');
+        image.className = 'emotion-sprite';
+        image.src = getEmotionSpriteAssetUrl(name);
+        image.alt = name.replaceAll('_', ' ');
+        image.title = name;
+        image.width = 128;
+        image.height = 128;
+        image.loading = 'lazy';
+        image.decoding = 'async';
+        wrap.appendChild(image);
+        fragment.appendChild(wrap);
+      } else {
+        fragment.appendChild(document.createTextNode(raw));
+      }
+      cursor = match.index + raw.length;
+      match = EMOTION_SPRITE_TAG_RE.exec(node.nodeValue);
+    }
+    if (cursor < node.nodeValue.length) fragment.appendChild(document.createTextNode(node.nodeValue.slice(cursor)));
+    node.replaceWith(fragment);
+  });
+}
+
 // ============================================
 // Artifact Preview
 // ============================================
@@ -3122,6 +3215,7 @@ function addArtifactPreview(container) {
 // Post-Render Pipeline
 // ============================================
 function postRenderProcessing(bubble) {
+  renderEmotionSprites(bubble);
   addCodeCopyButtons(bubble);
   addArtifactPreview(bubble);
   highlightCodeBlocks(bubble);
@@ -3385,7 +3479,7 @@ async function retryRequest(idx) {
   if (conv) conv.updatedAt = Date.now();
   if (getSwipeRequest(msg, swipeIdx)?.status === 'complete') extractMemories(requestContext.messages);
   await saveConversationImmediately();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -4974,6 +5068,8 @@ function openSettings() {
   document.getElementById('setFont').value = localStorage.getItem('assistantFont') || '';
   document.getElementById('setMsgFontSize').value = localStorage.getItem('assistantMsgFontSize') || '';
   document.getElementById('setMsgMaxWidth').value = localStorage.getItem('assistantMsgMaxWidth') || '';
+  document.getElementById('setEmotionSprites').checked = areEmotionSpritesEnabled();
+  document.getElementById('setEmotionSpriteSet').value = getEmotionSpriteSet();
   document.getElementById('setWebSearch').checked = localStorage.getItem('llmWebSearch') === 'true';
   document.getElementById('setForceSearch').checked = localStorage.getItem('llmForceSearch') === 'true';
   document.getElementById('setUrlFetch').checked = localStorage.getItem('llmUrlFetch') !== 'false';
@@ -5092,6 +5188,8 @@ function collectProfileSettingsFromInputs() {
     llmCorsProxy: normalizeCorsProxyUrl(document.getElementById('setCorsProxy').value),
     llmMemoryEnabled: document.getElementById('setMemory').checked ? 'true' : 'false',
     llmHoldScreenshot: document.getElementById('setHoldScreenshot').checked ? 'true' : 'false',
+    llmEmotionSprites: document.getElementById('setEmotionSprites').checked ? 'true' : 'false',
+    llmEmotionSpriteSet: document.getElementById('setEmotionSpriteSet').value,
     llmInputCost: document.getElementById('setInputCost').value.trim(),
     llmOutputCost: document.getElementById('setOutputCost').value.trim(),
     llmEnableStMacros: document.getElementById('setEnableStMacros').checked ? 'true' : 'false',
@@ -5125,6 +5223,8 @@ function applyProfileToInputs(settings) {
   document.getElementById('setCorsProxy').value = normalizeCorsProxyUrl(settings.llmCorsProxy);
   document.getElementById('setMemory').checked = parseEnabledSetting(settings.llmMemoryEnabled);
   document.getElementById('setHoldScreenshot').checked = settings.llmHoldScreenshot === 'true';
+  document.getElementById('setEmotionSprites').checked = settings.llmEmotionSprites === 'true';
+  document.getElementById('setEmotionSpriteSet').value = settings.llmEmotionSpriteSet || 'auto';
   document.getElementById('setInputCost').value = settings.llmInputCost || '';
   document.getElementById('setOutputCost').value = settings.llmOutputCost || '';
   document.getElementById('setEnableStMacros').checked = settings.llmEnableStMacros === 'true';
@@ -5150,6 +5250,7 @@ function applyProfile(profile) {
   if (settings.llmApiKey) setApiKey(settings.llmApiKey, getKeyStorageMode());
   localStorage.setItem('assistantActiveProfileId', profile.id);
   applyProfileToInputs(settings);
+  if (!streaming) renderMessages({ preserveScroll: true });
   renderProfileSummary();
   renderConnectionChip();
   syncScheduleAutoPush();
@@ -5275,6 +5376,9 @@ function saveSettings() {
   localStorage.setItem('llmCorsProxy', normalizeCorsProxyUrl(document.getElementById('setCorsProxy').value));
   localStorage.setItem('llmMemoryEnabled', document.getElementById('setMemory').checked ? 'true' : 'false');
   localStorage.setItem('llmHoldScreenshot', document.getElementById('setHoldScreenshot').checked ? 'true' : 'false');
+  localStorage.setItem('llmEmotionSprites', document.getElementById('setEmotionSprites').checked ? 'true' : 'false');
+  localStorage.setItem('llmEmotionSpriteSet', document.getElementById('setEmotionSpriteSet').value);
+  if (!streaming) renderMessages({ preserveScroll: true });
   setDebugPreference();
   syncSaveSettings(false, false);
 
@@ -5577,7 +5681,6 @@ function renderPromptEntries() {
     const div = document.createElement('div');
     div.className = 'prompt-entry' + (entry.enabled ? '' : ' disabled');
     div.dataset.peId = entry.id;
-    div.draggable = true;
 
     // Drag-and-drop
     div.addEventListener('dragstart', (e) => {
@@ -5609,6 +5712,7 @@ function renderPromptEntries() {
     const drag = document.createElement('span');
     drag.className = 'drag-handle';
     drag.textContent = '☰';
+    drag.draggable = true;
 
     const toggle = document.createElement('input');
     toggle.type = 'checkbox';
@@ -5772,6 +5876,7 @@ async function buildSystemMessages(conv) {
   // Memory prompt
   const mem = await getMemoryPrompt();
   if (mem) msgs.push({ role: 'system', content: mem });
+  if (areEmotionSpritesEnabled()) msgs.push({ role: 'system', content: buildEmotionSpriteInstructions() });
   return msgs;
 }
 
@@ -5992,9 +6097,11 @@ function maybeAddAvatar(wrapper) {
   }
 }
 
-function renderMessages() {
+function renderMessages({ preserveScroll = false } = {}) {
   closeChatSearch();
   const area = document.getElementById('messagesArea');
+  const wasAtBottom = area.scrollHeight - area.scrollTop - area.clientHeight <= 4;
+  const savedScrollTop = preserveScroll && !wasAtBottom ? area.scrollTop : null;
   area.innerHTML = '';
 
   if (messages.length === 0) {
@@ -6268,7 +6375,7 @@ function renderMessages() {
     area.appendChild(wrapper);
   });
 
-  area.scrollTop = area.scrollHeight;
+  area.scrollTop = savedScrollTop === null ? area.scrollHeight : savedScrollTop;
   updateSendBtnState();
 
   // Restore select mode state if active
@@ -6362,7 +6469,7 @@ function renderEditMode(area, msg, idx) {
     const newBranch = JSON.parse(JSON.stringify(messages.slice(idx)));
     msg.branches[msg.branchIndex] = newBranch;
     saveConversations();
-    renderMessages();
+    renderMessages({ preserveScroll: true });
   };
 
   editActions.appendChild(cancelBtn);
@@ -6410,7 +6517,7 @@ async function resendAfterEdit() {
   }
   if (conv) conv.updatedAt = Date.now();
   saveConversations();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -8648,7 +8755,7 @@ async function sendMessage() {
   }
   if (conv) conv.updatedAt = Date.now();
   debouncedSave();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -8687,7 +8794,7 @@ async function regenerate() {
 
   if (conv) conv.updatedAt = Date.now();
   debouncedSave();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -8727,7 +8834,7 @@ async function continueMessage() {
 
   if (conv) conv.updatedAt = Date.now();
   debouncedSave();
-  renderMessages();
+  renderMessages({ preserveScroll: true });
   updateTokenInfo();
 }
 
@@ -8762,7 +8869,7 @@ const IMPORT_SETTING_ALLOWLIST = [
   'llmTemperature', 'llmMaxTokens', 'llmContextWindow', 'llmPromptCache', 'llmThinking',
   'llmThinkingEffort', 'llmExtraParams', 'llmExcludeParams', 'llmPrefill', 'llmPersona',
   'llmEnableStMacros', 'llmRpUserName', 'llmInputCost', 'llmOutputCost', 'llmWebSearch',
-  'llmForceSearch', 'llmMemoryEnabled', 'llmHoldScreenshot', 'llmCacheEnabled', 'llmPromptEntries',
+  'llmForceSearch', 'llmMemoryEnabled', 'llmHoldScreenshot', 'llmEmotionSprites', 'llmEmotionSpriteSet', 'llmCacheEnabled', 'llmPromptEntries',
   'llmUrlFetch', 'llmToolConfirm', 'llmSearchApiUrl', 'llmCorsProxy',
   'assistantTheme', 'assistantCustomTheme', 'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth'
 ];
@@ -9081,7 +9188,9 @@ function synapseSelfTest() {
     assert(storedSync.token === (localStorage.getItem('assistantSyncGistToken') || '') &&
       storedSync.gistId === (localStorage.getItem('assistantSyncGistId') || '') &&
       storedSync.passphrase === (localStorage.getItem('assistantSyncPassphrase') || ''), 'auto-push stored configuration');
-    const result = { ok: true, checks: ['normalization', 'context filtering', 'source numbering', 'legacy import', 'updatedAt merge', 'auto-push configuration', 'auto-push stored configuration'] };
+    EMOTION_SPRITE_TAG_RE.lastIndex = 0;
+    assert(EMOTION_SPRITE_TAG_RE.test('<gpt_helpfulness />'), 'emotion sprite tag');
+    const result = { ok: true, checks: ['normalization', 'context filtering', 'source numbering', 'legacy import', 'updatedAt merge', 'auto-push configuration', 'auto-push stored configuration', 'emotion sprite tag'] };
     console.info('Synapse self-test passed', result);
     return result;
   } catch (error) {
@@ -9696,6 +9805,7 @@ async function syncPullFromGist() {
     return false;
   }
   _syncOperationInFlight = true;
+  const previousActiveConvId = activeConvId;
   const cfg = syncSaveSettings(false, false);
   let succeeded = false;
   try {
@@ -9748,7 +9858,7 @@ async function syncPullFromGist() {
     localStorage.setItem('assistantActiveConvId', activeConvId || '');
 
     renderSidebar();
-    renderMessages();
+    renderMessages({ preserveScroll: activeConvId === previousActiveConvId });
     updateTokenInfo();
     updateCharacterUI();
     localStorage.setItem('assistantSyncLastPullAt', String(Date.now()));
@@ -11213,6 +11323,11 @@ const __windowBridge = {
   buildApiContent,
   extractImages,
   renderMarkdown,
+  areEmotionSpritesEnabled,
+  getEmotionSpriteSet,
+  getEmotionSpritePrefix,
+  getEmotionSpriteAssetUrl,
+  renderEmotionSprites,
   addCodeCopyButtons,
   highlightCodeBlocks,
   addLineNumbers,
