@@ -15,7 +15,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="./styles.css?v=20260813">
+<link rel="stylesheet" href="./styles.css?v=202608131410">
 </head>
 <body>
 
@@ -447,14 +447,14 @@
 
     <div class="settings-tab-content" id="settingsTab-sync">
       <div class="modal-section">GitHub Gist</div>
-      <div class="settings-note">Manual sync stores encrypted conversations, memories, presets, prompts, and appearance settings in a private Gist. API keys, provider URLs, search keys, and proxy settings stay on this device.</div>
+      <div class="settings-note">Manual sync stores encrypted conversations, memories, presets, prompts, and appearance settings in a private Gist. API keys, provider URLs, search keys, and proxy settings stay on this device. Push now creates the Gist; Pull now remains manual.</div>
       <form class="password-field-form" onsubmit="return false">
         <input class="sr-only" type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true">
         <label for="setSyncToken">GitHub token</label>
         <input type="password" id="setSyncToken" autocomplete="off" placeholder="Token with Gist read/write access">
       </form>
       <label for="setSyncGistId">Gist ID</label>
-      <input type="text" id="setSyncGistId" autocomplete="off" placeholder="Leave empty to create one on Push">
+      <input type="text" id="setSyncGistId" autocomplete="off" placeholder="Existing Gist ID required for auto-push">
       <label for="setSyncPassphrase">Sync passphrase</label>
       <div class="model-selector-row sync-passphrase-row">
         <input type="password" id="setSyncPassphrase" autocomplete="off" placeholder="Used only for local encryption and decryption">
@@ -465,6 +465,11 @@
         <button class="btn btn-secondary debug-inline-btn" type="button" onclick="syncSaveSettings()">Save</button>
       </div>
       <div class="settings-note" id="syncDetails">Add a GitHub token and passphrase, then push to create or update your private sync Gist.</div>
+      <label class="toggle-row">
+        <input type="checkbox" id="setSyncAutoPush" onchange="syncToggleAutoPush(this)">
+        Automatically push local changes
+        <span class="toggle-hint">Encrypted, debounced push; needs an existing Gist</span>
+      </label>
       <div class="sync-actions">
         <button class="btn btn-primary" type="button" onclick="syncPushToGist()">Push now</button>
         <button class="btn btn-secondary" type="button" onclick="syncPullFromGist()">Pull now</button>
@@ -644,6 +649,6 @@
   </div>
 </div>
 
-<script type="module" src="./js/main.js?v=20260813"></script>
+<script type="module" src="./js/main.js?v=202608131410"></script>
 </body>
 </html>

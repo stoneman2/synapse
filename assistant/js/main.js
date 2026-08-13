@@ -41,12 +41,15 @@ let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-08-12',
+  buildDate: '2026-08-13T14:10:00+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
 const SYNC_GIST_API_URL = 'https://api.github.com/gists';
 const SYNC_KDF_ITERATIONS = 120000;
+const SYNC_AUTO_PUSH_KEY = 'assistantSyncAutoPush';
+const SYNC_AUTO_PENDING_KEY = 'assistantSyncAutoPushPending';
+const SYNC_AUTO_PUSH_DELAY = 1200;
 const SYNC_SETTINGS_KEYS = [
   'llmModel', 'llmApiFormat', 'llmStreaming', 'llmEnterSend', 'llmTemperature',
   'llmMaxTokens', 'llmPromptCache', 'llmThinking', 'llmThinkingEffort',
@@ -446,11 +449,13 @@ function saveConversationImmediately() {
       localStorage.setItem('assistantConversations', JSON.stringify(conversations));
       localStorage.setItem('assistantActiveConvId', activeConvId || '');
     } catch(e) { return Promise.reject(e); }
+    syncScheduleAutoPush();
     return Promise.resolve();
   }
   try { localStorage.setItem('assistantActiveConvId', activeConvId || ''); } catch(e) {}
   return idbPutAll('conversations', conversations)
-    .then(() => idbPut('meta', { key: 'activeConvId', value: activeConvId || '' }));
+    .then(() => idbPut('meta', { key: 'activeConvId', value: activeConvId || '' }))
+    .then(() => syncScheduleAutoPush());
 }
 
 function scrollMessagesToBottom() {
@@ -1001,6 +1006,7 @@ function toggleTheme() {
   let idx = order.indexOf(current);
   const next = order[(idx + 1) % order.length];
   applyTheme(next);
+  syncScheduleAutoPush();
 
   // Flash theme name
   const btn = document.getElementById('themeToggle');
@@ -1041,6 +1047,7 @@ function onThemeSelectChange() {
     loadCustomColorPickers();
   }
   applyTheme(val);
+  syncScheduleAutoPush();
 }
 
 function loadCustomColorPickers() {
@@ -1076,6 +1083,7 @@ function resetCustomTheme() {
   document.getElementById('setTheme').value = 'dark';
   document.getElementById('customThemeColors').style.display = 'none';
   applyTheme('dark');
+  syncScheduleAutoPush();
 }
 
 function getCustomThemeFromPickers() {
@@ -1105,6 +1113,7 @@ function liveCustomTheme() {
   const t = getCustomThemeFromPickers();
   localStorage.setItem('assistantCustomTheme', JSON.stringify(t));
   applyTheme('custom');
+  syncScheduleAutoPush();
 }
 
 // ============================================
@@ -1413,9 +1422,11 @@ async function saveMemories(memories) {
   const normalized = normalizeMemoryList(memories).memories;
   if (!db) {
     localStorage.setItem('assistantMemories', JSON.stringify(normalized));
+    syncScheduleAutoPush();
     return;
   }
   await idbPutAll('memories', normalized);
+  syncScheduleAutoPush();
 }
 
 async function getMemoryPrompt() {
@@ -2301,6 +2312,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const shareId = new URLSearchParams(location.search).get('share');
   readOnlyShare = !!shareId;
   if (readOnlyShare) document.body.classList.add('share-view');
+  if (!readOnlyShare) window.addEventListener('online', () => syncRunAutoPush());
 
   if (!readOnlyShare) {
     // Migration: strip endpoint suffix from proxy URL
@@ -2333,6 +2345,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     migrateToPromptEntries();
     await loadProjects();
     await loadConversations();
+    void syncRunAutoPush();
   }
   loadTheme();
   loadCustomFont(localStorage.getItem('assistantFont') || '');
@@ -3748,9 +3761,13 @@ function saveConversations() {
   // hidden delete/fork/regenerate handlers still exist in the DOM, so guard centrally.
   if (readOnlyShare) return;
   try { localStorage.setItem('assistantActiveConvId', activeConvId || ''); } catch(e) {}
-  if (!db) return;
+  if (!db) {
+    syncScheduleAutoPush();
+    return;
+  }
   idbPutAll('conversations', conversations)
     .then(() => idbPut('meta', { key: 'activeConvId', value: activeConvId || '' }))
+    .then(() => syncScheduleAutoPush())
     .catch(e => console.error('IDB save error:', e));
 }
 
@@ -4035,6 +4052,7 @@ async function loadProjects() {
 function saveProjects() {
   if (!db) return;
   idbPut('meta', { key: 'projects', value: projects })
+    .then(() => syncScheduleAutoPush())
     .catch(e => console.error('IDB projects save error:', e));
 }
 
@@ -4856,6 +4874,7 @@ function saveSetup() {
   setApiKey(key, getSelectedKeyStorage('setup'));
   localStorage.setItem('llmModel', model);
   localStorage.setItem('llmApiFormat', document.getElementById('setupApiFormat')?.value || getProviderPreset(provider).apiFormat);
+  syncScheduleAutoPush();
   closeModal('setupModal');
   renderConnectionChip();
   announce('Provider settings saved.');
@@ -4876,6 +4895,7 @@ function switchSettingsTab(tabName, btn) {
 
 function toggleCache(enabled) {
   localStorage.setItem('llmCacheEnabled', enabled ? 'true' : 'false');
+  syncScheduleAutoPush();
   updateCacheStats();
   showToast(enabled ? 'Response cache enabled.' : 'Response cache disabled.', 'info');
 }
@@ -5013,6 +5033,7 @@ function loadProfiles() {
 function saveProfiles(profiles) {
   const safeProfiles = (Array.isArray(profiles) ? profiles : []).map(sanitizeProfileRecord);
   localStorage.setItem('assistantProfiles', JSON.stringify(safeProfiles));
+  syncScheduleAutoPush();
 }
 
 function renderProfileSelect() {
@@ -5131,6 +5152,7 @@ function applyProfile(profile) {
   applyProfileToInputs(settings);
   renderProfileSummary();
   renderConnectionChip();
+  syncScheduleAutoPush();
   showToast('Profile applied: ' + profile.name, 'success');
 }
 
@@ -5254,7 +5276,7 @@ function saveSettings() {
   localStorage.setItem('llmMemoryEnabled', document.getElementById('setMemory').checked ? 'true' : 'false');
   localStorage.setItem('llmHoldScreenshot', document.getElementById('setHoldScreenshot').checked ? 'true' : 'false');
   setDebugPreference();
-  syncSaveSettings(false);
+  syncSaveSettings(false, false);
 
   // Warn if web search enabled for non-Anthropic without search URL
   if (document.getElementById('setWebSearch').checked) {
@@ -5294,6 +5316,7 @@ function saveSettings() {
 
   closeModal('settingsModal');
   renderConnectionChip();
+  syncScheduleAutoPush();
   announce('Settings saved.');
 }
 
@@ -5356,6 +5379,7 @@ function saveCurrentAsPreset() {
   };
   presets.push(preset);
   localStorage.setItem('assistantPresets', JSON.stringify(presets));
+  syncScheduleAutoPush();
   loadPresets();
   document.getElementById('setPresetSelect').value = preset.id;
   showToast('Preset saved: ' + name, 'success');
@@ -5372,6 +5396,7 @@ function deleteSelectedPreset() {
   if (!confirm('Delete preset "' + preset.name + '"?')) return;
   presets = presets.filter(p => p.id !== id);
   localStorage.setItem('assistantPresets', JSON.stringify(presets));
+  syncScheduleAutoPush();
   loadPresets();
 
   // Clear imported prompt entries and extra params
@@ -5510,6 +5535,7 @@ function importSTPreset(event) {
     };
     presets.push(preset);
     localStorage.setItem('assistantPresets', JSON.stringify(presets));
+    syncScheduleAutoPush();
     loadPresets();
     document.getElementById('setPresetSelect').value = preset.id;
     showToast('Imported ST preset: ' + presetName, 'success');
@@ -5526,6 +5552,7 @@ function loadPromptEntries() {
 
 function savePromptEntries(entries) {
   localStorage.setItem('llmPromptEntries', JSON.stringify(entries));
+  syncScheduleAutoPush();
 }
 
 function migrateToPromptEntries() {
@@ -9021,8 +9048,9 @@ async function clearDataCategory(category) {
     await cacheClear();
   } else if (category === 'credentials') {
     ['llmApiKey', 'llmSearchApiKey'].forEach(key => { localStorage.removeItem(key); sessionStorage.removeItem(key); });
-    ['assistantSyncGistToken', 'assistantSyncPassphrase', 'assistantSyncGistId', 'assistantSyncSalt', 'assistantSyncLastHash'].forEach(key => localStorage.removeItem(key));
+    ['assistantSyncGistToken', 'assistantSyncPassphrase', 'assistantSyncGistId', 'assistantSyncSalt', 'assistantSyncLastHash', SYNC_AUTO_PUSH_KEY, SYNC_AUTO_PENDING_KEY].forEach(key => localStorage.removeItem(key));
     scrubProfileSecrets();
+    renderSyncSettings();
   }
   await renderStorageSummary();
   renderConnectionChip();
@@ -9047,7 +9075,13 @@ function synapseSelfTest() {
     assert(imported.conversations.length === 1 && imported.conversations[0].messages.length === 1, 'legacy import');
     const merged = mergeConversationRecords([{ id: 'same', updatedAt: 1, messages: [] }], [{ id: 'same', updatedAt: 2, messages: [{ role: 'user', content: 'newer' }] }]);
     assert(merged[0].messages.length === 1, 'import merge');
-    const result = { ok: true, checks: ['normalization', 'context filtering', 'source numbering', 'legacy import', 'updatedAt merge'] };
+    assert(!syncAutoPushIsConfigured({ token: 'token', passphrase: 'passphrase' }), 'auto-push Gist gating');
+    assert(syncAutoPushIsConfigured({ token: 'token', passphrase: 'passphrase', gistId: 'gist' }), 'auto-push configuration');
+    const storedSync = syncGetStoredConfig();
+    assert(storedSync.token === (localStorage.getItem('assistantSyncGistToken') || '') &&
+      storedSync.gistId === (localStorage.getItem('assistantSyncGistId') || '') &&
+      storedSync.passphrase === (localStorage.getItem('assistantSyncPassphrase') || ''), 'auto-push stored configuration');
+    const result = { ok: true, checks: ['normalization', 'context filtering', 'source numbering', 'legacy import', 'updatedAt merge', 'auto-push configuration', 'auto-push stored configuration'] };
     console.info('Synapse self-test passed', result);
     return result;
   } catch (error) {
@@ -9074,23 +9108,91 @@ function syncGetDeviceId() {
   return id;
 }
 
+let _syncInputsLoaded = false;
+let _syncAutoPushTimer;
+let _syncOperationInFlight = false;
+
+function syncAutoPushIsConfigured(cfg) {
+  return !!(cfg?.token && cfg?.passphrase && cfg?.gistId);
+}
+
+function syncGetStoredConfig() {
+  return {
+    token: localStorage.getItem('assistantSyncGistToken') || '',
+    gistId: localStorage.getItem('assistantSyncGistId') || '',
+    passphrase: localStorage.getItem('assistantSyncPassphrase') || '',
+    autoPush: localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true'
+  };
+}
+
 function syncGetConfigFromInputs() {
   const tokenEl = document.getElementById('setSyncToken');
   const gistEl = document.getElementById('setSyncGistId');
   const passEl = document.getElementById('setSyncPassphrase');
+  const autoEl = document.getElementById('setSyncAutoPush');
+  const stored = syncGetStoredConfig();
   return {
-    token: tokenEl ? tokenEl.value.trim() : (localStorage.getItem('assistantSyncGistToken') || ''),
-    gistId: gistEl ? gistEl.value.trim() : (localStorage.getItem('assistantSyncGistId') || ''),
-    passphrase: passEl ? passEl.value : (localStorage.getItem('assistantSyncPassphrase') || '')
+    token: _syncInputsLoaded && tokenEl ? tokenEl.value.trim() : stored.token,
+    gistId: _syncInputsLoaded && gistEl ? gistEl.value.trim() : stored.gistId,
+    passphrase: _syncInputsLoaded && passEl ? passEl.value : stored.passphrase,
+    autoPush: _syncInputsLoaded && autoEl ? autoEl.checked : stored.autoPush
   };
 }
 
-function syncSaveSettings(showSavedToast = true) {
+function syncScheduleAutoPush() {
+  if (readOnlyShare || localStorage.getItem(SYNC_AUTO_PUSH_KEY) !== 'true') return;
+  localStorage.setItem(SYNC_AUTO_PENDING_KEY, 'true');
+  clearTimeout(_syncAutoPushTimer);
+  _syncAutoPushTimer = setTimeout(syncRunAutoPush, SYNC_AUTO_PUSH_DELAY);
+}
+
+async function syncRunAutoPush() {
+  clearTimeout(_syncAutoPushTimer);
+  _syncAutoPushTimer = null;
+  if (readOnlyShare || localStorage.getItem(SYNC_AUTO_PUSH_KEY) !== 'true' ||
+      localStorage.getItem(SYNC_AUTO_PENDING_KEY) !== 'true' || navigator.onLine === false) return false;
+  if (_syncOperationInFlight) return false;
+  const cfg = syncGetStoredConfig();
+  if (!syncAutoPushIsConfigured(cfg)) {
+    localStorage.setItem(SYNC_AUTO_PUSH_KEY, 'false');
+    localStorage.removeItem(SYNC_AUTO_PENDING_KEY);
+    return false;
+  }
+  localStorage.removeItem(SYNC_AUTO_PENDING_KEY);
+  const pushed = await syncPushToGist({ auto: true });
+  if (!pushed) {
+    localStorage.setItem(SYNC_AUTO_PENDING_KEY, 'true');
+    return false;
+  }
+  if (localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
+  return true;
+}
+
+function syncToggleAutoPush(input) {
+  if (!input?.checked) {
+    syncSaveSettings(false);
+    return;
+  }
+  if (!syncAutoPushIsConfigured(syncGetConfigFromInputs())) {
+    input.checked = false;
+    syncSaveSettings(false, false);
+    showToast('Auto-push requires a GitHub token, passphrase, and existing Gist ID.', 'error');
+    return;
+  }
+  syncSaveSettings(false);
+}
+
+function syncSaveSettings(showSavedToast = true, schedule = true) {
   const cfg = syncGetConfigFromInputs();
   syncSetStoredValue('assistantSyncGistToken', cfg.token);
   syncSetStoredValue('assistantSyncGistId', cfg.gistId);
   syncSetStoredValue('assistantSyncPassphrase', cfg.passphrase);
+  const autoPush = cfg.autoPush && syncAutoPushIsConfigured(cfg);
+  localStorage.setItem(SYNC_AUTO_PUSH_KEY, autoPush ? 'true' : 'false');
+  if (!autoPush) localStorage.removeItem(SYNC_AUTO_PENDING_KEY);
+  cfg.autoPush = autoPush;
   renderSyncSettings();
+  if (schedule && autoPush) syncScheduleAutoPush();
   if (showSavedToast) showToast('Sync settings saved.', 'success');
   return cfg;
 }
@@ -9109,9 +9211,12 @@ function renderSyncSettings() {
   const tokenEl = document.getElementById('setSyncToken');
   const gistEl = document.getElementById('setSyncGistId');
   const passEl = document.getElementById('setSyncPassphrase');
+  const autoEl = document.getElementById('setSyncAutoPush');
   if (tokenEl) tokenEl.value = localStorage.getItem('assistantSyncGistToken') || '';
   if (gistEl) gistEl.value = localStorage.getItem('assistantSyncGistId') || '';
   if (passEl) passEl.value = localStorage.getItem('assistantSyncPassphrase') || '';
+  if (autoEl) autoEl.checked = localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true';
+  _syncInputsLoaded = true;
 
   const token = localStorage.getItem('assistantSyncGistToken') || '';
   const gistId = localStorage.getItem('assistantSyncGistId') || '';
@@ -9453,10 +9558,19 @@ function syncIsOwnedFileName(name) {
     || (name.startsWith('conv_') && name.endsWith('.json.enc'));
 }
 
-async function syncPushToGist() {
-  const cfg = syncSaveSettings(false);
+async function syncPushToGist(options = {}) {
+  const auto = options.auto === true;
+  if (_syncOperationInFlight) {
+    if (!auto) showToast('A sync operation is already in progress.', 'info');
+    return false;
+  }
+  _syncOperationInFlight = true;
+  const pendingAtStart = localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true';
+  if (auto || pendingAtStart) localStorage.removeItem(SYNC_AUTO_PENDING_KEY);
+  const cfg = auto ? syncGetStoredConfig() : syncSaveSettings(false, false);
+  let succeeded = false;
   try {
-    syncValidateConfig(cfg, false);
+    syncValidateConfig(cfg, auto);
     syncSetStatus('checking', 'Pushing...', 'Encrypting local data and writing Gist files.');
     let gist = null;
     let existingManifest = null;
@@ -9498,11 +9612,21 @@ async function syncPushToGist() {
     localStorage.setItem('assistantSyncLastHash', await syncSha256Hex(built.manifest));
     renderSyncSettings();
     syncSetStatus('current', 'Pushed', 'Encrypted sync Gist updated with ' + conversations.length + ' conversations.');
-    showToast('Sync push complete.', 'success');
+    succeeded = true;
+    if (!auto) showToast('Sync push complete.', 'success');
+    return true;
   } catch (err) {
     console.error('Sync push failed:', err);
     syncSetStatus('unknown', 'Push failed', err.message || 'Unable to push sync data.');
-    showToast('Sync push failed: ' + (err.message || err), 'error', 6000);
+    if (!auto) showToast('Sync push failed: ' + (err.message || err), 'error', 6000);
+    return false;
+  } finally {
+    if (!succeeded && syncAutoPushIsConfigured(cfg) && (auto || pendingAtStart)) {
+      localStorage.setItem(SYNC_AUTO_PENDING_KEY, 'true');
+    }
+    _syncOperationInFlight = false;
+    if (succeeded && localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
+        localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
   }
 }
 
@@ -9567,7 +9691,13 @@ function syncMergeMemoryLists(localList, remoteList) {
 }
 
 async function syncPullFromGist() {
-  const cfg = syncSaveSettings(false);
+  if (_syncOperationInFlight) {
+    showToast('A sync operation is already in progress.', 'info');
+    return false;
+  }
+  _syncOperationInFlight = true;
+  const cfg = syncSaveSettings(false, false);
+  let succeeded = false;
   try {
     syncValidateConfig(cfg, true);
     syncSetStatus('checking', 'Pulling...', 'Fetching and decrypting sync files.');
@@ -9625,11 +9755,18 @@ async function syncPullFromGist() {
     renderSyncSettings();
     syncSetStatus('current', 'Pulled', 'Merged ' + remoteConversations.length + ' remote conversations. Added ' + merged.added + ', updated ' + merged.updated + '.');
     showToast('Sync pull complete.', 'success');
+    succeeded = true;
+    return true;
   } catch (err) {
     console.error('Sync pull failed:', err);
     const message = err.name === 'OperationError' ? 'Could not decrypt sync data. Check the passphrase.' : (err.message || 'Unable to pull sync data.');
     syncSetStatus('unknown', 'Pull failed', message);
     showToast('Sync pull failed: ' + message, 'error', 6000);
+    return false;
+  } finally {
+    _syncOperationInFlight = false;
+    if (succeeded && localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
+        localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
   }
 }
 
@@ -9638,7 +9775,7 @@ function syncGeneratePassphrase() {
     const passphrase = syncBytesToBase64Url(syncRandomBytes(24)).match(/.{1,6}/g).join('-');
     const passEl = document.getElementById('setSyncPassphrase');
     if (passEl) passEl.value = passphrase;
-    syncSaveSettings(false);
+    syncSaveSettings(false, false);
     showToast('Sync passphrase generated.', 'success');
   } catch (err) {
     showToast('Could not generate passphrase: ' + (err.message || err), 'error');
@@ -9646,7 +9783,7 @@ function syncGeneratePassphrase() {
 }
 
 function syncBuildPairingText() {
-  const cfg = syncSaveSettings(false);
+  const cfg = syncSaveSettings(false, false);
   if (!cfg.gistId) throw new Error('Push once to create a Gist before pairing.');
   if (!cfg.passphrase) throw new Error('Sync passphrase is required for pairing.');
   const includeToken = document.getElementById('setSyncQrIncludeToken')?.checked;
@@ -9683,7 +9820,7 @@ function syncApplyPairingText(text, silent = false) {
     if (gistEl) gistEl.value = payload.gistId;
     if (passEl) passEl.value = payload.passphrase;
     if (payload.token && tokenEl) tokenEl.value = payload.token;
-    syncSaveSettings(false);
+    syncSaveSettings(false, false);
     showToast('Pairing code applied.', 'success');
     return true;
   } catch (err) {
@@ -11211,6 +11348,9 @@ const __windowBridge = {
   handleCommandInput,
   handleCommandKeydown,
   syncSaveSettings,
+  syncScheduleAutoPush,
+  syncRunAutoPush,
+  syncToggleAutoPush,
   renderSyncSettings,
   syncPushToGist,
   syncPullFromGist,

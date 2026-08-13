@@ -157,6 +157,8 @@ Important keys include:
 
 Use "Export all chats" from the toolbar menu if you want a backup.
 
+Optional GitHub Gist sync encrypts conversations, memories, projects, prompts, presets, and appearance settings before storing them in a private Gist. Push now creates or updates it; Pull now is always manual. After the first push, you can opt into debounced automatic pushes from the Sync tab. Automatic push is off by default and never pulls or runs on shared read-only pages.
+
 The Data settings tab reports approximate category sizes and browser usage/quota, provides separate confirmed clear actions, and previews imports before applying them. Imports accept schema-less legacy single-chat files and current bulk files. Merge uses newer `updatedAt` values; Copy remaps IDs; Replace requires an additional confirmation. Export schema version is `synapse-export` version 2. Credentials are excluded from settings/profiles in exports and imports.
 
 ## Project Files
