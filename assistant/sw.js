@@ -3,7 +3,7 @@
  * Bump CACHE_VERSION on every release. The activate handler deletes anything that
  * doesn't match, so a stale build can't survive a deploy.
  */
-const CACHE_VERSION = 'synapse-202608131635';
+const CACHE_VERSION = 'synapse-202608240821';
 
 const PRECACHE = [
   './',

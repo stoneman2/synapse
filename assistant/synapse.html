@@ -12144,7 +12144,20 @@ function syncApplySettings(settings) {
   renderProfileSummary();
 }
 
-async function syncBuildGistFiles(passphrase, existingManifest = null) {
+async function syncReadRemoteConversations(gist, manifest, passphrase, keyCache = {}) {
+  const remoteConversations = [];
+  const entries = Array.isArray(manifest.files?.conversations) ? manifest.files.conversations : [];
+  for (const entry of entries) {
+    if (!entry?.file) continue;
+    const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, entry.file), passphrase, keyCache);
+    if (payload?.conversation) remoteConversations.push(payload.conversation);
+  }
+  return remoteConversations;
+}
+
+// merged: optional { conversations, memories, projects } already merged with the
+// remote Gist, so a push never deletes data another device pushed.
+async function syncBuildGistFiles(passphrase, existingManifest = null, merged = null) {
   clearTimeout(_saveDebounceTimer);
   if (db) {
     await idbPutAll('conversations', conversations);
@@ -12157,9 +12170,9 @@ async function syncBuildGistFiles(passphrase, existingManifest = null) {
 
   const now = Date.now();
   const settingsPayload = { version: 1, exportedAt: new Date(now).toISOString(), settings: syncCollectSettings() };
-  const memoriesPayload = { version: 1, exportedAt: new Date(now).toISOString(), memories: await loadMemories() };
-  const projectsPayload = { version: 1, exportedAt: new Date(now).toISOString(), projects };
-  const localConversations = conversations.map(syncNormalizeConversation);
+  const memoriesPayload = { version: 1, exportedAt: new Date(now).toISOString(), memories: merged?.memories || await loadMemories() };
+  const projectsPayload = { version: 1, exportedAt: new Date(now).toISOString(), projects: merged?.projects || projects };
+  const localConversations = (merged?.conversations || conversations).map(syncNormalizeConversation);
   const files = {
     'settings.json.enc': { content: await syncEncryptPayloadWithKey(settingsPayload, context) },
     'memories.json.enc': { content: await syncEncryptPayloadWithKey(memoriesPayload, context) },
@@ -12236,7 +12249,23 @@ async function syncPushToGist(options = {}) {
       }
     }
 
-    const built = await syncBuildGistFiles(cfg.passphrase, existingManifest);
+    // Merge the remote Gist into what we push: the Gist holds the union of all
+    // devices, otherwise a push from one device deletes the other's chats.
+    let merged = null;
+    if (existingManifest) {
+      const keyCache = {};
+      const remoteConversations = await syncReadRemoteConversations(gist, existingManifest, cfg.passphrase, keyCache);
+      merged = { conversations: (await syncMergeConversationLists(conversations, remoteConversations)).conversations };
+      if (existingManifest.files?.memories) {
+        const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, existingManifest.files.memories), cfg.passphrase, keyCache);
+        merged.memories = syncMergeMemoryLists(await loadMemories(), payload.memories || []);
+      }
+      if (existingManifest.files?.projects) {
+        const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, existingManifest.files.projects), cfg.passphrase, keyCache);
+        merged.projects = syncMergeProjectLists(projects, payload.projects || []);
+      }
+    }
+    const built = await syncBuildGistFiles(cfg.passphrase, existingManifest, merged);
     if (cfg.gistId) {
       const patchFiles = { ...built.files };
       Object.keys(gist?.files || {}).forEach(name => {
@@ -12264,14 +12293,15 @@ async function syncPushToGist(options = {}) {
     localStorage.setItem('assistantSyncLastPushAt', String(Date.now()));
     localStorage.setItem('assistantSyncLastHash', await syncSha256Hex(built.manifest));
     renderSyncSettings();
-    syncSetStatus('current', 'Pushed', 'Encrypted sync Gist updated with ' + conversations.length + ' conversations.');
+    syncSetStatus('current', 'Pushed', 'Encrypted sync Gist updated with ' + built.manifest.files.conversations.length + ' conversations.');
     succeeded = true;
     if (!auto) showToast('Sync push complete.', 'success');
     return true;
   } catch (err) {
     console.error('Sync push failed:', err);
-    syncSetStatus('unknown', 'Push failed', err.message || 'Unable to push sync data.');
-    if (!auto) showToast('Sync push failed: ' + (err.message || err), 'error', 6000);
+    const message = err.name === 'OperationError' ? 'Could not decrypt the existing sync Gist. Check the passphrase.' : (err.message || 'Unable to push sync data.');
+    syncSetStatus('unknown', 'Push failed', message);
+    if (!auto) showToast('Sync push failed: ' + message, 'error', 6000);
     return false;
   } finally {
     if (!succeeded && syncAutoPushIsConfigured(cfg) && (auto || pendingAtStart)) {
@@ -12365,13 +12395,7 @@ async function syncPullFromGist() {
     const settingsPayload = await syncDecryptPayload(await syncGetGistFileContent(gist, settingsFile, cfg.token), cfg.passphrase, keyCache);
     const memoriesPayload = await syncDecryptPayload(await syncGetGistFileContent(gist, memoriesFile, cfg.token), cfg.passphrase, keyCache);
 
-    const remoteConversations = [];
-    const entries = Array.isArray(manifest.files?.conversations) ? manifest.files.conversations : [];
-    for (const entry of entries) {
-      if (!entry?.file) continue;
-      const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, entry.file, cfg.token), cfg.passphrase, keyCache);
-      if (payload?.conversation) remoteConversations.push(payload.conversation);
-    }
+    const remoteConversations = await syncReadRemoteConversations(gist, manifest, cfg.passphrase, keyCache);
 
     syncApplySettings(settingsPayload.settings || {});
     const mergedMemories = syncMergeMemoryLists(await loadMemories(), memoriesPayload.memories || []);
