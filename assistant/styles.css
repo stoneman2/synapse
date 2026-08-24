@@ -307,7 +307,7 @@ svg.icon {
 .conv-item {
   padding: 10px 12px;
   border-radius: 8px;
-  cursor: pointer;
+  cursor: default;
   font-size: 0.85em;
   color: var(--text-secondary);
   transition: all 0.2s;
@@ -322,10 +322,19 @@ svg.icon {
 
 .conv-item .conv-title {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
 }
+.conv-item .conv-title:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .conv-rename-input {
   background: var(--bg);
   color: var(--text-primary);
@@ -549,7 +558,8 @@ svg.icon {
   opacity: 0;
   transition: opacity 0.2s, background 0.2s;
 }
-.code-block-wrapper:hover .code-copy-btn { opacity: 1; }
+.code-block-wrapper:hover .code-copy-btn,
+.code-block-wrapper:focus-within .code-copy-btn { opacity: 1; }
 .code-copy-btn:hover { background: var(--overlay-25); color: var(--text-primary); }
 
 /* Message actions */
@@ -997,7 +1007,7 @@ svg.icon {
   .input-area { padding: 8px 12px 12px; }
   .messages-area { padding: 12px; }
   .sidebar-overlay.open { display: block; }
-  .toolbar { padding-top: env(safe-area-inset-top); }
+  .toolbar { height: calc(50px + env(safe-area-inset-top)); padding-top: env(safe-area-inset-top); }
   .input-area { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
   .sidebar { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
   .toolbar-btn { padding: 10px; min-width: 44px; min-height: 44px; display: flex; align-items: center; justify-content: center; }
@@ -1136,7 +1146,6 @@ body.share-view .select-toolbar,
 body.share-view .msg-actions,
 body.share-view .regen-btn,
 body.share-view .swipe-controls,
-body.share-view .branch-controls,
 body.share-view .msg-meta { display: none !important; }
 body.share-view .main { margin-left: 0; }
 .share-banner {
@@ -1308,8 +1317,7 @@ body.share-view .main { margin-left: 0; }
 .messages-area.select-mode .msg-wrapper.selected .msg-bubble { box-shadow: 0 0 0 2px var(--accent); }
 .messages-area.select-mode .msg-actions,
 .messages-area.select-mode .regen-btn,
-.messages-area.select-mode .swipe-nav,
-.messages-area.select-mode .branch-controls { display: none !important; }
+.messages-area.select-mode .swipe-nav { display: none !important; }
 .select-toolbar {
   position: absolute;
   bottom: 60px;
@@ -1369,8 +1377,7 @@ body.share-view .main { margin-left: 0; }
 .thinking-block { margin-bottom: 8px; border-radius: 8px; background: var(--hover); overflow: hidden; font-size: 0.85em; }
 .thinking-header { padding: 8px 12px; cursor: pointer; color: var(--text-secondary); display: flex; align-items: center; gap: 6px; user-select: none; }
 .thinking-header:hover { color: var(--text-primary); }
-.thinking-content { display: none; padding: 4px 12px 8px; border-top: 1px solid var(--card-border); white-space: pre-wrap; color: var(--text-secondary); max-height: 300px; overflow-y: auto; }
-.thinking-content.open { display: block; }
+.thinking-content { padding: 4px 12px 8px; border-top: 1px solid var(--card-border); white-space: pre-wrap; color: var(--text-secondary); max-height: 300px; overflow-y: auto; }
 
 /* Line numbers in code blocks. The spans are display:block, so the \n text nodes
    between them must not render as extra blank lines: the pre drops to normal
@@ -1395,7 +1402,8 @@ pre.has-line-numbers { counter-reset: code-line; white-space: normal; }
   opacity: 0;
   transition: opacity 0.2s, background 0.2s;
 }
-.code-block-wrapper:hover .code-download-btn { opacity: 1; }
+.code-block-wrapper:hover .code-download-btn,
+.code-block-wrapper:focus-within .code-download-btn { opacity: 1; }
 .code-download-btn:hover { background: var(--overlay-25); color: var(--text-primary); }
 
 .code-preview-btn {
@@ -1413,7 +1421,8 @@ pre.has-line-numbers { counter-reset: code-line; white-space: normal; }
   opacity: 0;
   transition: opacity 0.2s, background 0.2s;
 }
-.code-block-wrapper:hover .code-preview-btn { opacity: 1; }
+.code-block-wrapper:hover .code-preview-btn,
+.code-block-wrapper:focus-within .code-preview-btn { opacity: 1; }
 .code-preview-btn:hover { background: var(--overlay-25); color: var(--text-primary); }
 .artifact-frame {
   display: block;
@@ -1479,13 +1488,6 @@ body.theme-light .hljs-symbol, body.theme-light .hljs-bullet, body.theme-light .
 .conv-item.dragging { opacity: 0.4; }
 .conv-item.drag-over { border-top: 2px solid var(--accent); }
 
-/* Branch controls */
-.branch-controls { display: none; flex-direction: row; align-items: center; gap: 8px; margin-top: 6px; font-size: 0.8em; color: var(--text-secondary); }
-.branch-controls.has-branches { display: flex; }
-.branch-controls button { background: var(--hover); border: none; color: var(--text-secondary); padding: 3px 10px; border-radius: 6px; cursor: pointer; }
-.branch-controls button:hover { background: var(--overlay-10); color: var(--text-primary); }
-.branch-controls button:disabled { opacity: 0.3; cursor: not-allowed; }
-
 /* Chat search bar */
 .chat-search-bar {
   display: none;
@@ -1524,6 +1526,10 @@ body.theme-light .hljs-symbol, body.theme-light .hljs-bullet, body.theme-light .
 
 /* Spoiler tags */
 .spoiler {
+  display: inline;
+}
+.spoiler > summary {
+  display: inline;
   background: var(--text-primary);
   color: transparent;
   border-radius: 4px;
@@ -1531,12 +1537,19 @@ body.theme-light .hljs-symbol, body.theme-light .hljs-bullet, body.theme-light .
   cursor: pointer;
   transition: all 0.2s;
   user-select: none;
+  list-style: none;
 }
-.spoiler.revealed {
+.spoiler > summary::-webkit-details-marker { display: none; }
+.spoiler > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.spoiler[open] > summary {
   background: var(--hover);
   color: var(--text-primary);
   user-select: auto;
 }
+.spoiler-hide { display: none; }
+.spoiler[open] .spoiler-reveal { display: none; }
+.spoiler[open] .spoiler-hide { display: inline; }
+.spoiler:not([open]) .spoiler-content { display: none; }
 
 /* @model mentions */
 .model-override-badge {
@@ -1589,7 +1602,6 @@ body.theme-light .hljs-symbol, body.theme-light .hljs-bullet, body.theme-light .
 @media (hover: none) {
   .scroll-fab { width: 44px; height: 44px; }
   .conv-item.active .conv-pin { display: block; }
-  .branch-controls button { padding: 8px 14px; min-height: 36px; }
 }
 
 /* Character card avatar in sidebar */
