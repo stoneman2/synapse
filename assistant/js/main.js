@@ -96,7 +96,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-08-25T20:04:13+08:00',
+  buildDate: '2026-08-25T20:11:27+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -494,7 +494,7 @@ function renderConnectionChip() {
   const provider = getLlmProviderInfo(model, format, localStorage.getItem('llmProxyUrl') || '');
   const profile = getActiveProfileSummary();
   providerEl.textContent = model ? provider.name : 'Not connected';
-  modelEl.textContent = model ? (formatModelForDisplay(model, 25) + (profile?.name ? ' · ' + profile.name : '')) : 'Set up a provider';
+  modelEl.textContent = model ? (formatModelForDisplay(model, 44) + (profile?.name ? ' · ' + profile.name : '')) : 'Set up a provider';
   if (chip) chip.setAttribute('aria-label', model ? 'API connection: ' + provider.name + ', ' + model + (profile?.name ? ', profile ' + profile.name : '') : 'Open API settings');
 }
 

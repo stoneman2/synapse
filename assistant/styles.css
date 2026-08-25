@@ -2264,8 +2264,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 
 @media (max-width: 768px) {
-  .connection-chip { max-width: 145px; padding: 4px 7px; }
-  .connection-chip-model { max-width: 130px; }
+  .connection-chip { max-width: 220px; padding: 4px 7px; }
+  .connection-chip-model { max-width: 200px; }
   .command-dropdown { left: 8px; right: 8px; }
   .connection-chip,
   .input-control-btn { min-height: 44px; }
