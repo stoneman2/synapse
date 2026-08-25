@@ -1,9 +1,10 @@
 import { getFocusableElements, trapFocus } from './lib/dom-utils.js';
-import { escapeHTML, isLightColor } from './lib/text-utils.js';
+import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js';
 // ============================================
 // State
 // ============================================
 let conversations = [];
+const temporaryConversations = new WeakSet();
 let projects = [];
 let activeConvId = null;
 // True when the page is showing someone else's shared conversation via ?share=.
@@ -16,6 +17,8 @@ let sending = false;
 let userScrolledAway = false;
 let _suppressScrollFlag = false;
 let pendingAttachments = [];
+let pendingAttachmentReads = 0;
+let attachmentStatusMessage = '';
 let voiceRec = null;
 let modelOverride = null;
 const armedFollowUpConversationIds = new Set();
@@ -32,6 +35,13 @@ let conversationSort = localStorage.getItem('assistantConversationSort') || 'upd
 let bulkMode = false;
 const selectedConversationIds = new Set();
 let pendingImport = null;
+let pendingImportMeta = null;
+let activeSettingsTab = 'api';
+let _promptSettingsAutosaveTimer = null;
+let _appearanceSettingsAutosaveTimer = null;
+let _promptSettingsAutosavePending = false;
+let _appearanceSettingsAutosavePending = false;
+let localDataOperationsInFlight = 0;
 let commandActive = false;
 let commandIdx = 0;
 let tokenInfoRequestId = 0;
@@ -41,13 +51,52 @@ const modalFocusReturn = new WeakMap();
 let transientDialogFocusReturn = null;
 let transientDialogClose = null;
 let toolbarMenuFocusReturn = null;
+let actionMenuClose = null;
 let globalSearchDismiss = null;
 let debugLogBuffer = [];
 let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
+function beginLocalDataOperation() {
+  if (_syncOperationInFlight) {
+    showToast('Wait for sync to finish.', 'info');
+    return false;
+  }
+  localDataOperationsInFlight++;
+  return true;
+}
+
+function endLocalDataOperation() {
+  localDataOperationsInFlight = Math.max(0, localDataOperationsInFlight - 1);
+  if (localDataOperationsInFlight === 0 && !_syncOperationInFlight &&
+      localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
+      localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
+}
+
+const TEMPORARY_CHAT_NOTICE = 'This chat stays in this tab. It does not use saved memories or project context. Messages are still sent to your selected provider.';
+
+function isTemporaryConversation(conv) {
+  return Boolean(conv && temporaryConversations.has(conv));
+}
+
+function getPersistentConversations() {
+  return conversations.filter(conv => !isTemporaryConversation(conv));
+}
+
+function getPersistentActiveConvId() {
+  const active = getActiveConv();
+  if (active && !isTemporaryConversation(active)) return active.id;
+  return getPersistentConversations()[0]?.id || '';
+}
+
+function replacePersistentConversations(next, preserveTemporary = true) {
+  const temporary = preserveTemporary ? conversations.filter(isTemporaryConversation) : [];
+  const temporaryIds = new Set(temporary.map(conv => conv.id));
+  conversations = temporary.concat((next || []).filter(conv => !temporaryIds.has(conv.id)));
+}
+
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-08-25T16:06:41+08:00',
+  buildDate: '2026-08-25T19:50:24+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -67,6 +116,7 @@ const SYNC_SETTINGS_KEYS = [
   'llmWebSearch', 'llmForceSearch', 'llmMemoryEnabled', 'llmHoldScreenshot',
   'llmEmotionSprites', 'llmEmotionSpriteSet',
   'llmPromptEntries', 'assistantPresets', 'assistantProfiles', 'assistantTheme',
+  'assistantStarterPrompts', 'assistantStarterPromptsHidden',
   'assistantCustomTheme', 'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth',
   'llmContextWindow', 'llmUrlFetch', 'llmToolConfirm'
 ];
@@ -280,11 +330,18 @@ function openModal(modalOrId, focusSelector) {
   const modal = typeof modalOrId === 'string' ? document.getElementById(modalOrId) : modalOrId;
   if (!modal) return;
   const dialog = modal.querySelector('.modal') || modal;
+  const previous = openModalStack[openModalStack.length - 1];
+
+  if (previous && previous !== modal) {
+    previous.inert = true;
+    previous.setAttribute('aria-hidden', 'true');
+  }
 
   if (!modal.classList.contains('open')) {
     modalFocusReturn.set(modal, document.activeElement instanceof HTMLElement ? document.activeElement : null);
     modal.classList.add('open');
   }
+  modal.inert = false;
   modal.setAttribute('aria-hidden', 'false');
 
   if (!openModalStack.includes(modal)) openModalStack.push(modal);
@@ -298,9 +355,21 @@ function openModal(modalOrId, focusSelector) {
 function closeModal(modalOrId, restoreFocus = true) {
   const modal = typeof modalOrId === 'string' ? document.getElementById(modalOrId) : modalOrId;
   if (!modal) return;
+  if (modal.id === 'settingsModal' && _syncOperationInFlight) {
+    showToast('Wait for sync to finish.', 'info');
+    return;
+  }
+  if (modal.id === 'projectsModal') void flushProjectAutosave();
+  if (modal.id === 'settingsModal') flushSettingsAutosaves();
   modal.classList.remove('open');
+  modal.inert = true;
   modal.setAttribute('aria-hidden', 'true');
   openModalStack = openModalStack.filter(m => m !== modal);
+  const previous = openModalStack[openModalStack.length - 1];
+  if (previous) {
+    previous.inert = false;
+    previous.setAttribute('aria-hidden', 'false');
+  }
 
   if (!restoreFocus) return;
   const prevFocus = modalFocusReturn.get(modal);
@@ -319,6 +388,11 @@ function closeTopModal(restoreFocus = true) {
 function openTransientDialog(overlay, popup, focusTarget = popup) {
   if (transientDialogClose) transientDialogClose();
   transientDialogFocusReturn = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const underlyingModal = openModalStack[openModalStack.length - 1] || null;
+  if (underlyingModal) {
+    underlyingModal.inert = true;
+    underlyingModal.setAttribute('aria-hidden', 'true');
+  }
   popup.setAttribute('role', 'dialog');
   popup.setAttribute('aria-modal', 'true');
   if (!popup.hasAttribute('tabindex')) popup.setAttribute('tabindex', '-1');
@@ -329,6 +403,10 @@ function openTransientDialog(overlay, popup, focusTarget = popup) {
     const previous = transientDialogFocusReturn;
     transientDialogFocusReturn = null;
     if (transientDialogClose === close) transientDialogClose = null;
+    if (underlyingModal && underlyingModal.classList.contains('open')) {
+      underlyingModal.inert = false;
+      underlyingModal.setAttribute('aria-hidden', 'false');
+    }
     if (previous && document.contains(previous)) previous.focus();
   };
   const onKey = event => {
@@ -353,7 +431,9 @@ function initModalAccessibility() {
     dialog.setAttribute('role', 'dialog');
     dialog.setAttribute('aria-modal', 'true');
     if (!dialog.hasAttribute('tabindex')) dialog.setAttribute('tabindex', '-1');
-    modal.setAttribute('aria-hidden', modal.classList.contains('open') ? 'false' : 'true');
+    const open = modal.classList.contains('open');
+    modal.inert = !open;
+    modal.setAttribute('aria-hidden', open ? 'false' : 'true');
     if (modal.dataset.a11yInit === '1') return;
 
     modal.addEventListener('click', (e) => {
@@ -416,6 +496,108 @@ function renderConnectionChip() {
   providerEl.textContent = model ? provider.name : 'Not connected';
   modelEl.textContent = model ? (formatModelForDisplay(model, 25) + (profile?.name ? ' · ' + profile.name : '')) : 'Set up a provider';
   if (chip) chip.setAttribute('aria-label', model ? 'API connection: ' + provider.name + ', ' + model + (profile?.name ? ', profile ' + profile.name : '') : 'Open API settings');
+}
+
+function renderConversationHeader() {
+  const conv = getActiveConv();
+  const title = conv?.title || 'Synapse';
+  const toolbarTitle = document.getElementById('toolbarTitle');
+  const contextTitle = document.getElementById('contextConversationTitle');
+  if (toolbarTitle) {
+    toolbarTitle.textContent = title;
+    toolbarTitle.title = title;
+  }
+  if (contextTitle) contextTitle.textContent = title;
+}
+
+function readCachedModels() {
+  try {
+    const models = JSON.parse(localStorage.getItem('llmModelList') || '[]');
+    return Array.isArray(models) ? models.filter(model => typeof model === 'string' && model.trim()) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function renderConnectionPicker(query = '') {
+  const results = document.getElementById('connectionPickerResults');
+  if (!results) return;
+  const search = String(query || '').trim().toLowerCase();
+  results.replaceChildren();
+  const addSection = (label, items, choose) => {
+    const filtered = items.filter(item => item.label.toLowerCase().includes(search));
+    if (!filtered.length) return;
+    const heading = document.createElement('div');
+    heading.className = 'connection-picker-label';
+    heading.textContent = label;
+    results.appendChild(heading);
+    filtered.forEach(item => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.setAttribute('role', 'menuitem');
+      button.textContent = item.label;
+      if (item.detail) {
+        const detail = document.createElement('small');
+        detail.textContent = item.detail;
+        button.appendChild(detail);
+      }
+      button.onclick = () => choose(item);
+      results.appendChild(button);
+    });
+  };
+  const profiles = loadProfiles().map(profile => {
+    const summary = getConnectionSummary(profile.settings || {});
+    return { label: profile.name || 'Unnamed profile', detail: summary.provider.name + ' · ' + summary.model, profile };
+  });
+  addSection('Profiles', profiles, item => {
+    applyProfile(item.profile);
+    closeConnectionPicker();
+  });
+  const current = localStorage.getItem('llmModel') || '';
+  const models = [...new Set([current, ...readCachedModels()].filter(Boolean))].map(model => ({ label: model, model }));
+  addSection('Current provider', models, item => {
+    localStorage.setItem('llmModel', item.model);
+    localStorage.removeItem('assistantActiveProfileId');
+    syncScheduleAutoPush();
+    renderConnectionChip();
+    renderMessages({ preserveScroll: true });
+    updateTokenInfo();
+    closeConnectionPicker();
+    announce('Model changed to ' + item.model + '.');
+  });
+  if (!results.children.length) {
+    const empty = document.createElement('p');
+    empty.className = 'connection-picker-empty';
+    empty.textContent = 'No matching models or profiles.';
+    results.appendChild(empty);
+  }
+}
+
+function toggleConnectionPicker(event) {
+  event?.stopPropagation();
+  const picker = document.getElementById('connectionPicker');
+  const chip = document.getElementById('connectionChip');
+  if (!picker || !chip) return;
+  const opening = picker.hidden;
+  closeSidebarMenu(false);
+  closeComposerMenu(false);
+  picker.hidden = !opening;
+  chip.setAttribute('aria-expanded', String(opening));
+  if (opening) {
+    const search = document.getElementById('connectionPickerSearch');
+    search.value = '';
+    renderConnectionPicker();
+    search.focus();
+  }
+}
+
+function closeConnectionPicker(restoreFocus = false) {
+  const picker = document.getElementById('connectionPicker');
+  const chip = document.getElementById('connectionChip');
+  if (!picker || picker.hidden) return;
+  picker.hidden = true;
+  chip?.setAttribute('aria-expanded', 'false');
+  if (restoreFocus) chip?.focus();
 }
 
 function getKeyStorageMode() {
@@ -507,6 +689,8 @@ function normalizeQueuedFollowUps(raw) {
 function normalizeConversationRecord(raw) {
   const conv = raw && typeof raw === 'object' ? raw : {};
   const normalized = { ...conv };
+  delete normalized.temporary;
+  delete normalized.isTemporary;
   normalized.id = String(normalized.id || '');
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(normalized.id)) normalized.id = genId();
   normalized.title = String(normalized.title || 'New Chat');
@@ -550,6 +734,7 @@ function normalizeConversationRecord(raw) {
         results: Array.isArray(block?.results) ? block.results.map(result => ({ ...result, url: safeHttpUrl(result?.url) })).filter(result => result.url || result.title) : block?.results
       })) : []));
       if (message.role === 'assistant') {
+        if (message.comparison !== true) delete message.comparison;
         message.swipes = Array.isArray(message.swipes) ? message.swipes.map(value => String(value ?? '')) : [];
         if (message.swipes.length === 0) {
           const content = Array.isArray(message.content)
@@ -560,7 +745,7 @@ function normalizeConversationRecord(raw) {
         if (!Number.isInteger(message.swipeIndex)) message.swipeIndex = 0;
         message.swipeIndex = Math.max(0, Math.min(message.swipes.length - 1, message.swipeIndex));
         message.content = message.swipes[message.swipeIndex];
-      }
+      } else delete message.comparison;
       if (message.includeInContext !== false) message.includeInContext = true;
       return message;
     });
@@ -1028,10 +1213,12 @@ function showToast(message, type = 'info', duration = 3000, action = null) {
   toast.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
   toast.setAttribute('aria-atomic', 'true');
   container.appendChild(toast);
-  setTimeout(() => {
-    toast.classList.add('removing');
-    setTimeout(() => toast.remove(), 300);
-  }, duration);
+  if (duration > 0) {
+    setTimeout(() => {
+      toast.classList.add('removing');
+      setTimeout(() => toast.remove(), 300);
+    }, duration);
+  }
 }
 
 // ============================================
@@ -1109,8 +1296,8 @@ function applyTheme(name) {
   s.setProperty('--msg-user', t.msgUser);
   s.setProperty('--msg-assistant', t.msgAssistant);
   s.setProperty('--hover', isLightColor(t.bg) ? 'rgba(0,0,0,0.05)' : 'rgba(255,255,255,0.05)');
-  s.setProperty('--accent-text', isLightColor(t.accent) ? '#101014' : '#f7f8ff');
-  s.setProperty('--msg-user-text', isLightColor(t.msgUser) ? '#101014' : '#f7f8ff');
+  s.setProperty('--accent-text', getContrastText(t.accent));
+  s.setProperty('--msg-user-text', getContrastText(t.msgUser));
   const bgLight = isLightColor(t.bg);
   // Lets the stylesheet re-skin the (dark-only) highlight.js token colors.
   document.body.classList.toggle('theme-light', bgLight);
@@ -1123,10 +1310,19 @@ function applyTheme(name) {
   s.setProperty('--msg-font-size', t.msgFontSize || '0.95em');
   s.setProperty('--code-bg', t.codeBg || (bgLight ? 'rgba(0,0,0,0.06)' : 'rgba(0,0,0,0.3)'));
   s.setProperty('--card-bg', bgLight ? 'rgba(0, 0, 0, 0.06)' : 'rgba(255, 255, 255, 0.08)');
+  const danger = bgLight ? '#dc2626' : '#ef4444';
+  const dangerHover = bgLight ? '#b91c1c' : '#dc2626';
+  const success = '#22c55e';
+  const warning = '#eab308';
   s.setProperty('--error-color', bgLight ? '#dc2626' : '#ff7777');
-  s.setProperty('--danger-color', bgLight ? '#dc2626' : '#ef4444');
-  s.setProperty('--danger-hover', bgLight ? '#b91c1c' : '#dc2626');
-  s.setProperty('--success-color', '#22c55e');
+  s.setProperty('--danger-color', danger);
+  s.setProperty('--danger-hover', dangerHover);
+  s.setProperty('--danger-text', getContrastText(danger));
+  s.setProperty('--success-color', success);
+  s.setProperty('--success-text', getContrastText(success));
+  s.setProperty('--warning-color', warning);
+  s.setProperty('--warning-text', getContrastText(warning));
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', t.bg);
   if (!readOnlyShare) localStorage.setItem('assistantTheme', name);
 
   const btn = document.getElementById('themeToggle');
@@ -1201,6 +1397,9 @@ function onThemeSelectChange() {
   }
   applyTheme(val);
   syncScheduleAutoPush();
+  if (document.getElementById('settingsModal')?.classList.contains('open')) {
+    setSettingsSaveStatus(_appearanceSettingsAutosavePending ? 'Saving...' : 'Appearance saved.');
+  }
 }
 
 function loadCustomColorPickers() {
@@ -1237,6 +1436,7 @@ function resetCustomTheme() {
   document.getElementById('customThemeColors').style.display = 'none';
   applyTheme('dark');
   syncScheduleAutoPush();
+  if (document.getElementById('settingsModal')?.classList.contains('open')) setSettingsSaveStatus('Appearance saved.');
 }
 
 function getCustomThemeFromPickers() {
@@ -1267,6 +1467,9 @@ function liveCustomTheme() {
   localStorage.setItem('assistantCustomTheme', JSON.stringify(t));
   applyTheme('custom');
   syncScheduleAutoPush();
+  if (document.getElementById('settingsModal')?.classList.contains('open')) {
+    setSettingsSaveStatus(_appearanceSettingsAutosavePending ? 'Saving...' : 'Appearance saved.');
+  }
 }
 
 // ============================================
@@ -1385,9 +1588,9 @@ function isNetworkLikeFetchError(err) {
     || lower.includes('mixed content');
 }
 
-async function fetchApiWithHttpSupport(url, options, baseUrl, forceSensitive = false) {
+async function fetchApiWithHttpSupport(url, options, baseUrl, forceSensitive = false, proxyOverride = '') {
   const apiBase = String(baseUrl || '').trim();
-  const corsProxy = getCorsProxyUrl();
+  const corsProxy = proxyOverride ? normalizeCorsProxyUrl(proxyOverride) : getCorsProxyUrl();
   const proxyAllowed = canUseCorsProxy(url, options, corsProxy, forceSensitive);
   const tryProxyFetch = async () => fetch(corsProxy + encodeURIComponent(url), options);
   const tryDirectFetch = async () => fetch(url, options);
@@ -1662,37 +1865,735 @@ async function getMemoryPrompt() {
     memories.map(m => '- ' + m.text).join('\n');
 }
 
-async function callApiNonStreaming(messages) {
-  const baseUrl = (localStorage.getItem('llmProxyUrl') || '').replace(/\/+$/, '');
-  const apiKey = getApiKey();
-  const model = localStorage.getItem('llmModel') || '';
-  const format = localStorage.getItem('llmApiFormat') && localStorage.getItem('llmApiFormat') !== 'auto'
-    ? localStorage.getItem('llmApiFormat') : detectApiFormat(model);
-
-  let url, headers, body;
-  if (format === 'anthropic') {
-    url = baseUrl + '/messages';
-    headers = buildProviderHeaders('anthropic', apiKey);
-    const prepared = prepareAnthropicMessages(messages);
-    body = { model, system: prepared.system, messages: prepared.messages, max_tokens: 512, stream: false };
-  } else {
-    url = baseUrl + '/chat/completions';
-    headers = buildProviderHeaders('openai', apiKey);
-    body = { model, messages, stream: false, max_tokens: 512 };
-  }
-
-  const resp = await fetchApiWithHttpSupport(url, { method: 'POST', headers, body: JSON.stringify(body) }, baseUrl);
-  if (!resp.ok) throw new Error('HTTP ' + resp.status);
-  const data = await resp.json();
-
-  if (format === 'anthropic') {
-    return (data.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
-  }
-  return data.choices?.[0]?.message?.content || '';
+function inferRequestProvider(settings = {}) {
+  const explicit = String(settings.llmProvider || '').trim();
+  if (explicit && PROVIDER_PRESETS[explicit]) return explicit;
+  const base = String(settings.llmProxyUrl || '').toLowerCase();
+  const format = String(settings.llmApiFormat || 'auto').toLowerCase();
+  if (base.includes('openrouter')) return 'openrouter';
+  if (base.includes('anthropic') || format === 'anthropic') return 'anthropic';
+  if (base.includes('11434') || base.includes('ollama')) return 'ollama';
+  if (base.includes('1234') || base.includes('lmstudio')) return 'lmstudio';
+  if (base.includes('openai.com')) return 'openai';
+  return 'custom';
 }
 
-async function extractMemories(conversationMessages) {
-  if (!isMemoryEnabled()) return;
+function resolveRequestApiFormat(settings, provider, model) {
+  const explicit = String(settings.llmApiFormat || 'auto').toLowerCase();
+  if (explicit !== 'auto') return explicit === 'anthropic' ? 'anthropic' : 'openai';
+  const preset = getProviderPreset(provider);
+  if (preset.apiFormat !== 'auto') return preset.apiFormat;
+  return /^claude/i.test(model) ? 'anthropic' : 'openai';
+}
+
+function buildRequestTarget(settings = {}, options = {}) {
+  const rawBase = String(settings.llmProxyUrl || '').trim().replace(/\/(?:chat\/completions|messages)\/?$/i, '');
+  const baseUrl = sanitizeStoredUrl(rawBase).replace(/\/+$/, '');
+  const model = String(options.model || settings.llmModel || '').trim();
+  if (!baseUrl) throw new Error('Set a valid API base URL first.');
+  if (!model) throw new Error('Choose a model first.');
+  const provider = inferRequestProvider(settings);
+  const apiFormat = resolveRequestApiFormat(settings, provider, model);
+  const temperature = Number.parseFloat(settings.llmTemperature);
+  const maxTokens = Number.parseInt(settings.llmMaxTokens, 10);
+  const contextWindow = Number.parseInt(settings.llmContextWindow, 10);
+  let host = baseUrl;
+  try { host = new URL(baseUrl).host; } catch (error) {}
+  return Object.freeze({
+    provider,
+    baseUrl,
+    host,
+    model,
+    apiFormat,
+    temperature: Number.isFinite(temperature) ? temperature : null,
+    maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? maxTokens : null,
+    contextWindow: Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : null,
+    corsProxy: normalizeCorsProxyUrl(settings.llmCorsProxy || ''),
+    profileId: String(options.profileId || ''),
+    profileName: String(options.profileName || ''),
+    keyRequired: getProviderPreset(provider).keyRequired,
+    apiKey: String(options.apiKey || '').trim()
+  });
+}
+
+function getActiveRequestTarget(model = localStorage.getItem('llmModel') || '') {
+  const settings = {};
+  ['llmProvider', 'llmProxyUrl', 'llmModel', 'llmApiFormat', 'llmTemperature', 'llmMaxTokens', 'llmContextWindow', 'llmCorsProxy']
+    .forEach(key => { settings[key] = localStorage.getItem(key) || ''; });
+  const profile = getActiveProfile();
+  return buildRequestTarget(settings, { model, apiKey: getApiKey(), profileId: profile?.id, profileName: profile?.name });
+}
+
+function requestAuthoritiesMatch(left, right) {
+  return Boolean(left && right && left.baseUrl === right.baseUrl && left.provider === right.provider && left.apiFormat === right.apiFormat);
+}
+
+function resolveRequestTargetKey(target, active, suppliedKey = '') {
+  const supplied = String(suppliedKey || '').trim();
+  if (supplied) return supplied;
+  return requestAuthoritiesMatch(target, active) ? String(active.apiKey || '') : '';
+}
+
+function getProfileRequestTarget(profile, suppliedKey = '') {
+  if (!profile?.settings) throw new Error('This saved profile is incomplete.');
+  const target = buildRequestTarget(profile.settings, { profileId: profile.id, profileName: profile.name });
+  let active = null;
+  try { active = getActiveRequestTarget(); } catch (error) {}
+  const apiKey = resolveRequestTargetKey(target, active, suppliedKey);
+  if (target.keyRequired && !apiKey) throw new Error('Enter a temporary API key for ' + target.host + '.');
+  return Object.freeze({ ...target, apiKey });
+}
+
+function getTrustedCorsProxyHost(target) {
+  if (!target?.corsProxy || isLocalUrl(target.baseUrl)) return '';
+  const endpoint = target.apiFormat === 'anthropic' ? '/messages' : '/chat/completions';
+  const options = { method: 'POST', headers: { Authorization: 'Bearer [redacted]' }, body: '{}' };
+  if (!canUseCorsProxy(target.baseUrl + endpoint, options, target.corsProxy, true)) return '';
+  try { return new URL(target.corsProxy).host; } catch (error) { return ''; }
+}
+
+function formatRequestTargetDestination(target) {
+  const proxyHost = getTrustedCorsProxyHost(target);
+  return 'API: ' + target.host + (proxyHost ? ' · Proxy: ' + proxyHost : '') + ' · ' + target.model;
+}
+
+function prepareOpenAiMessages(apiMessages) {
+  return (apiMessages || []).map(message => {
+    if (!Array.isArray(message.content)) return message;
+    if (message.role === 'assistant') {
+      const text = message.content.filter(part => part.type === 'text').map(part => part.text || '').join('');
+      return { ...message, content: text || '[Generated image]' };
+    }
+    return {
+      ...message,
+      content: message.content.map(part => {
+        if (part.type === 'image_url' && part.image_url) return { type: 'image_url', image_url: { url: part.image_url.url } };
+        if (part.type === 'file') {
+          const name = part.file?.name || 'file';
+          return typeof part.file?.textContent === 'string'
+            ? { type: 'text', text: `--- ${name} ---\n${part.file.textContent}\n--- end ${name} ---` }
+            : { type: 'text', text: `[Attached file: ${name}]` };
+        }
+        return part;
+      })
+    };
+  });
+}
+
+async function callApiNonStreaming(messages, options = {}) {
+  const target = options.target || getActiveRequestTarget();
+  if (target.keyRequired && !target.apiKey) throw new Error('Enter an API key for ' + target.host + '.');
+  const outputTokens = Number.isFinite(Number(options.maxTokens)) && Number(options.maxTokens) > 0 ? Number(options.maxTokens) : 512;
+  let url;
+  let headers;
+  let body;
+  if (target.apiFormat === 'anthropic') {
+    url = target.baseUrl + '/messages';
+    headers = buildProviderHeaders('anthropic', target.apiKey);
+    const prepared = prepareAnthropicMessages(messages);
+    body = { model: target.model, system: prepared.system, messages: prepared.messages, max_tokens: outputTokens, stream: false };
+  } else {
+    url = target.baseUrl + '/chat/completions';
+    headers = buildProviderHeaders('openai', target.apiKey);
+    body = { model: target.model, messages: prepareOpenAiMessages(messages), stream: false };
+    const tokenKey = target.provider === 'openai' && /^(?:o\d|gpt-5)/i.test(target.model) ? 'max_completion_tokens' : 'max_tokens';
+    body[tokenKey] = outputTokens;
+  }
+  if (target.temperature !== null && !NO_SAMPLING_PARAMS_RE.test(target.model)) body.temperature = target.temperature;
+
+  const resp = await fetchApiWithHttpSupport(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    signal: options.signal
+  }, target.baseUrl, false, target.corsProxy);
+  if (!resp.ok) {
+    let detail = '';
+    try { detail = (await resp.text()).slice(0, 200); } catch (error) {}
+    const error = new Error('API returned ' + resp.status + (detail ? ': ' + detail : ''));
+    error.httpStatus = resp.status;
+    throw error;
+  }
+  const data = await resp.json();
+  const text = target.apiFormat === 'anthropic'
+    ? (data.content || []).filter(part => part.type === 'text').map(part => part.text || '').join('')
+    : (Array.isArray(data.choices?.[0]?.message?.content)
+        ? data.choices[0].message.content.filter(part => part.type === 'text').map(part => part.text || '').join('')
+        : String(data.choices?.[0]?.message?.content || ''));
+  if (!text.trim()) throw new Error('The provider returned an empty response.');
+  return text;
+}
+
+function getTargetContextWindow(target) {
+  if (target?.contextWindow) return target.contextWindow;
+  try {
+    const metadata = JSON.parse(localStorage.getItem('llmModelMetadata') || '{}');
+    const value = Number(metadata[target?.model]?.context_length ?? metadata[target?.model]);
+    return value > 0 ? value : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function guardTargetContextLimit(apiMessages, target, maxOutput) {
+  const contextWindow = getTargetContextWindow(target);
+  if (!contextWindow) return false;
+  const promptTokens = (apiMessages || []).reduce((total, message) => total + estimateTokens(
+    typeof message.content === 'string' ? message.content : JSON.stringify(message.content || '')
+  ), 0);
+  if (promptTokens + maxOutput <= contextWindow) return false;
+  showToast(formatModelForDisplay(target.model, 30) + ' needs about ' + formatTokenCount(promptTokens + maxOutput) +
+    ' tokens, above its ' + formatTokenCount(contextWindow) + ' token context window.', 'error', 7000);
+  return true;
+}
+
+function insertComposerText(text) {
+  const input = document.getElementById('chatInput');
+  if (!input) return;
+  const value = String(text || '').trim();
+  if (!value) return;
+  if (input.value.trim()) {
+    const start = input.selectionStart;
+    const prefix = start > 0 && !/\s$/.test(input.value.slice(0, start)) ? '\n' : '';
+    input.setRangeText(prefix + value, start, input.selectionEnd, 'end');
+  } else {
+    input.value = value;
+    input.setSelectionRange(value.length, value.length);
+  }
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.focus();
+}
+
+async function completeDraft() {
+  if (readOnlyShare || sending || streaming) return;
+  const input = document.getElementById('chatInput');
+  const conv = getActiveConv();
+  if (!input || !conv || !input.value.trim()) {
+    showToast('Write part of a message first.', 'info');
+    return;
+  }
+  const snapshot = {
+    convId: conv.id,
+    value: input.value,
+    start: input.selectionStart,
+    end: input.selectionEnd
+  };
+  if (!beginSendingAction()) return;
+  try {
+    const target = getActiveRequestTarget();
+    const context = await buildRequestMessages(conv, { messageList: messages });
+    const apiMessages = [
+      { role: 'system', content: 'Complete the unfinished user draft at the cursor. Return only the exact text to insert. Do not quote, explain, or repeat text before the cursor.' },
+      ...context.messages,
+      { role: 'user', content: 'Text before cursor:\n' + snapshot.value.slice(0, snapshot.start) + '\n\nText after cursor:\n' + snapshot.value.slice(snapshot.end) }
+    ];
+    if (guardTargetContextLimit(apiMessages, target, 128)) return;
+    const completion = await callApiNonStreaming(apiMessages, { target, maxTokens: 128 });
+    if (activeConvId !== snapshot.convId || input.value !== snapshot.value ||
+        input.selectionStart !== snapshot.start || input.selectionEnd !== snapshot.end) {
+      showToast('Draft changed, so the completion was not inserted.', 'info');
+      return;
+    }
+    input.setRangeText(completion, snapshot.start, snapshot.end, 'end');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.focus();
+    announce('Draft completed. Review it before sending.');
+  } catch (error) {
+    showToast('Could not complete the draft: ' + sanitizeErrorDetail(error), 'error', 6000);
+  } finally {
+    endSendingAction();
+  }
+}
+
+function parseFollowUpSuggestions(raw) {
+  const text = String(raw || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  const start = text.indexOf('[');
+  const end = text.lastIndexOf(']');
+  if (start === -1 || end < start) throw new Error('The provider did not return a suggestion list.');
+  const parsed = JSON.parse(text.slice(start, end + 1));
+  if (!Array.isArray(parsed)) throw new Error('The provider did not return a suggestion list.');
+  const seen = new Set();
+  const suggestions = [];
+  parsed.forEach(value => {
+    if (typeof value !== 'string') return;
+    const suggestion = value.trim().slice(0, 280);
+    const key = suggestion.toLocaleLowerCase();
+    if (!suggestion || seen.has(key) || suggestions.length >= 3) return;
+    seen.add(key);
+    suggestions.push(suggestion);
+  });
+  if (!suggestions.length) throw new Error('The provider returned no usable suggestions.');
+  return suggestions;
+}
+
+function showFollowUpSuggestions(suggestions, snapshot) {
+  const overlay = document.createElement('div');
+  overlay.className = 'char-info-overlay';
+  const popup = document.createElement('div');
+  popup.className = 'char-info-popup manual-ai-dialog';
+  popup.setAttribute('aria-labelledby', 'followUpSuggestionsTitle');
+  const heading = document.createElement('h3');
+  heading.id = 'followUpSuggestionsTitle';
+  heading.textContent = 'Suggested follow-ups';
+  const note = document.createElement('p');
+  note.className = 'manual-ai-note';
+  note.textContent = 'Choose one to place it in the composer. Nothing is sent automatically.';
+  const list = document.createElement('div');
+  list.className = 'suggestion-list';
+  let close;
+  suggestions.forEach(suggestion => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'suggestion-btn';
+    button.textContent = suggestion;
+    button.onclick = () => {
+      const source = messages[snapshot.messageIndex];
+      if (activeConvId !== snapshot.convId || source !== snapshot.message ||
+          source?.swipeIndex !== snapshot.swipeIndex || getMsgText(source) !== snapshot.text) {
+        close();
+        showToast('The source response changed. Generate suggestions again.', 'info');
+        return;
+      }
+      insertComposerText(suggestion);
+      close();
+      announce('Suggestion placed in the composer.');
+    };
+    list.appendChild(button);
+  });
+  const closeButton = document.createElement('button');
+  closeButton.type = 'button';
+  closeButton.className = 'btn btn-secondary';
+  closeButton.textContent = 'Close';
+  popup.append(heading, note, list, closeButton);
+  close = openTransientDialog(overlay, popup, list.querySelector('button'));
+  closeButton.onclick = close;
+}
+
+async function suggestFollowUps(messageIndex) {
+  if (readOnlyShare || sending || streaming) return;
+  const conv = getActiveConv();
+  const message = messages[messageIndex];
+  const request = getSwipeRequest(message);
+  if (!conv || message?.role !== 'assistant' || messageIndex !== messages.length - 1 ||
+      !getMsgText(message).trim() || (request && request.status !== 'complete')) return;
+  const snapshot = {
+    convId: conv.id,
+    messageIndex,
+    message,
+    swipeIndex: message.swipeIndex || 0,
+    text: getMsgText(message)
+  };
+  if (!beginSendingAction()) return;
+  try {
+    const target = getActiveRequestTarget();
+    const context = await buildRequestMessages(conv, { messageList: messages, untilIndex: messageIndex + 1 });
+    const apiMessages = [
+      { role: 'system', content: 'Suggest exactly three concise messages the user could send next. Return only a JSON array of three strings. Do not include markdown or explanations.' },
+      ...context.messages
+    ];
+    if (guardTargetContextLimit(apiMessages, target, 256)) return;
+    const suggestions = parseFollowUpSuggestions(await callApiNonStreaming(apiMessages, { target, maxTokens: 256 }));
+    const source = messages[snapshot.messageIndex];
+    if (activeConvId !== snapshot.convId || source !== snapshot.message ||
+        source?.swipeIndex !== snapshot.swipeIndex || getMsgText(source) !== snapshot.text) {
+      showToast('The response changed, so the suggestions were discarded.', 'info');
+      return;
+    }
+    showFollowUpSuggestions(suggestions, snapshot);
+  } catch (error) {
+    showToast('Could not suggest follow-ups: ' + sanitizeErrorDetail(error), 'error', 6000);
+  } finally {
+    endSendingAction();
+  }
+}
+
+function comparisonTargetIdentity(target) {
+  return [target?.provider, target?.baseUrl, target?.apiFormat, target?.model].join('\n');
+}
+
+function getComparisonTargetChoices() {
+  const choices = [];
+  const currentModel = localStorage.getItem('llmModel') || '';
+  [...new Set([currentModel, ...readCachedModels()].filter(Boolean))].forEach(model => {
+    choices.push({ kind: 'model', model, label: model, detail: 'Current provider' });
+  });
+  loadProfiles().forEach(profile => {
+    try {
+      const target = buildRequestTarget(profile.settings || {}, { profileId: profile.id, profileName: profile.name });
+      choices.push({
+        kind: 'profile',
+        profile,
+        label: profile.name || 'Unnamed profile',
+        detail: formatRequestTargetDestination(target)
+      });
+    } catch (error) {}
+  });
+  return choices.map((choice, index) => ({ ...choice, id: 'target-' + index }));
+}
+
+function createComparisonTargetField(slot, choices, defaultId) {
+  const section = document.createElement('fieldset');
+  section.className = 'comparison-target';
+  const legend = document.createElement('legend');
+  legend.textContent = 'Target ' + slot;
+  const select = document.createElement('select');
+  select.setAttribute('aria-label', 'Comparison target ' + slot);
+  choices.forEach(choice => {
+    const option = document.createElement('option');
+    option.value = choice.id;
+    option.textContent = choice.label + ' · ' + choice.detail;
+    select.appendChild(option);
+  });
+  const manualOption = document.createElement('option');
+  manualOption.value = 'manual';
+  manualOption.textContent = 'Other model on current provider';
+  select.appendChild(manualOption);
+  select.value = defaultId || 'manual';
+
+  const manual = document.createElement('input');
+  manual.type = 'text';
+  manual.placeholder = 'Model name';
+  manual.setAttribute('aria-label', 'Model name for target ' + slot);
+
+  const destination = document.createElement('p');
+  destination.className = 'comparison-destination';
+  const keyLabel = document.createElement('label');
+  keyLabel.className = 'comparison-key';
+  const keyText = document.createElement('span');
+  const keyInput = document.createElement('input');
+  keyInput.type = 'password';
+  keyInput.autocomplete = 'off';
+  keyInput.spellcheck = false;
+  keyLabel.append(keyText, keyInput);
+
+  const selectedChoice = () => choices.find(choice => choice.id === select.value) || null;
+  const previewTarget = () => {
+    const choice = selectedChoice();
+    if (choice?.kind === 'profile') return buildRequestTarget(choice.profile.settings || {}, { profileId: choice.profile.id, profileName: choice.profile.name });
+    const model = choice?.kind === 'model' ? choice.model : manual.value.trim();
+    if (!model) throw new Error('Enter a model name.');
+    return getActiveRequestTarget(model);
+  };
+  const update = () => {
+    manual.hidden = select.value !== 'manual';
+    keyLabel.hidden = true;
+    keyInput.required = false;
+    try {
+      const target = previewTarget();
+      destination.textContent = formatRequestTargetDestination(target);
+      let active = null;
+      try { active = getActiveRequestTarget(); } catch (error) {}
+      const crossAuthority = selectedChoice()?.kind === 'profile' && !requestAuthoritiesMatch(target, active);
+      const showKey = crossAuthority && (target.keyRequired || target.provider === 'custom');
+      keyLabel.hidden = !showKey;
+      keyInput.required = showKey && target.keyRequired;
+      keyText.textContent = target.keyRequired ? 'Temporary API key' : 'Temporary API key (optional)';
+      keyInput.setAttribute('aria-label', keyText.textContent + ' for ' + target.host);
+    } catch (error) {
+      destination.textContent = manual.hidden ? 'This target is incomplete.' : 'Enter a model name.';
+    }
+  };
+  const resolve = () => {
+    const choice = selectedChoice();
+    if (choice?.kind === 'profile') return getProfileRequestTarget(choice.profile, keyInput.value);
+    const model = choice?.kind === 'model' ? choice.model : manual.value.trim();
+    if (!model) throw new Error('Enter a model name for target ' + slot + '.');
+    return getActiveRequestTarget(model);
+  };
+  select.onchange = update;
+  manual.oninput = update;
+  section.append(legend, select, manual, destination, keyLabel);
+  update();
+  return { section, select, keyInput, resolve, update };
+}
+
+function selectAssistantSwipe(message, swipeIndex) {
+  if (!message?.swipes?.length) return;
+  const next = Math.max(0, Math.min(message.swipes.length - 1, swipeIndex));
+  message.swipeIndex = next;
+  message.content = message.swipes[next];
+  message.images = message.swipeImages?.[next] || [];
+  const llm = message.swipeLlms?.[next];
+  if (llm) {
+    message.llm = llm;
+    message.model = llm.model;
+    message.apiFormat = llm.apiFormat;
+  }
+  if (Number.isFinite(message.swipeTokenEstimates?.[next])) message.tokenEstimate = message.swipeTokenEstimates[next];
+}
+
+function applyComparisonSettledResults(assistantMsg, targets, settled) {
+  const successful = [];
+  settled.forEach((result, index) => {
+    const request = assistantMsg.swipeRequests[index];
+    if (result.status === 'fulfilled') {
+      assistantMsg.swipes[index] = String(result.value || '').trim();
+      finishRequestMetadata(request, 'complete');
+      successful.push(index);
+    } else {
+      const stopped = result.reason?.name === 'AbortError';
+      assistantMsg.swipes[index] = stopped
+        ? 'Request stopped.'
+        : 'No response. Open request details to see what happened.';
+      finishRequestMetadata(request, stopped ? 'stopped' : 'failed', result.reason, result.reason?.httpStatus);
+    }
+    selectAssistantSwipe(assistantMsg, index);
+    updateMessageTokenMetadata(assistantMsg, index);
+  });
+  selectAssistantSwipe(assistantMsg, successful[0] ?? 0);
+  return successful;
+}
+
+function showComparisonResults(conv, assistantMsg, targets) {
+  const messageIndex = messages.indexOf(assistantMsg);
+  if (messageIndex < 0 || activeConvId !== conv.id) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'char-info-overlay';
+  const popup = document.createElement('div');
+  popup.className = 'char-info-popup manual-ai-dialog comparison-results-dialog';
+  popup.setAttribute('aria-labelledby', 'comparisonResultsTitle');
+  const heading = document.createElement('h3');
+  heading.id = 'comparisonResultsTitle';
+  heading.textContent = 'Compare responses';
+  const note = document.createElement('p');
+  note.className = 'manual-ai-note';
+  note.textContent = 'The chosen response is used as future conversation context.';
+  const grid = document.createElement('div');
+  grid.className = 'comparison-results';
+  let close;
+  targets.forEach((target, index) => {
+    const card = document.createElement('section');
+    card.className = 'comparison-result';
+    const title = document.createElement('h4');
+    title.textContent = target.profileName || target.model;
+    const meta = document.createElement('small');
+    meta.textContent = target.destination;
+    const response = document.createElement('pre');
+    response.textContent = assistantMsg.swipes[index] || 'No response.';
+    const request = assistantMsg.swipeRequests[index];
+    const use = document.createElement('button');
+    use.type = 'button';
+    use.className = 'btn ' + (assistantMsg.swipeIndex === index ? 'btn-primary' : 'btn-secondary');
+    use.textContent = assistantMsg.swipeIndex === index ? 'Using this response' : 'Use this response';
+    use.disabled = request?.status !== 'complete';
+    use.onclick = () => {
+      if (activeConvId !== conv.id || messages[messageIndex] !== assistantMsg) {
+        close();
+        showToast('This comparison is no longer active.', 'info');
+        return;
+      }
+      selectAssistantSwipe(assistantMsg, index);
+      conv.updatedAt = Date.now();
+      saveConversations();
+      renderMessages({ preserveScroll: true });
+      close();
+      announce('Selected ' + target.model + ' for future context.');
+    };
+    card.append(title, meta, response, use);
+    grid.appendChild(card);
+  });
+  const done = document.createElement('button');
+  done.type = 'button';
+  done.className = 'btn btn-secondary';
+  done.textContent = 'Close';
+  popup.append(heading, note, grid, done);
+  close = openTransientDialog(overlay, popup, grid.querySelector('button:not(:disabled)') || done);
+  done.onclick = close;
+}
+
+async function runModelComparison(selectedTargets) {
+  if (readOnlyShare || pendingAttachmentReads > 0 || !beginSendingAction()) return;
+  const input = document.getElementById('chatInput');
+  const conv = getActiveConv();
+  const originalText = input?.value || '';
+  const attachments = cloneDraftAttachments(pendingAttachments);
+  const attachmentSnapshot = JSON.stringify(attachments);
+  const draftMessage = buildComposerMessage(originalText, attachments);
+  if (!input || !conv || !draftMessage) {
+    showToast('Write a message or attach a file first.', 'error');
+    endSendingAction();
+    return;
+  }
+  const targets = selectedTargets.slice(0, 2);
+  const publicTargets = targets.map(target => ({
+    model: target.model,
+    profileName: target.profileName,
+    destination: formatRequestTargetDestination(target)
+  }));
+  let controller = null;
+  try {
+    const built = await buildRequestMessages(conv, { messageList: messages, draftMessage });
+    if (activeConvId !== conv.id || input.value !== originalText || JSON.stringify(cloneDraftAttachments(pendingAttachments)) !== attachmentSnapshot) {
+      showToast('The draft changed, so comparison was cancelled.', 'info');
+      return;
+    }
+    const outputLimits = targets.map(target => target.maxTokens || resolveMaxTokens());
+    if (targets.some((target, index) => guardTargetContextLimit(built.messages, target, outputLimits[index]))) return;
+
+    const addedDocs = [];
+    if (attachments.length) {
+      const docs = conv.docs || (conv.docs = []);
+      attachments.forEach(attachment => {
+        if (!attachment?.textContent || attachment.binary) return;
+        const doc = {
+          id: 'doc_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+          name: attachment.name || 'file',
+          text: attachment.textContent.slice(0, 20000),
+          createdAt: Date.now()
+        };
+        docs.push(doc);
+        addedDocs.push(doc);
+      });
+    }
+    const userMsg = { ...draftMessage, timestamp: Date.now() };
+    updateMessageTokenMetadata(userMsg);
+    messages.push(userMsg);
+    delete conv.draft;
+    conv.updatedAt = Date.now();
+    input.value = '';
+    input.style.height = 'auto';
+    pendingAttachments = [];
+    clearModelOverride();
+    renderPreviews();
+    try {
+      await saveConversationImmediately();
+    } catch (error) {
+      messages.pop();
+      if (addedDocs.length) conv.docs = (conv.docs || []).filter(doc => !addedDocs.includes(doc));
+      restoreComposerSnapshot(conv, input, originalText, attachments, '');
+      throw new Error('Could not save your message before comparing: ' + sanitizeErrorDetail(error));
+    }
+    if (conv.title === 'New Chat') {
+      conv.title = (originalText.trim() || 'Attachment chat').slice(0, 40);
+      renderSidebar();
+    }
+
+    const promptTokens = built.messages.reduce((total, message) => total + estimateTokens(
+      typeof message.content === 'string' ? message.content : JSON.stringify(message.content || '')
+    ), 0);
+    const assistantMsg = {
+      role: 'assistant',
+      comparison: true,
+      content: '',
+      swipes: ['', ''],
+      swipeIndex: 0,
+      swipeThinking: ['', ''],
+      swipeToolUse: [[], []],
+      swipeImages: [[], []],
+      swipeSources: [[], []],
+      timestamp: Date.now()
+    };
+    targets.forEach((target, index) => {
+      setAssistantLlmMetadata(assistantMsg, index, target.model, target.apiFormat, target);
+      createRequestMetadata(assistantMsg, index, {
+        model: target.model,
+        apiFormat: target.apiFormat,
+        messageCount: built.messages.length,
+        promptTokens,
+        contextWindow: getTargetContextWindow(target)
+      });
+    });
+    messages.push(assistantMsg);
+    controller = new AbortController();
+    abortController = controller;
+    streaming = true;
+    document.getElementById('sendBtn')?.classList.add('streaming');
+    updateSendBtnState();
+    renderMessages();
+    const lastBubble = document.querySelector('#messagesArea .msg-wrapper.assistant:last-of-type .msg-bubble');
+    if (lastBubble) lastBubble.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
+
+    const settled = await Promise.allSettled(targets.map((target, index) => callApiNonStreaming(built.messages, {
+      target,
+      maxTokens: outputLimits[index],
+      signal: controller.signal
+    })));
+    const successful = applyComparisonSettledResults(assistantMsg, targets, settled);
+    conv.updatedAt = Date.now();
+    await saveConversationImmediately();
+    renderMessages({ preserveScroll: true });
+    updateTokenInfo();
+    if (successful.length) {
+      announce('Model comparison complete.');
+    } else {
+      announce(controller.signal.aborted ? 'Model comparison stopped.' : 'Both comparison requests failed.');
+    }
+    showComparisonResults(conv, assistantMsg, publicTargets);
+  } catch (error) {
+    showToast('Could not compare models: ' + sanitizeErrorDetail(error), 'error', 7000);
+  } finally {
+    if (abortController === controller) abortController = null;
+    streaming = false;
+    document.getElementById('sendBtn')?.classList.remove('streaming');
+    endSendingAction();
+  }
+}
+
+function openCompareModels() {
+  if (readOnlyShare || sending || streaming) return;
+  if (pendingAttachmentReads > 0) {
+    showToast('Wait for attachments to finish reading.', 'info');
+    return;
+  }
+  const input = document.getElementById('chatInput');
+  if (!getActiveConv() || (!input?.value.trim() && pendingAttachments.length === 0)) {
+    showToast('Write a message or attach a file first.', 'info');
+    return;
+  }
+  const choices = getComparisonTargetChoices();
+  const first = createComparisonTargetField('A', choices, choices[0]?.id);
+  const second = createComparisonTargetField('B', choices, choices[1]?.id || 'manual');
+  const overlay = document.createElement('div');
+  overlay.className = 'char-info-overlay';
+  const popup = document.createElement('form');
+  popup.className = 'char-info-popup manual-ai-dialog comparison-dialog';
+  popup.setAttribute('aria-labelledby', 'compareModelsTitle');
+  const heading = document.createElement('h3');
+  heading.id = 'compareModelsTitle';
+  heading.textContent = 'Compare models';
+  const note = document.createElement('p');
+  note.className = 'manual-ai-note';
+  note.textContent = 'The same conversation context goes to both destinations. This makes two billable requests. A custom CORS proxy may also receive the context and key when used. Comparison replies do not use tools and do not stream.';
+  const targets = document.createElement('div');
+  targets.className = 'comparison-targets';
+  targets.append(first.section, second.section);
+  const error = document.createElement('p');
+  error.className = 'manual-ai-error';
+  error.setAttribute('role', 'alert');
+  const actions = document.createElement('div');
+  actions.className = 'modal-actions';
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.className = 'btn btn-secondary';
+  cancel.textContent = 'Cancel';
+  const compare = document.createElement('button');
+  compare.type = 'submit';
+  compare.className = 'btn btn-primary';
+  compare.textContent = 'Compare';
+  actions.append(cancel, compare);
+  popup.append(heading, note, targets, error, actions);
+  let close = openTransientDialog(overlay, popup, first.select);
+  cancel.onclick = close;
+  popup.onsubmit = event => {
+    event.preventDefault();
+    error.textContent = '';
+    try {
+      const selected = [first.resolve(), second.resolve()];
+      if (comparisonTargetIdentity(selected[0]) === comparisonTargetIdentity(selected[1])) {
+        throw new Error('Choose two different models or providers.');
+      }
+      first.keyInput.value = '';
+      second.keyInput.value = '';
+      close();
+      runModelComparison(selected);
+    } catch (submitError) {
+      error.textContent = sanitizeErrorDetail(submitError);
+    }
+  };
+}
+
+async function extractMemories(conversationMessages, conv = getActiveConv()) {
+  if (!isMemoryEnabled() || isTemporaryConversation(conv)) return;
 
   const existing = await loadMemories();
   const existingText = existing.map(m => '- ' + m.text).join('\n') || '(none yet)';
@@ -1952,7 +2853,7 @@ function buildSnippet(text, idx, windowSize = 90) {
 function searchLocalDocs(query, conv) {
   // Project files come first so both callers (the file-search popup and /files) see
   // them without either needing to know projects exist.
-  const projectDocs = (getProject(conv && conv.projectId) || {}).docs || [];
+  const projectDocs = isTemporaryConversation(conv) ? [] : ((getProject(conv && conv.projectId) || {}).docs || []);
   const docs = projectDocs.concat((conv && conv.docs) || []);
   if (!query || !docs.length) return [];
   const q = query.toLowerCase();
@@ -2323,18 +3224,28 @@ function buildConversationTranscript(limit = 40, sourceMessages = messages) {
 }
 
 async function deleteMemory(id) {
+  if (!beginLocalDataOperation()) return;
+  try {
   const existing = await loadMemories();
   if (existing.some(memory => memory.id === id)) syncRecordTombstones('memories', [id]);
   await saveMemories(existing.filter(memory => memory.id !== id));
   openManageMemories();
+  } finally {
+    endLocalDataOperation();
+  }
 }
 
 async function clearAllMemories() {
   if (!confirm('Clear all memories?')) return;
+  if (!beginLocalDataOperation()) return;
+  try {
   const existing = await loadMemories();
   syncRecordTombstones('memories', existing.map(memory => memory.id));
   await saveMemories([]);
   openManageMemories();
+  } finally {
+    endLocalDataOperation();
+  }
 }
 
 // ============================================
@@ -2426,16 +3337,20 @@ function suggestProfileName(settings = {}) {
   return (summary.provider.name + ' - ' + formatModelForDisplay(summary.model, 28)).trim();
 }
 
-function setAssistantLlmMetadata(assistantMsg, swipeIdx, model, format) {
-  const baseUrl = localStorage.getItem('llmProxyUrl') || '';
-  const provider = getLlmProviderInfo(model, format, baseUrl);
-  const activeProfile = getActiveProfile();
+function setAssistantLlmMetadata(assistantMsg, swipeIdx, model, format, requestTarget = null) {
+  const baseUrl = requestTarget?.baseUrl || localStorage.getItem('llmProxyUrl') || '';
+  const providerKey = requestTarget?.provider || '';
+  const symbols = { openai: 'O', anthropic: 'C', openrouter: 'R', ollama: 'L', lmstudio: 'L' };
+  const provider = symbols[providerKey]
+    ? { symbol: symbols[providerKey], name: getProviderPreset(providerKey).label }
+    : getLlmProviderInfo(model, format, baseUrl);
+  const activeProfile = requestTarget ? null : getActiveProfile();
   const metadata = {
     model,
     apiFormat: format,
     providerName: provider.name,
     providerSymbol: provider.symbol,
-    profileName: activeProfile?.name || '',
+    profileName: requestTarget?.profileName || activeProfile?.name || '',
     timestamp: Date.now()
   };
   assistantMsg.model = model;
@@ -2564,7 +3479,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         ? 'Conversation storage is blocked by another tab. Reload after closing older tabs; changes are read-only until then.'
         : 'IndexedDB is unavailable. This tab is using limited browser storage.', 'error', 0);
     }
-    if (db) await loadProjects();
+    await loadProjects();
     migrateToPromptEntries();
     await loadConversations();
     initConversationChannel();
@@ -2576,6 +3491,55 @@ document.addEventListener('DOMContentLoaded', async () => {
   loadCachedModels('settings');
   renderConnectionChip();
   initModalAccessibility();
+  const organization = document.querySelector('.sidebar-organization');
+  if (organization) organization.hidden = localStorage.getItem('assistantSidebarOrganizationOpen') !== 'true';
+  document.getElementById('toolbarMenu')?.addEventListener('keydown', event => {
+    handleMenuKeydown(event, event.currentTarget, closeToolbarMenu);
+  });
+  document.getElementById('sidebarMenu')?.addEventListener('keydown', event => {
+    handleMenuKeydown(event, event.currentTarget, () => closeSidebarMenu(true));
+  });
+  document.getElementById('composerMenu')?.addEventListener('keydown', event => {
+    handleMenuKeydown(event, event.currentTarget, () => closeComposerMenu(true));
+  });
+  document.getElementById('connectionPickerResults')?.addEventListener('keydown', event => {
+    handleMenuKeydown(event, event.currentTarget, () => closeConnectionPicker(true));
+  });
+  document.getElementById('connectionPickerSearch')?.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeConnectionPicker(true);
+    } else if (event.key === 'ArrowDown') {
+      const first = document.querySelector('#connectionPickerResults [role="menuitem"]');
+      if (first) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+  });
+  document.querySelector('.settings-tabs')?.addEventListener('keydown', event => {
+    const tabs = Array.from(event.currentTarget.querySelectorAll('[role="tab"]'));
+    const current = Math.max(0, tabs.indexOf(document.activeElement));
+    let next = current;
+    if (event.key === 'ArrowRight') next = (current + 1) % tabs.length;
+    else if (event.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    tabs[next].click();
+    tabs[next].focus();
+  });
+  ['setPersona', 'setRpUserName', 'setStarterPrompts'].forEach(id => {
+    document.getElementById(id)?.addEventListener('input', schedulePromptSettingsAutosave);
+  });
+  ['setEnableStMacros', 'setStarterPromptsHidden'].forEach(id => {
+    document.getElementById(id)?.addEventListener('change', schedulePromptSettingsAutosave);
+  });
+  ['setFont', 'setMsgFontSize', 'setMsgMaxWidth', 'setEmotionSprites', 'setEmotionSpriteSet',
+    'cBorderRadius', 'cMsgMaxWidth', 'cMsgFontSize'].forEach(id => {
+    document.getElementById(id)?.addEventListener('change', scheduleAppearanceSettingsAutosave);
+  });
   renderLocalUpdateStatus();
   checkLocalUpdateStatus(false);
 
@@ -2584,14 +3548,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Second wipe vector: the localStorage fallback below writes `conversations`
     // directly, bypassing the guard inside saveConversations.
     if (readOnlyShare) return;
+    if (_projectAutosaveTimer) void flushProjectAutosave();
+    flushSettingsAutosaves();
     clearTimeout(_saveDebounceTimer);
     persistDraftFromUI();
     saveConversations();
     // Only write to localStorage as fallback if IndexedDB is not available
     if (!db && !conversationStorageBlocked) {
       try {
-        localStorage.setItem('assistantConversations', JSON.stringify(conversations));
-        localStorage.setItem('assistantActiveConvId', activeConvId || '');
+        localStorage.setItem('assistantConversations', JSON.stringify(getPersistentConversations()));
+        localStorage.setItem('assistantActiveConvId', getPersistentActiveConvId());
       } catch(e) {}
     }
   });
@@ -2640,7 +3606,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       handleMentionKeydown(e, ta);
       if (e.defaultPrevented) return;
     }
-    if (e.key === 'Enter' && e.ctrlKey) {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       streaming ? queueFollowUpFromComposer() : sendMessage();
     } else if (e.key === 'Enter' && !e.shiftKey) {
@@ -2654,8 +3620,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Global keyboard shortcuts
   document.addEventListener('keydown', (e) => {
-    if (readOnlyShare && ((e.ctrlKey && e.key.toLowerCase() === 'n') ||
-      (e.ctrlKey && e.shiftKey && ['e', 'r'].includes(e.key.toLowerCase())))) {
+    const commandKey = e.ctrlKey || e.metaKey;
+    const key = e.key.toLowerCase();
+    if (readOnlyShare && ((commandKey && key === 'n') ||
+      (commandKey && e.shiftKey && ['e', 'r'].includes(key)))) {
       e.preventDefault();
       return;
     }
@@ -2671,12 +3639,36 @@ document.addEventListener('DOMContentLoaded', async () => {
         globalSearchDismiss();
         return;
       }
+      if (closeTopModal()) {
+        e.preventDefault();
+        return;
+      }
       if (document.getElementById('chatSearchBar').classList.contains('open')) {
         closeChatSearch();
         return;
       }
       if (document.getElementById('toolbarMenu')?.classList.contains('open')) {
         closeToolbarMenu();
+        e.preventDefault();
+        return;
+      }
+      if (document.getElementById('sidebarMenu')?.classList.contains('open')) {
+        closeSidebarMenu(true);
+        e.preventDefault();
+        return;
+      }
+      if (document.getElementById('composerMenu')?.classList.contains('open')) {
+        closeComposerMenu(true);
+        e.preventDefault();
+        return;
+      }
+      if (!document.getElementById('connectionPicker')?.hidden) {
+        closeConnectionPicker(true);
+        e.preventDefault();
+        return;
+      }
+      if (actionMenuClose) {
+        actionMenuClose();
         e.preventDefault();
         return;
       }
@@ -2692,47 +3684,43 @@ document.addEventListener('DOMContentLoaded', async () => {
         e.preventDefault();
         return;
       }
-      if (closeTopModal()) {
-        e.preventDefault();
-        return;
-      }
       if (streaming && abortController) abortController.abort();
     }
     if (openModalStack.length) return;
     // Ctrl+N - new conversation
-    if (e.ctrlKey && e.key === 'n') {
+    if (commandKey && key === 'n') {
       e.preventDefault();
       createConversation();
     }
     // Ctrl+/ - focus input
-    if (e.ctrlKey && e.key === '/') {
+    if (commandKey && e.key === '/') {
       e.preventDefault();
       document.getElementById('chatInput').focus();
     }
     // Ctrl+K - focus sidebar search
-    if (e.ctrlKey && e.key === 'k') {
+    if (commandKey && key === 'k') {
       e.preventDefault();
       const sb = document.getElementById('sidebar');
       if (sb.classList.contains('collapsed')) toggleSidebar();
       document.getElementById('sidebarSearch').focus();
     }
     // Ctrl+Shift+E - export all
-    if (e.ctrlKey && e.shiftKey && e.key === 'E') {
+    if (commandKey && e.shiftKey && key === 'e') {
       e.preventDefault();
       exportAllConversations();
     }
     // Ctrl+F - chat search
-    if (e.ctrlKey && e.key === 'f') {
+    if (commandKey && key === 'f') {
       e.preventDefault();
       openChatSearch();
     }
     // Ctrl+Shift+R - regenerate last response
-    if (e.ctrlKey && e.shiftKey && e.key === 'R') {
+    if (commandKey && e.shiftKey && key === 'r') {
       e.preventDefault();
       regenerate();
     }
     // Ctrl+Shift+? - shortcut help
-    if (e.ctrlKey && e.shiftKey && e.key === '?') {
+    if (commandKey && e.shiftKey && e.key === '?') {
       e.preventDefault();
       openModal('shortcutsModal');
     }
@@ -2744,9 +3732,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Drag & drop files
   const main = document.querySelector('.main');
-  main.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+  main.addEventListener('dragenter', (e) => { e.preventDefault(); main.classList.add('drag-over'); });
+  main.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; main.classList.add('drag-over'); });
+  main.addEventListener('dragleave', (e) => { if (!main.contains(e.relatedTarget)) main.classList.remove('drag-over'); });
   main.addEventListener('drop', (e) => {
     e.preventDefault();
+    main.classList.remove('drag-over');
     Array.from(e.dataTransfer.files).forEach(readAttachmentFile);
   });
 
@@ -2917,15 +3908,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     const img = e.target.closest('.chat-gen-img');
     if (!img) return;
     const overlay = document.createElement('div');
-    overlay.className = 'img-lightbox';
+    overlay.className = 'img-lightbox-overlay';
+    const popup = document.createElement('div');
+    popup.className = 'img-lightbox';
+    popup.setAttribute('aria-label', 'Generated image preview');
     const fullImg = document.createElement('img');
     fullImg.src = img.src;
     fullImg.alt = img.alt || 'Generated image';
-    overlay.appendChild(fullImg);
-    overlay.addEventListener('click', e => { if (e.target !== fullImg) overlay.remove(); });
-    const onKey = e => { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', onKey); } };
-    document.addEventListener('keydown', onKey);
-    document.body.appendChild(overlay);
+    const closeButton = document.createElement('button');
+    closeButton.type = 'button';
+    closeButton.className = 'img-lightbox-close';
+    closeButton.setAttribute('aria-label', 'Close image preview');
+    closeButton.textContent = '×';
+    popup.append(fullImg, closeButton);
+    const close = openTransientDialog(overlay, popup, closeButton);
+    closeButton.onclick = close;
   });
 
   // Last: the rest of init (theme, fonts, mermaid, KaTeX, lightbox and key handlers)
@@ -3478,7 +4475,8 @@ function speakMessage(msg, btn) {
     showToast('Read aloud is not supported in this browser.', 'error');
     return;
   }
-  const stopping = btn.dataset.speaking === 'true';
+  const control = btn || { dataset: {}, textContent: '' };
+  const stopping = control.dataset.speaking === 'true';
   // Always stop whatever is playing first, then clear every live button's state. This
   // self-heals across re-renders: stale buttons are gone from the DOM, so the query
   // only ever finds current ones.
@@ -3498,13 +4496,13 @@ function speakMessage(msg, btn) {
   }
   const utterance = new SpeechSynthesisUtterance(text);
   const reset = () => {
-    btn.dataset.speaking = 'false';
-    btn.textContent = 'Speak';
+    control.dataset.speaking = 'false';
+    control.textContent = 'Speak';
   };
   utterance.onend = reset;
   utterance.onerror = reset;
-  btn.dataset.speaking = 'true';
-  btn.textContent = 'Stop';
+  control.dataset.speaking = 'true';
+  control.textContent = 'Stop';
   synth.speak(utterance);
 }
 
@@ -3666,6 +4664,10 @@ async function retryRequest(idx) {
   try {
     const msg = messages[idx];
     if (!msg || msg.role !== 'assistant') return;
+    if (msg.comparison === true) {
+      showToast('Comparison responses cannot be retried with the active provider.', 'info');
+      return;
+    }
     const conv = getActiveConv();
     const swipeIdx = Number.isInteger(msg.swipeIndex) ? msg.swipeIndex : 0;
     const requestContext = await buildRequestMessages(conv, { messageList: messages, untilIndex: idx });
@@ -3685,7 +4687,7 @@ async function retryRequest(idx) {
     announce('Retrying the failed request.');
     await streamResponse(requestContext.messages, msg, swipeIdx, bubble, null, null, { conv });
     if (conv) conv.updatedAt = Date.now();
-    if (getSwipeRequest(msg, swipeIdx)?.status === 'complete') extractMemories(requestContext.messages);
+    if (getSwipeRequest(msg, swipeIdx)?.status === 'complete') extractMemories(requestContext.messages, conv);
     await saveConversationImmediately();
     renderMessages({ preserveScroll: true });
     updateTokenInfo();
@@ -3716,7 +4718,8 @@ async function updateTokenInfo() {
 
   // Project instructions and files are re-sent on every request, so surface them —
   // otherwise the cost is completely invisible in this bar.
-  const activeProject = getProject((getActiveConv() || {}).projectId);
+  const tokenConv = getActiveConv();
+  const activeProject = isTemporaryConversation(tokenConv) ? null : getProject((tokenConv || {}).projectId);
   if (activeProject) {
     const projTokens = estimateTokens((activeProject.instructions || '') + '\n' + projectDocsSystemText(activeProject));
     if (projTokens > 0) parts.push('Proj: ~' + formatTokenCount(projTokens) + ' tokens/msg');
@@ -3859,13 +4862,13 @@ function serializeConversation(conv) {
 }
 
 function setConversationBaseline(items) {
-  conversationBaseline = new Map((items || []).map(conv => [conv.id, serializeConversation(conv)]));
+  conversationBaseline = new Map((items || []).filter(conv => !isTemporaryConversation(conv)).map(conv => [conv.id, serializeConversation(conv)]));
 }
 
 function getConversationChanges() {
   const current = new Map();
   const changed = [];
-  conversations.forEach(record => {
+  getPersistentConversations().forEach(record => {
     const json = serializeConversation(record);
     current.set(record.id, json);
     const baseline = conversationBaseline.get(record.id);
@@ -3928,7 +4931,7 @@ function idbApplyConversationChanges(changed, deletions, tombstones) {
         }
       };
     });
-    tx.objectStore('meta').put({ key: 'activeConvId', value: activeConvId || '' });
+    tx.objectStore('meta').put({ key: 'activeConvId', value: getPersistentActiveConvId() });
     tx.oncomplete = () => resolve({
       records: [...records.values()],
       writtenRecords: [...writtenRecords.values()],
@@ -3949,18 +4952,19 @@ function reportPersistenceError(error) {
 function persistConversationState() {
   if (readOnlyShare) return Promise.resolve();
   if (conversationStorageBlocked) return Promise.reject(new Error('Conversation storage is unavailable until reload.'));
-  try { localStorage.setItem('assistantActiveConvId', activeConvId || ''); } catch(e) {}
+  try { localStorage.setItem('assistantActiveConvId', getPersistentActiveConvId()); } catch(e) {}
 
   const run = conversationSaveChain.then(async () => {
     const { changed, deletedIds } = getConversationChanges();
     if (!changed.length && !deletedIds.length) {
-      if (db) await idbPut('meta', { key: 'activeConvId', value: activeConvId || '' });
+      if (db) await idbPut('meta', { key: 'activeConvId', value: getPersistentActiveConvId() });
       persistenceErrorShown = false;
       return;
     }
     if (!db) {
-      localStorage.setItem('assistantConversations', JSON.stringify(conversations));
-      setConversationBaseline(conversations);
+      const persistent = getPersistentConversations();
+      localStorage.setItem('assistantConversations', JSON.stringify(persistent));
+      setConversationBaseline(persistent);
       syncScheduleAutoPush();
     } else {
       const now = Date.now();
@@ -3978,7 +4982,7 @@ function persistConversationState() {
       result.records.forEach(record => {
         const json = serializeConversation(record);
         conversationBaseline.set(record.id, json);
-        const index = conversations.findIndex(conv => conv.id === record.id);
+        const index = conversations.findIndex(conv => conv.id === record.id && !isTemporaryConversation(conv));
         if (index === -1) {
           conversations.unshift(normalizeConversationRecord(record));
           reconciled = true;
@@ -3989,7 +4993,7 @@ function persistConversationState() {
       });
       result.deletedIds.forEach(id => {
         conversationBaseline.delete(id);
-        const index = conversations.findIndex(conv => conv.id === id);
+        const index = conversations.findIndex(conv => conv.id === id && !isTemporaryConversation(conv));
         if (index !== -1 && captured.has(id) && serializeConversation(conversations[index]) === captured.get(id)) {
           conversations.splice(index, 1);
           reconciled = true;
@@ -4027,6 +5031,7 @@ function initConversationChannel() {
       let record;
       try { record = normalizeConversationRecord(raw); } catch (e) { return; }
       if (!record || dirtyIds.has(record.id)) return;
+      if (conversations.some(conv => conv.id === record.id && isTemporaryConversation(conv))) return;
       const index = conversations.findIndex(conv => conv.id === record.id);
       if (index !== -1 && compareConversationRecords(conversations[index], record) > 0) return;
       if (index === -1) conversations.unshift(record);
@@ -4037,6 +5042,7 @@ function initConversationChannel() {
     deletions.forEach(({ id, deletedAt }) => {
       if (dirtyIds.has(id)) return;
       const current = conversations.find(conv => conv.id === id);
+      if (isTemporaryConversation(current)) return;
       if (current && deletedAt && Number(current.updatedAt) > deletedAt) return;
       const before = conversations.length;
       conversations = conversations.filter(conv => conv.id !== id);
@@ -4201,7 +5207,8 @@ function cloneDraftAttachments(attachments) {
     mime: att.mime || '',
     dataUrl: att.type === 'image' ? safeMediaUrl(att.dataUrl) : safeFileUrl(att.dataUrl),
     textContent: typeof att.textContent === 'string' ? att.textContent : '',
-    binary: att.binary === true
+    binary: att.binary === true,
+    truncated: att.truncated === true
   }));
 }
 
@@ -4363,6 +5370,7 @@ function getActiveConv() { return conversations.find(c => c.id === activeConvId)
 
 function createConversation(projectId) {
   if (readOnlyShare) return;
+  if (_syncOperationInFlight) { showToast('Wait for sync to finish.', 'info'); return; }
   if (sending || streaming) { showToast('Stop the current response before creating another chat.', 'info'); return; }
   persistDraftFromUI();
   const conv = { id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
@@ -4378,12 +5386,37 @@ function createConversation(projectId) {
   updateTokenInfo();
   updateCharacterUI();
   restoreActiveDraft();
+  document.getElementById('chatInput')?.focus();
   announce('New conversation created.');
   if (window.innerWidth <= 768) toggleSidebar(false);
   if (window.innerWidth <= 1100) toggleContextPanel(false, false);
 }
 
+function createTemporaryConversation() {
+  if (readOnlyShare) return;
+  if (_syncOperationInFlight) { showToast('Wait for sync to finish.', 'info'); return; }
+  if (sending || streaming) { showToast('Stop the current response before creating another chat.', 'info'); return; }
+  persistDraftFromUI();
+  const conv = { id: genId(), title: 'Temporary chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
+  temporaryConversations.add(conv);
+  conversations.unshift(conv);
+  activeConvId = conv.id;
+  messages = conv.messages;
+  saveConversations();
+  renderSidebar();
+  renderMessages();
+  updateTokenInfo();
+  updateCharacterUI();
+  restoreActiveDraft();
+  document.getElementById('chatInput')?.focus();
+  closeSidebarMenu();
+  announce(TEMPORARY_CHAT_NOTICE);
+  if (window.innerWidth <= 768) toggleSidebar(false);
+  if (window.innerWidth <= 1100) toggleContextPanel(false, false);
+}
+
 function switchConversation(id) {
+  if (_syncOperationInFlight) { showToast('Wait for sync to finish.', 'info'); return; }
   if (sending || streaming) { showToast('Stop the current response before switching chats.', 'info'); return; }
   const conv = conversations.find(c => c.id === id);
   if (!conv) return;
@@ -4415,13 +5448,15 @@ function clearAllConversations() {
 // ============================================
 // Projects
 // ============================================
-// Stored as a single record in the existing `meta` store rather than a new object store
-// (which would force a DB version bump for ~20 records) or localStorage (project files
-// are unbounded text — the same reason conversations moved to IndexedDB).
+// Stored as a single record in the existing `meta` store rather than a new object store.
+// A synchronous localStorage copy protects edits until the IndexedDB write completes.
 
 const PROJECT_DOC_CHAR_LIMIT = 20000;
 const COLLAPSED_PROJECTS_KEY = 'assistantCollapsedProjectIds';
 let _projectEditId = null;
+let _projectAutosaveTimer = null;
+let _projectSaveRevision = 0;
+let _projectSaveChain = Promise.resolve();
 
 function getCollapsedProjectIds() {
   try {
@@ -4472,6 +5507,32 @@ function normalizeProjectList(raw) {
 }
 
 async function loadProjects() {
+  let fallbackProjects = null;
+  const fallbackRaw = localStorage.getItem('assistantProjects');
+  if (fallbackRaw !== null) {
+    try {
+      const parsed = JSON.parse(fallbackRaw);
+      if (!Array.isArray(parsed)) throw new Error('Project fallback is not a list.');
+      fallbackProjects = syncFilterDeletedRecords(normalizeProjectList(parsed), syncLoadTombstones().projects, 'updatedAt');
+    } catch (error) {
+      console.error('Project fallback parse error:', error);
+      localStorage.removeItem('assistantProjects');
+    }
+  }
+  if (!db) {
+    projects = fallbackProjects || [];
+    return;
+  }
+  if (fallbackProjects) {
+    projects = fallbackProjects;
+    try {
+      await idbPut('meta', { key: 'projects', value: projects });
+      localStorage.removeItem('assistantProjects');
+    } catch (error) {
+      console.error('Project fallback migration error:', error);
+    }
+    return;
+  }
   try {
     const record = await idbGet('meta', 'projects');
     const raw = (record && record.value) || [];
@@ -4484,11 +5545,30 @@ async function loadProjects() {
 }
 
 function saveProjects() {
-  if (!db) return;
-  projects = syncFilterDeletedRecords(normalizeProjectList(projects), syncLoadTombstones().projects, 'updatedAt');
-  idbPut('meta', { key: 'projects', value: projects })
-    .then(() => syncScheduleAutoPush())
-    .catch(e => console.error('IDB projects save error:', e));
+  const records = syncFilterDeletedRecords(normalizeProjectList(projects), syncLoadTombstones().projects, 'updatedAt');
+  const serialized = JSON.stringify(records);
+  const revision = ++_projectSaveRevision;
+  let fallbackSaved = false;
+  try {
+    localStorage.setItem('assistantProjects', serialized);
+    fallbackSaved = true;
+    syncScheduleAutoPush();
+  } catch (error) {
+    console.error('Project fallback save error:', error);
+  }
+  if (!db) return Promise.resolve(fallbackSaved);
+  const run = _projectSaveChain.then(() => idbPut('meta', { key: 'projects', value: records }))
+    .then(() => {
+      if (revision === _projectSaveRevision) localStorage.removeItem('assistantProjects');
+      if (!fallbackSaved) syncScheduleAutoPush();
+      return true;
+    })
+    .catch(error => {
+      console.error('IDB projects save error:', error);
+      return fallbackSaved;
+    });
+  _projectSaveChain = run.then(() => undefined);
+  return run;
 }
 
 function getProject(id) {
@@ -4516,6 +5596,8 @@ function deleteProject(id) {
   const proj = getProject(id);
   if (!proj) return;
   if (!confirm('Delete project "' + proj.name + '"? Its chats are kept and become unfiled.')) return;
+  clearTimeout(_projectAutosaveTimer);
+  _projectAutosaveTimer = null;
   // Detach, never cascade — deleting a folder must not delete the conversations in it.
   syncRecordTombstones('projects', [id]);
   conversations.forEach(c => {
@@ -4627,6 +5709,7 @@ function duplicateConversation(id = activeConvId) {
   delete copy.forkMessageIndex;
   delete copy.forkedAt;
   copy.queuedFollowUps = [];
+  if (isTemporaryConversation(source)) temporaryConversations.add(copy);
   conversations.unshift(copy);
   activeConvId = copy.id;
   messages = copy.messages;
@@ -4646,7 +5729,7 @@ function removeConversations(ids, showUndo = true) {
   if (publicCount && !confirm(publicCount + ' selected conversation' + (publicCount === 1 ? ' has' : 's have') + ' public share IDs. Deleting locally does not revoke those links. Continue?')) return;
   const removed = targets.map(conv => ({ conv, index: conversations.indexOf(conv) }));
   ids.forEach(id => armedFollowUpConversationIds.delete(id));
-  syncRecordTombstones('conversations', targets.map(conv => conv.id));
+  syncRecordTombstones('conversations', targets.filter(conv => !isTemporaryConversation(conv)).map(conv => conv.id));
   conversations = conversations.filter(c => !ids.includes(c.id));
   if (!conversations.length) conversations.push({ id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() });
   if (!conversations.some(c => c.id === activeConvId)) activeConvId = conversations[0].id;
@@ -4662,8 +5745,8 @@ function removeConversations(ids, showUndo = true) {
     label: 'Undo',
     onClick: () => {
       const tombstones = syncLoadTombstones().conversations;
-      removed.forEach(({ conv }) => { conv.updatedAt = Math.max(Date.now(), Number(tombstones[conv.id]) + 1 || 0); });
-      syncRemoveTombstones('conversations', removed.map(({ conv }) => conv.id));
+      removed.filter(({ conv }) => !isTemporaryConversation(conv)).forEach(({ conv }) => { conv.updatedAt = Math.max(Date.now(), Number(tombstones[conv.id]) + 1 || 0); });
+      syncRemoveTombstones('conversations', removed.filter(({ conv }) => !isTemporaryConversation(conv)).map(({ conv }) => conv.id));
       removed.sort((a, b) => a.index - b.index).forEach(({ conv, index }) => conversations.splice(Math.min(index, conversations.length), 0, conv));
       activeConvId = removed[0].conv.id;
       messages = getActiveConv().messages;
@@ -4724,11 +5807,15 @@ function showProjectPicker(conv, anchorEl) {
   projects.forEach(p => {
     addItem(p.name, conv.projectId === p.id, () => assignConversationToProject(conv, p.id));
   });
-  addItem('+ New project…', false, () => {
-    const name = prompt('Project name:');
-    if (name === null) return;
-    const proj = createProject(name);
+  addItem('+ New project', false, () => {
+    const proj = createProject('New project');
     assignConversationToProject(conv, proj.id);
+    openProjectsModal(proj.id);
+    requestAnimationFrame(() => {
+      const input = document.getElementById('projName');
+      input?.focus();
+      input?.select();
+    });
   });
 
   document.body.appendChild(picker);
@@ -4744,12 +5831,14 @@ function showProjectPicker(conv, anchorEl) {
 // --- Projects modal ---
 
 function openProjectsModal(projectId) {
+  clearTimeout(_projectAutosaveTimer);
   _projectEditId = projectId || (projects.length ? projects[0].id : null);
   renderProjectEditor();
   openModal('projectsModal');
 }
 
 function selectProjectInModal(id) {
+  flushProjectAutosave();
   _projectEditId = id || null;
   renderProjectEditor();
 }
@@ -4776,6 +5865,8 @@ function renderProjectEditor() {
 
   document.getElementById('projName').value = proj.name;
   document.getElementById('projInstructions').value = proj.instructions || '';
+  const saveStatus = document.getElementById('projectSaveStatus');
+  if (saveStatus) saveStatus.textContent = 'Saved';
 
   const count = conversations.filter(c => c.projectId === proj.id).length;
   document.getElementById('projChatCount').textContent =
@@ -4807,55 +5898,118 @@ function renderProjectEditor() {
   });
 }
 
+function renderProjectEditorPreservingPendingEdits(projectId) {
+  const preserve = _projectEditId === projectId && Boolean(_projectAutosaveTimer);
+  const name = preserve ? document.getElementById('projName')?.value : '';
+  const instructions = preserve ? document.getElementById('projInstructions')?.value : '';
+  renderProjectEditor();
+  if (!preserve) return;
+  const nameInput = document.getElementById('projName');
+  const instructionsInput = document.getElementById('projInstructions');
+  if (nameInput) nameInput.value = name || '';
+  if (instructionsInput) instructionsInput.value = instructions || '';
+  const status = document.getElementById('projectSaveStatus');
+  if (status) status.textContent = 'Saving...';
+}
+
 function newProjectFromModal() {
-  const name = prompt('Project name:');
-  if (name === null) return;
-  const proj = createProject(name);
+  flushProjectAutosave();
+  const proj = createProject('New project');
   _projectEditId = proj.id;
   renderProjectEditor();
+  requestAnimationFrame(() => {
+    const input = document.getElementById('projName');
+    input?.focus();
+    input?.select();
+  });
+}
+
+async function flushProjectAutosave() {
+  clearTimeout(_projectAutosaveTimer);
+  _projectAutosaveTimer = null;
+  const proj = getProject(_projectEditId);
+  if (!proj) return true;
+  const projectId = proj.id;
+  const name = document.getElementById('projName')?.value.trim() || proj.name;
+  const instructions = document.getElementById('projInstructions')?.value || '';
+  const status = document.getElementById('projectSaveStatus');
+  if (proj.name === name && proj.instructions === instructions) {
+    if (_projectEditId === projectId && status) status.textContent = 'Saved';
+    return true;
+  }
+  proj.name = name;
+  proj.instructions = instructions;
+  proj.updatedAt = Date.now();
+  if (_projectEditId === projectId && status) status.textContent = 'Saving...';
+  renderSidebar();
+  const save = saveProjects();
+  const revision = _projectSaveRevision;
+  const saved = await save;
+  if (_projectEditId === projectId && revision === _projectSaveRevision && status) status.textContent = saved ? 'Saved' : 'Could not save';
+  if (!saved) showToast('Could not save project changes.', 'error', 6000);
+  return saved;
+}
+
+function scheduleProjectAutosave() {
+  const status = document.getElementById('projectSaveStatus');
+  if (status) status.textContent = 'Saving...';
+  ++_projectSaveRevision;
+  clearTimeout(_projectAutosaveTimer);
+  _projectAutosaveTimer = setTimeout(() => { void flushProjectAutosave(); }, 450);
 }
 
 function saveProjectFromModal() {
-  const proj = getProject(_projectEditId);
-  if (!proj) { closeModal('projectsModal'); return; }
-  proj.name = document.getElementById('projName').value.trim() || proj.name;
-  proj.instructions = document.getElementById('projInstructions').value;
-  proj.updatedAt = Date.now();
-  saveProjects();
-  renderSidebar();
   closeModal('projectsModal');
-  showToast('Project saved.', 'success');
 }
 
-function removeProjectDoc(docId) {
-  const proj = getProject(_projectEditId);
+async function removeProjectDoc(docId) {
+  if (!beginLocalDataOperation()) return;
+  try {
+  const projectId = _projectEditId;
+  await flushProjectAutosave();
+  const proj = getProject(projectId);
   if (!proj) return;
   proj.docs = proj.docs.filter(d => d.id !== docId);
   proj.updatedAt = Date.now();
-  saveProjects();
-  renderProjectEditor();
+  if (_projectEditId === projectId) renderProjectEditorPreservingPendingEdits(projectId);
+  const status = document.getElementById('projectSaveStatus');
+  if (_projectEditId === projectId && status) status.textContent = 'Saving...';
+  const save = saveProjects();
+  const revision = _projectSaveRevision;
+  const saved = await save;
+  const currentStatus = document.getElementById('projectSaveStatus');
+  if (_projectEditId === projectId && revision === _projectSaveRevision && currentStatus) currentStatus.textContent = saved ? 'Saved' : 'Could not save';
+  if (!saved) showToast('Could not save project files.', 'error', 6000);
+  } finally {
+    endLocalDataOperation();
+  }
 }
 
-// Reuses readAttachmentFile so project files get the same PDF/DOCX/RTF/text extraction
-// as chat attachments, instead of duplicating that dispatch. It appends to
-// pendingAttachments, so drain what it added back off the end.
+// Reuse chat extraction while delivering results directly to this project.
 async function addProjectFiles(event) {
-  const proj = getProject(_projectEditId);
+  if (!beginLocalDataOperation()) {
+    event.target.value = '';
+    return;
+  }
+  try {
+  const projectId = _projectEditId;
+  await flushProjectAutosave();
+  const proj = getProject(projectId);
   if (!proj) return;
   const files = Array.from(event.target.files || []);
+  const docs = [];
   let skipped = 0;
   for (const file of files) {
-    const before = pendingAttachments.length;
+    const added = [];
     try {
-      await readAttachmentFile(file);
+      await readAttachmentFile(file, { onAttachment: attachment => added.push(attachment) });
     } catch (e) {
       console.warn('Project file read failed:', file.name, e);
     }
-    const added = pendingAttachments.splice(before);
     added.forEach(att => {
       const text = att.textContent || (att.file && att.file.textContent) || '';
       if (!text) { skipped++; return; }
-      proj.docs.push({
+      docs.push({
         id: 'doc_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
         name: att.name || (att.file && att.file.name) || 'file',
         text: text.slice(0, PROJECT_DOC_CHAR_LIMIT),
@@ -4863,12 +6017,25 @@ async function addProjectFiles(event) {
       });
     });
   }
-  proj.updatedAt = Date.now();
-  saveProjects();
-  renderPreviews();
-  renderProjectEditor();
-  event.target.value = '';
-  if (skipped) showToast(skipped + ' file(s) skipped — no readable text (images can’t be project files).');
+  await flushProjectAutosave();
+  const currentProject = getProject(projectId);
+  if (!currentProject) { event.target.value = ''; return; }
+  currentProject.docs.push(...docs);
+  currentProject.updatedAt = Date.now();
+  if (_projectEditId === projectId) renderProjectEditorPreservingPendingEdits(projectId);
+  const status = document.getElementById('projectSaveStatus');
+  if (_projectEditId === projectId && status) status.textContent = 'Saving...';
+  const save = saveProjects();
+  const revision = _projectSaveRevision;
+  const saved = await save;
+  const currentStatus = document.getElementById('projectSaveStatus');
+  if (_projectEditId === projectId && revision === _projectSaveRevision && currentStatus) currentStatus.textContent = saved ? 'Saved' : 'Could not save';
+  if (!saved) showToast('Could not save project files.', 'error', 6000);
+  if (skipped) showToast(skipped + ' file(s) skipped. Images and files without readable text cannot be project files.');
+  } finally {
+    event.target.value = '';
+    endLocalDataOperation();
+  }
 }
 
 // Inline SVG icons for conversation-row controls: consistent stroke glyphs
@@ -5012,19 +6179,6 @@ function renderSidebar() {
       renderSidebar();
     });
 
-    const pinBtn = document.createElement('button');
-    pinBtn.className = 'conv-pin' + (c.pinned ? ' pinned' : '');
-    pinBtn.innerHTML = CONV_ICONS.pin;
-    pinBtn.title = c.pinned ? 'Unpin' : 'Pin';
-    pinBtn.setAttribute('aria-label', c.pinned ? 'Unpin conversation' : 'Pin conversation');
-    pinBtn.onclick = (e) => {
-      e.stopPropagation();
-      c.pinned = !c.pinned;
-      c.updatedAt = Date.now();
-      saveConversations();
-      renderSidebar();
-    };
-
     if (bulkMode) {
       const select = document.createElement('input');
       select.type = 'checkbox';
@@ -5040,8 +6194,10 @@ function renderSidebar() {
     title.type = 'button';
     title.className = 'conv-title';
     title.textContent = c.title;
-    title.title = 'Open conversation; press F2 to rename';
+    const preview = [...(c.messages || [])].reverse().map(getMsgText).find(text => String(text || '').trim());
+    title.title = preview ? String(preview).trim().slice(0, 180) : 'Open conversation; press F2 to rename';
     title.setAttribute('aria-label', 'Open conversation ' + c.title + '. Press F2 to rename.');
+    if (c.id === activeConvId) title.setAttribute('aria-current', 'page');
     title.onclick = () => { if (c.id !== activeConvId) switchConversation(c.id); };
     const beginRename = () => {
       const input = document.createElement('input');
@@ -5080,14 +6236,6 @@ function renderSidebar() {
       beginRename();
     });
 
-    const del = document.createElement('button');
-    del.className = 'conv-delete';
-    del.innerHTML = '&times;';
-    del.title = 'Delete';
-    del.setAttribute('aria-label', 'Delete conversation');
-    del.onclick = (e) => deleteConversation(c.id, e);
-
-    div.appendChild(pinBtn);
     if (c.characterAvatar) {
       const safeAvatar = safeMediaUrl(c.characterAvatar);
       if (safeAvatar) {
@@ -5101,6 +6249,7 @@ function renderSidebar() {
     const state = document.createElement('span');
     state.className = 'conv-state';
     const stateParts = [];
+    if (isTemporaryConversation(c)) stateParts.push('Temporary');
     if (c.archivedAt) stateParts.push('Archived');
     if (c.queuedFollowUps?.length) stateParts.push(c.queuedFollowUps.length + ' queued');
     state.textContent = stateParts.join(' · ');
@@ -5114,37 +6263,35 @@ function renderSidebar() {
       tagEl.textContent = c.tag;
       div.appendChild(tagEl);
     }
-    const tagBtn = document.createElement('button');
-    tagBtn.className = 'conv-delete';
-    tagBtn.innerHTML = CONV_ICONS.tag;
-    tagBtn.title = 'Tag';
-    tagBtn.setAttribute('aria-label', 'Tag conversation');
-    tagBtn.onclick = (e) => { e.stopPropagation(); showTagPicker(c, tagBtn); };
-    div.appendChild(tagBtn);
-    const projBtn = document.createElement('button');
-    projBtn.className = 'conv-delete';
-    projBtn.innerHTML = CONV_ICONS.folder;
-    projBtn.title = 'Project';
-    projBtn.setAttribute('aria-label', 'Move conversation to a project');
-    projBtn.onclick = (e) => { e.stopPropagation(); showProjectPicker(c, projBtn); };
-    div.appendChild(projBtn);
-    const archiveBtn = document.createElement('button');
-    archiveBtn.className = 'conv-delete conv-archive';
-    archiveBtn.innerHTML = c.archivedAt ? CONV_ICONS.restore : CONV_ICONS.archive;
-    archiveBtn.title = c.archivedAt ? 'Restore conversation' : 'Archive conversation';
-    archiveBtn.setAttribute('aria-label', archiveBtn.title);
-    archiveBtn.onclick = e => { e.stopPropagation(); archiveConversation(c.id); };
-    div.appendChild(archiveBtn);
-    const duplicateBtn = document.createElement('button');
-    duplicateBtn.className = 'conv-delete conv-duplicate';
-    duplicateBtn.innerHTML = CONV_ICONS.duplicate;
-    duplicateBtn.title = 'Duplicate conversation';
-    duplicateBtn.setAttribute('aria-label', 'Duplicate conversation');
-    duplicateBtn.onclick = e => { e.stopPropagation(); duplicateConversation(c.id); };
-    div.appendChild(duplicateBtn);
-    div.appendChild(del);
+    const moreBtn = document.createElement('button');
+    moreBtn.type = 'button';
+    moreBtn.className = 'conv-more';
+    moreBtn.textContent = '⋯';
+    moreBtn.title = 'Conversation actions';
+    moreBtn.setAttribute('aria-label', 'Actions for ' + c.title);
+    moreBtn.setAttribute('aria-haspopup', 'menu');
+    moreBtn.setAttribute('aria-expanded', 'false');
+    moreBtn.onclick = event => {
+      event.stopPropagation();
+      openActionMenu(moreBtn, [
+        { label: 'Rename', action: beginRename },
+        { label: c.pinned ? 'Unpin' : 'Pin', action: () => { c.pinned = !c.pinned; c.updatedAt = Date.now(); saveConversations(); renderSidebar(); } },
+        { label: 'Tag', action: () => showTagPicker(c, moreBtn) },
+        { label: 'Move to project', action: () => showProjectPicker(c, moreBtn) },
+        { label: 'Duplicate', action: () => duplicateConversation(c.id) },
+        { label: c.archivedAt ? 'Restore' : 'Archive', action: () => archiveConversation(c.id) },
+        { label: 'Delete', danger: true, action: () => deleteConversation(c.id) }
+      ], 'Conversation actions');
+    };
+    div.appendChild(moreBtn);
     list.appendChild(div);
   });
+  if (!sorted.length) {
+    const empty = document.createElement('p');
+    empty.className = 'sidebar-empty';
+    empty.textContent = conversationView === 'archived' ? 'No archived chats.' : 'No active chats.';
+    list.appendChild(empty);
+  }
   renderTagFilterBar();
   filterConversations();
   updateBulkCount();
@@ -5307,6 +6454,122 @@ function toggleContextPanel(forceOpen, persist = true) {
 // ============================================
 // Toolbar Menu
 // ============================================
+function handleMenuKeydown(event, menu, closeMenu) {
+  const items = Array.from(menu.querySelectorAll('[role="menuitem"]:not([hidden]):not(:disabled)'));
+  if (!items.length) return;
+  const current = Math.max(0, items.indexOf(document.activeElement));
+  let next = current;
+  if (event.key === 'ArrowDown') next = (current + 1) % items.length;
+  else if (event.key === 'ArrowUp') next = (current - 1 + items.length) % items.length;
+  else if (event.key === 'Home') next = 0;
+  else if (event.key === 'End') next = items.length - 1;
+  else if (event.key === 'Escape') {
+    event.preventDefault();
+    closeMenu();
+    return;
+  } else if (event.key === 'Tab') {
+    closeMenu();
+    return;
+  } else {
+    return;
+  }
+  event.preventDefault();
+  items.forEach((item, index) => { item.tabIndex = index === next ? 0 : -1; });
+  items[next].focus();
+}
+
+function setStaticMenuOpen(menuId, buttonId, open, restoreFocus = false) {
+  const menu = document.getElementById(menuId);
+  const button = document.getElementById(buttonId);
+  if (!menu || !button) return;
+  menu.classList.toggle('open', open);
+  button.setAttribute('aria-expanded', String(open));
+  if (open) {
+    const items = Array.from(menu.querySelectorAll('[role="menuitem"]:not([hidden]):not(:disabled)'));
+    items.forEach((item, index) => { item.tabIndex = index === 0 ? 0 : -1; });
+    items[0]?.focus();
+  } else if (restoreFocus) {
+    button.focus();
+  }
+}
+
+function toggleSidebarMenu(event) {
+  event?.stopPropagation();
+  const open = !document.getElementById('sidebarMenu')?.classList.contains('open');
+  closeComposerMenu(false);
+  closeConnectionPicker(false);
+  setStaticMenuOpen('sidebarMenu', 'sidebarMoreBtn', open);
+}
+
+function closeSidebarMenu(restoreFocus = false) {
+  setStaticMenuOpen('sidebarMenu', 'sidebarMoreBtn', false, restoreFocus);
+}
+
+function toggleComposerMenu(event) {
+  event?.stopPropagation();
+  const open = !document.getElementById('composerMenu')?.classList.contains('open');
+  closeSidebarMenu(false);
+  closeConnectionPicker(false);
+  setStaticMenuOpen('composerMenu', 'composerMoreBtn', open);
+}
+
+function closeComposerMenu(restoreFocus = false) {
+  setStaticMenuOpen('composerMenu', 'composerMoreBtn', false, restoreFocus);
+}
+
+function toggleSidebarOrganization() {
+  const section = document.querySelector('.sidebar-organization');
+  if (!section) return;
+  section.hidden = !section.hidden;
+  localStorage.setItem('assistantSidebarOrganizationOpen', String(!section.hidden));
+  if (!section.hidden) section.querySelector('button, select')?.focus();
+}
+
+function openActionMenu(anchor, items, label = 'Actions') {
+  actionMenuClose?.(false);
+  const menu = document.createElement('div');
+  menu.className = 'toolbar-menu action-menu open';
+  menu.setAttribute('role', 'menu');
+  menu.setAttribute('aria-label', label);
+  items.filter(item => !item.hidden).forEach(item => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.setAttribute('role', 'menuitem');
+    button.textContent = item.label;
+    if (item.danger) button.classList.add('danger');
+    button.onclick = () => {
+      close(false);
+      item.action();
+    };
+    menu.appendChild(button);
+  });
+  if (!menu.children.length) return;
+
+  document.body.appendChild(menu);
+  anchor.setAttribute('aria-expanded', 'true');
+  const rect = anchor.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  menu.style.left = Math.max(8, Math.min(rect.right - menuRect.width, window.innerWidth - menuRect.width - 8)) + 'px';
+  menu.style.top = Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - menuRect.height - 8)) + 'px';
+
+  const onDocumentClick = event => {
+    if (!menu.contains(event.target) && event.target !== anchor) close(false);
+  };
+  const close = (restoreFocus = true) => {
+    menu.remove();
+    anchor.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('click', onDocumentClick);
+    if (actionMenuClose === close) actionMenuClose = null;
+    if (restoreFocus && document.contains(anchor)) anchor.focus();
+  };
+  actionMenuClose = close;
+  menu.addEventListener('keydown', event => handleMenuKeydown(event, menu, close));
+  setTimeout(() => document.addEventListener('click', onDocumentClick), 0);
+  const buttons = Array.from(menu.querySelectorAll('[role="menuitem"]'));
+  buttons.forEach((button, index) => { button.tabIndex = index === 0 ? 0 : -1; });
+  buttons[0]?.focus();
+}
+
 function toggleToolbarMenu(e) {
   e.stopPropagation();
   const menu = document.getElementById('toolbarMenu');
@@ -5314,18 +6577,25 @@ function toggleToolbarMenu(e) {
   document.getElementById('toolbarMoreBtn')?.setAttribute('aria-expanded', String(open));
   if (open) {
     toolbarMenuFocusReturn = document.activeElement;
-    menu.querySelector('[role="menuitem"]')?.focus();
+    const items = Array.from(menu.querySelectorAll('[role="menuitem"]:not([hidden]):not(:disabled)'));
+    items.forEach((item, index) => { item.tabIndex = index === 0 ? 0 : -1; });
+    items[0]?.focus();
   } else {
     toolbarMenuFocusReturn = null;
   }
 }
-function closeToolbarMenu() {
+function closeToolbarMenu(restoreFocus = true) {
   document.getElementById('toolbarMenu').classList.remove('open');
   document.getElementById('toolbarMoreBtn')?.setAttribute('aria-expanded', 'false');
-  if (toolbarMenuFocusReturn && document.contains(toolbarMenuFocusReturn)) toolbarMenuFocusReturn.focus();
+  if (restoreFocus && toolbarMenuFocusReturn && document.contains(toolbarMenuFocusReturn)) toolbarMenuFocusReturn.focus();
   toolbarMenuFocusReturn = null;
 }
-document.addEventListener('click', () => closeToolbarMenu());
+document.addEventListener('click', event => {
+  if (!event.target.closest('.toolbar-more')) closeToolbarMenu(false);
+  if (!event.target.closest('.sidebar-more')) closeSidebarMenu(false);
+  if (!event.target.closest('.composer-more')) closeComposerMenu(false);
+  if (!event.target.closest('.connection-picker-wrap')) closeConnectionPicker(false);
+});
 
 // ============================================
 // Setup & Settings
@@ -5354,7 +6624,7 @@ function applyProviderPreset(target, providerName) {
     inputs.base.dataset.providerPresetUrl = preset.baseUrl;
   }
   if (inputs.format) inputs.format.value = preset.apiFormat;
-  const keyLabel = inputs.key?.closest('form')?.querySelector('label[for="' + inputs.key.id + '"]');
+  const keyLabel = inputs.key ? document.querySelector('label[for="' + inputs.key.id + '"]') : null;
   if (keyLabel) keyLabel.textContent = preset.keyRequired ? 'API Key' : 'API Key (optional)';
   const refresh = document.querySelector('[onclick="refreshModels(\'' + target + '\', this)"]');
   if (refresh) refresh.disabled = false;
@@ -5378,6 +6648,12 @@ async function testConnection(target = 'settings') {
     return;
   }
   const started = performance.now();
+  const statusEl = document.getElementById(target === 'setup' ? 'setupConnectionStatus' : 'settingsConnectionStatus');
+  const button = statusEl?.closest('.connection-test-row')?.querySelector('button');
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+  }
   renderConnectionStatus(target, 'Testing...', 'testing');
   announce('Testing ' + preset.label + ' connection.');
   try {
@@ -5395,6 +6671,11 @@ async function testConnection(target = 'settings') {
     const elapsed = Math.max(0, Math.round(performance.now() - started));
     renderConnectionStatus(target, 'Failed · ' + elapsed + ' ms · ' + sanitizeErrorDetail(err), 'error');
     announce('Connection failed.');
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+    }
   }
 }
 
@@ -5406,14 +6687,25 @@ function getSelectedModel(target) {
   return selectEl.value || localStorage.getItem('llmModel') || '';
 }
 
+function renderSetupError(message = '') {
+  const error = document.getElementById('setupError');
+  if (!error) return;
+  error.textContent = message;
+  error.hidden = !message;
+}
+
 function saveSetup() {
   let proxy = document.getElementById('setupProxy').value.trim();
   const key = document.getElementById('setupKey').value.trim();
   const provider = document.getElementById('setupProvider').value || 'custom';
-  if (!proxy || (providerRequiresKey({ llmProvider: provider }) && !key)) { showToast(providerRequiresKey({ llmProvider: provider }) ? 'Base URL and API Key are required.' : 'Base URL is required.', 'error'); return; }
+  renderSetupError();
+  if (!proxy || (providerRequiresKey({ llmProvider: provider }) && !key)) {
+    renderSetupError(providerRequiresKey({ llmProvider: provider }) ? 'Enter a base URL and API key.' : 'Enter a base URL.');
+    return;
+  }
   proxy = proxy.replace(/\/(chat\/completions|messages)\/?$/, '');
   const model = getSelectedModel('setup');
-  if (!model) { showToast('Choose or enter a model.', 'error'); return; }
+  if (!model) { renderSetupError('Choose or enter a model.'); return; }
   localStorage.setItem('llmProxyUrl', proxy);
   localStorage.setItem('llmProvider', provider);
   setApiKey(key, getSelectedKeyStorage('setup'));
@@ -5430,15 +6722,56 @@ function saveSetup() {
   }).catch(() => {});
 }
 
+function continueWithoutProvider() {
+  renderSetupError();
+  closeModal('setupModal');
+  document.getElementById('chatInput')?.focus();
+  announce('Continuing without a configured provider.');
+}
+
+function updateSettingsFooter(tabName = activeSettingsTab) {
+  activeSettingsTab = tabName;
+  const button = document.getElementById('settingsSaveBtn');
+  const status = document.getElementById('settingsSaveStatus');
+  const labels = {
+    api: 'Save API settings',
+    tools: 'Save tool settings'
+  };
+  if (button) {
+    button.hidden = !labels[tabName];
+    button.textContent = labels[tabName] || 'Save';
+  }
+  if (status) status.textContent = ['prompts', 'appearance', 'debug'].includes(tabName) ? 'Changes save automatically.' : '';
+}
+
+function setSettingsSaveStatus(message = '') {
+  const status = document.getElementById('settingsSaveStatus');
+  if (status) status.textContent = message;
+}
+
 function switchSettingsTab(tabName, btn) {
-  document.querySelectorAll('.settings-tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.settings-tab-content').forEach(t => t.classList.remove('active'));
-  btn.classList.add('active');
-  document.getElementById('settingsTab-' + tabName).classList.add('active');
+  document.querySelectorAll('.settings-tab').forEach(tab => {
+    const selected = tab === btn;
+    tab.classList.toggle('active', selected);
+    tab.setAttribute('aria-selected', String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  });
+  document.querySelectorAll('.settings-tab-content').forEach(panel => {
+    const selected = panel.id === 'settingsTab-' + tabName;
+    panel.classList.toggle('active', selected);
+    panel.hidden = !selected;
+  });
   if (tabName === 'data') renderStorageSummary();
+  updateSettingsFooter(tabName);
 }
 
 function openSettings() {
+  clearTimeout(_promptSettingsAutosaveTimer);
+  clearTimeout(_appearanceSettingsAutosaveTimer);
+  _promptSettingsAutosaveTimer = null;
+  _appearanceSettingsAutosaveTimer = null;
+  _promptSettingsAutosavePending = false;
+  _appearanceSettingsAutosavePending = false;
   document.getElementById('setProxy').value = localStorage.getItem('llmProxyUrl') || '';
   document.getElementById('setKey').value = getApiKey();
   const providerSelect = document.getElementById('setProvider');
@@ -5453,6 +6786,8 @@ function openSettings() {
   document.getElementById('setPersona').value = (conv && conv.persona) || localStorage.getItem('llmPersona') || '';
   document.getElementById('setEnableStMacros').checked = localStorage.getItem('llmEnableStMacros') === 'true';
   document.getElementById('setRpUserName').value = localStorage.getItem('llmRpUserName') || '';
+  document.getElementById('setStarterPrompts').value = getStarterPrompts().join('\n');
+  document.getElementById('setStarterPromptsHidden').checked = localStorage.getItem('assistantStarterPromptsHidden') === 'true';
   document.getElementById('setExtraParams').value = localStorage.getItem('llmExtraParams') || '';
   document.getElementById('setExcludeParams').value = localStorage.getItem('llmExcludeParams') || '';
   document.getElementById('setPrefill').value = localStorage.getItem('llmPrefill') || '';
@@ -5514,7 +6849,10 @@ function openSettings() {
     }
   }
 
-  openModal('settingsModal', '#setProxy');
+  const activeButton = document.querySelector('.settings-tab.active') || document.getElementById('settingsTabButton-api');
+  const tabName = activeButton?.id.replace('settingsTabButton-', '') || 'api';
+  switchSettingsTab(tabName, activeButton);
+  openModal('settingsModal', '#' + (tabName === 'api' ? 'setProxy' : activeButton?.id));
 }
 
 function loadProfiles() {
@@ -5715,8 +7053,7 @@ function deleteSelectedProfile() {
   showToast('Profile deleted.', 'info');
 }
 
-function saveSettings() {
-  // Validate extra params JSON
+function readValidatedExtraParams() {
   const extraParamsField = document.getElementById('setExtraParams');
   const extraParamsVal = extraParamsField.value.trim();
   if (extraParamsVal) {
@@ -5726,22 +7063,37 @@ function saveSettings() {
     } catch(e) {
       extraParamsField.classList.add('invalid');
       showToast('Extra Parameters must be valid JSON.', 'error');
-      return;
+      return null;
     }
   } else {
     extraParamsField.classList.remove('invalid');
   }
+  return extraParamsVal;
+}
 
+function savePresetGenerationSettings() {
+  const extraParamsVal = readValidatedExtraParams();
+  if (extraParamsVal === null) return false;
+  localStorage.setItem('llmTemperature', document.getElementById('setTemperature').value.trim());
+  localStorage.setItem('llmExtraParams', extraParamsVal);
+  syncScheduleAutoPush();
+  updateTokenInfo();
+  return true;
+}
+
+function saveApiSettings() {
+  const extraParamsVal = readValidatedExtraParams();
+  if (extraParamsVal === null) return false;
   let proxy = document.getElementById('setProxy').value.trim();
   proxy = proxy.replace(/\/(chat\/completions|messages)\/?$/, '');
   const providerName = document.getElementById('setProvider').value || 'custom';
   const keyValue = document.getElementById('setKey').value.trim();
   if (!proxy || (providerRequiresKey({ llmProvider: providerName }) && !keyValue)) {
     showToast(providerRequiresKey({ llmProvider: providerName }) ? 'Base URL and API Key are required.' : 'Base URL is required.', 'error');
-    return;
+    return false;
   }
   const selectedModel = getSelectedModel('settings');
-  if (!selectedModel) { showToast('Choose or enter a model.', 'error'); return; }
+  if (!selectedModel) { showToast('Choose or enter a model.', 'error'); return false; }
   localStorage.setItem('llmProxyUrl', proxy);
   localStorage.setItem('llmProvider', providerName);
   setApiKey(keyValue, getSelectedKeyStorage('settings'));
@@ -5749,24 +7101,128 @@ function saveSettings() {
   localStorage.setItem('llmApiFormat', document.getElementById('setApiFormat').value);
   localStorage.setItem('llmExtraParams', extraParamsVal);
   localStorage.setItem('llmExcludeParams', document.getElementById('setExcludeParams').value.trim());
-  const personaVal = document.getElementById('setPersona').value;
-  { const c = getActiveConv();
-    if (c && c.persona !== personaVal) { c.persona = personaVal; c.updatedAt = Date.now(); saveConversations(); }
-    // Only update global default if this is not a character-card conversation
-    if (!c || !c.characterCard) localStorage.setItem('llmPersona', personaVal);
-  }
-  localStorage.setItem('llmEnableStMacros', document.getElementById('setEnableStMacros').checked ? 'true' : 'false');
-  localStorage.setItem('llmRpUserName', document.getElementById('setRpUserName').value.trim());
   localStorage.setItem('llmPrefill', document.getElementById('setPrefill').value);
   localStorage.setItem('llmStreaming', document.getElementById('setStreaming').checked ? 'true' : 'false');
   localStorage.setItem('llmEnterSend', document.getElementById('setEnterSend').checked ? 'true' : 'false');
-  const tempVal = document.getElementById('setTemperature').value.trim();
-  localStorage.setItem('llmTemperature', tempVal);
+  localStorage.setItem('llmTemperature', document.getElementById('setTemperature').value.trim());
   localStorage.setItem('llmMaxTokens', document.getElementById('setMaxTokens').value.trim());
   localStorage.setItem('llmContextWindow', document.getElementById('setContextWindow').value.trim());
   localStorage.setItem('llmPromptCache', document.getElementById('setPromptCache').checked ? 'true' : 'false');
   localStorage.setItem('llmThinking', document.getElementById('setThinking').checked ? 'true' : 'false');
   localStorage.setItem('llmThinkingEffort', document.getElementById('setThinkingEffort').value);
+  localStorage.removeItem('assistantActiveProfileId');
+  renderConnectionChip();
+  renderProfileSummary();
+  syncScheduleAutoPush();
+  setSettingsSaveStatus('API settings saved.');
+  announce('API settings saved.');
+
+  if (keyValue || !providerRequiresKey({ llmProvider: providerName })) {
+    fetchAvailableModels(proxy, keyValue).then(models => {
+      localStorage.setItem('llmModelList', JSON.stringify(models));
+    }).catch(() => {});
+  }
+  return true;
+}
+
+function savePromptSettings({ announceChange = true } = {}) {
+  _promptSettingsAutosavePending = false;
+  const personaVal = document.getElementById('setPersona').value;
+  const conv = getActiveConv();
+  if (conv && conv.persona !== personaVal) {
+    conv.persona = personaVal;
+    conv.updatedAt = Date.now();
+    saveConversations();
+  }
+  if ((!conv || !conv.characterCard) && !isTemporaryConversation(conv)) localStorage.setItem('llmPersona', personaVal);
+  localStorage.setItem('llmEnableStMacros', document.getElementById('setEnableStMacros').checked ? 'true' : 'false');
+  localStorage.setItem('llmRpUserName', document.getElementById('setRpUserName').value.trim());
+  const prompts = document.getElementById('setStarterPrompts').value
+    .split('\n').map(value => value.trim()).filter(Boolean)
+    .filter((value, index, all) => all.findIndex(item => item.toLowerCase() === value.toLowerCase()) === index)
+    .slice(0, 8);
+  localStorage.setItem('assistantStarterPrompts', JSON.stringify(prompts));
+  localStorage.setItem('assistantStarterPromptsHidden', document.getElementById('setStarterPromptsHidden').checked ? 'true' : 'false');
+  syncScheduleAutoPush();
+  if (!streaming) renderMessages({ preserveScroll: true });
+  setSettingsSaveStatus('Prompt settings saved.');
+  if (announceChange) announce('Prompt settings saved.');
+  return true;
+}
+
+function validateCssSetting(id, property, label) {
+  const field = document.getElementById(id);
+  const value = field.value.trim();
+  const valid = !value || Boolean(window.CSS?.supports?.(property, value));
+  field.classList.toggle('invalid', !valid);
+  if (!valid) showToast(label + ' is not a valid CSS value.', 'error');
+  return valid;
+}
+
+function saveAppearanceSettings({ announceChange = true } = {}) {
+  const valid = [
+    validateCssSetting('setMsgFontSize', 'font-size', 'Message font size'),
+    validateCssSetting('setMsgMaxWidth', 'width', 'Message width')
+  ];
+  if (document.getElementById('setTheme').value === 'custom') {
+    valid.push(validateCssSetting('cBorderRadius', 'border-radius', 'Custom radius'));
+    valid.push(validateCssSetting('cMsgMaxWidth', 'width', 'Custom message width'));
+    valid.push(validateCssSetting('cMsgFontSize', 'font-size', 'Custom message font size'));
+  }
+  if (valid.includes(false)) return false;
+  _appearanceSettingsAutosavePending = false;
+  const themeName = document.getElementById('setTheme').value;
+  if (themeName === 'custom') {
+    localStorage.setItem('assistantCustomTheme', JSON.stringify(getCustomThemeFromPickers()));
+  }
+  applyTheme(themeName);
+  const msgFs = document.getElementById('setMsgFontSize').value.trim();
+  const msgMw = document.getElementById('setMsgMaxWidth').value.trim();
+  msgFs ? localStorage.setItem('assistantMsgFontSize', msgFs) : localStorage.removeItem('assistantMsgFontSize');
+  msgMw ? localStorage.setItem('assistantMsgMaxWidth', msgMw) : localStorage.removeItem('assistantMsgMaxWidth');
+  applyMsgOverrides();
+  const fontName = document.getElementById('setFont').value.trim();
+  localStorage.setItem('assistantFont', fontName);
+  loadCustomFont(fontName);
+  localStorage.setItem('llmEmotionSprites', document.getElementById('setEmotionSprites').checked ? 'true' : 'false');
+  localStorage.setItem('llmEmotionSpriteSet', document.getElementById('setEmotionSpriteSet').value);
+  if (!streaming) renderMessages({ preserveScroll: true });
+  syncScheduleAutoPush();
+  setSettingsSaveStatus('Appearance saved.');
+  if (announceChange) announce('Appearance saved.');
+  return true;
+}
+
+function schedulePromptSettingsAutosave() {
+  _promptSettingsAutosavePending = true;
+  setSettingsSaveStatus('Saving...');
+  clearTimeout(_promptSettingsAutosaveTimer);
+  _promptSettingsAutosaveTimer = setTimeout(() => {
+    _promptSettingsAutosaveTimer = null;
+    savePromptSettings({ announceChange: false });
+  }, 450);
+}
+
+function scheduleAppearanceSettingsAutosave() {
+  _appearanceSettingsAutosavePending = true;
+  setSettingsSaveStatus('Saving...');
+  clearTimeout(_appearanceSettingsAutosaveTimer);
+  _appearanceSettingsAutosaveTimer = setTimeout(() => {
+    _appearanceSettingsAutosaveTimer = null;
+    saveAppearanceSettings({ announceChange: false });
+  }, 450);
+}
+
+function flushSettingsAutosaves() {
+  if (_promptSettingsAutosaveTimer) clearTimeout(_promptSettingsAutosaveTimer);
+  if (_appearanceSettingsAutosaveTimer) clearTimeout(_appearanceSettingsAutosaveTimer);
+  _promptSettingsAutosaveTimer = null;
+  _appearanceSettingsAutosaveTimer = null;
+  if (_promptSettingsAutosavePending) savePromptSettings({ announceChange: false });
+  if (_appearanceSettingsAutosavePending) saveAppearanceSettings({ announceChange: false });
+}
+
+function saveToolSettings() {
   localStorage.setItem('llmInputCost', document.getElementById('setInputCost').value.trim());
   localStorage.setItem('llmOutputCost', document.getElementById('setOutputCost').value.trim());
   localStorage.setItem('llmWebSearch', document.getElementById('setWebSearch').checked ? 'true' : 'false');
@@ -5778,58 +7234,35 @@ function saveSettings() {
   localStorage.setItem('llmCorsProxy', normalizeCorsProxyUrl(document.getElementById('setCorsProxy').value));
   localStorage.setItem('llmMemoryEnabled', document.getElementById('setMemory').checked ? 'true' : 'false');
   localStorage.setItem('llmHoldScreenshot', document.getElementById('setHoldScreenshot').checked ? 'true' : 'false');
-  localStorage.setItem('llmEmotionSprites', document.getElementById('setEmotionSprites').checked ? 'true' : 'false');
-  localStorage.setItem('llmEmotionSpriteSet', document.getElementById('setEmotionSpriteSet').value);
-  if (!streaming) renderMessages({ preserveScroll: true });
-  setDebugPreference();
-  syncSaveSettings(false, false);
-
-  // Warn if web search enabled for non-Anthropic without search URL
   if (document.getElementById('setWebSearch').checked) {
-    const fmt = document.getElementById('setApiFormat').value;
+    const fmt = localStorage.getItem('llmApiFormat') || 'auto';
     const searchUrl = document.getElementById('setSearchApiUrl').value.trim();
     if (fmt !== 'anthropic' && fmt !== 'auto' && !searchUrl) {
-      showToast('Web search enabled but no Search API URL set — search won\'t work for OpenAI-compatible models.', 'error');
+      showToast('Web search needs a Search API URL for OpenAI-compatible models.', 'error');
     }
   }
-
-  // Theme
-  const themeName = document.getElementById('setTheme').value;
-  if (themeName === 'custom') {
-    localStorage.setItem('assistantCustomTheme', JSON.stringify(getCustomThemeFromPickers()));
-  }
-  applyTheme(themeName);
-
-  // Message overrides
-  const msgFs = document.getElementById('setMsgFontSize').value.trim();
-  const msgMw = document.getElementById('setMsgMaxWidth').value.trim();
-  msgFs ? localStorage.setItem('assistantMsgFontSize', msgFs) : localStorage.removeItem('assistantMsgFontSize');
-  msgMw ? localStorage.setItem('assistantMsgMaxWidth', msgMw) : localStorage.removeItem('assistantMsgMaxWidth');
-  applyMsgOverrides();
-
-  // Font
-  const fontName = document.getElementById('setFont').value.trim();
-  localStorage.setItem('assistantFont', fontName);
-  loadCustomFont(fontName);
-
-  // Try to fetch models in background
-  const key = document.getElementById('setKey').value.trim();
-  if (proxy && (key || !providerRequiresKey({ llmProvider: providerName }))) {
-    fetchAvailableModels(proxy, key).then(models => {
-      localStorage.setItem('llmModelList', JSON.stringify(models));
-    }).catch(() => {});
-  }
-
-  closeModal('settingsModal');
-  renderConnectionChip();
   syncScheduleAutoPush();
-  announce('Settings saved.');
+  setSettingsSaveStatus('Tool settings saved.');
+  announce('Tool settings saved.');
+  return true;
+}
+
+function saveSettingsTab() {
+  const saves = {
+    api: saveApiSettings,
+    prompts: savePromptSettings,
+    appearance: saveAppearanceSettings,
+    tools: saveToolSettings
+  };
+  return saves[activeSettingsTab]?.() || false;
+}
+
+function saveSettings() {
+  return saveSettingsTab();
 }
 
 function closeSettings() {
   closeModal('settingsModal');
-  // Revert theme if user didn't save
-  loadTheme();
 }
 
 // ============================================
@@ -5871,6 +7304,8 @@ function applyPreset(id) {
   renderPromptEntries();
   if ('temperature' in preset) document.getElementById('setTemperature').value = preset.temperature ?? '';
   if ('extraParams' in preset) document.getElementById('setExtraParams').value = preset.extraParams || '';
+  savePresetGenerationSettings();
+  schedulePromptSettingsAutosave();
 }
 
 function saveCurrentAsPreset() {
@@ -5905,14 +7340,6 @@ function deleteSelectedPreset() {
   localStorage.setItem('assistantPresets', JSON.stringify(presets));
   syncScheduleAutoPush();
   loadPresets();
-
-  // Clear imported prompt entries and extra params
-  savePromptEntries([{ id: 'pe_' + Date.now() + '_sys', name: 'System Prompt', content: '', enabled: true }]);
-  renderPromptEntries();
-  document.getElementById('setTemperature').value = '';
-  document.getElementById('setExtraParams').value = '';
-  document.getElementById('setPersona').value = '';
-
   showToast('Preset deleted.', 'info');
 }
 
@@ -5920,8 +7347,16 @@ function importSTPreset(event) {
   const file = event.target.files[0];
   if (!file) return;
   event.target.value = '';
+  if (!beginLocalDataOperation()) return;
+  let operationEnded = false;
+  const finishOperation = () => {
+    if (operationEnded) return;
+    operationEnded = true;
+    endLocalDataOperation();
+  };
   const reader = new FileReader();
   reader.onload = function(e) {
+    try {
     let data;
     try { data = JSON.parse(e.target.result); } catch(err) {
       showToast('Invalid JSON file.', 'error');
@@ -5999,6 +7434,7 @@ function importSTPreset(event) {
 
     // Set Extra Parameters field
     document.getElementById('setExtraParams').value = Object.keys(extra).length ? JSON.stringify(extra, null, 2) : '';
+    savePresetGenerationSettings();
 
     // Extract prompt entries from ST prompts array
     if (Array.isArray(data.prompts)) {
@@ -6045,8 +7481,22 @@ function importSTPreset(event) {
     loadPresets();
     document.getElementById('setPresetSelect').value = preset.id;
     showToast('Imported ST preset: ' + presetName, 'success');
+    } catch (err) {
+      showToast('Could not import preset: ' + sanitizeErrorDetail(err), 'error');
+    } finally {
+      finishOperation();
+    }
   };
-  reader.readAsText(file);
+  reader.onerror = reader.onabort = () => {
+    showToast('Could not read preset file.', 'error');
+    finishOperation();
+  };
+  try {
+    reader.readAsText(file);
+  } catch (err) {
+    showToast('Could not read preset file.', 'error');
+    finishOperation();
+  }
 }
 
 // ============================================
@@ -6246,7 +7696,7 @@ async function buildSystemMessages(conv) {
   // so a project with instructions suppresses "You are a helpful assistant."
   // Macros are applied to instructions only — resolving them inside a source file would
   // silently rewrite any {{...}} the file happens to contain.
-  const project = getProject(conv && conv.projectId);
+  const project = isTemporaryConversation(conv) ? null : getProject(conv && conv.projectId);
   if (project) {
     if (project.instructions && project.instructions.trim()) {
       msgs.push({ role: 'system', content: 'Project instructions (' + project.name + '):\n\n' + resolveText(project.instructions) });
@@ -6279,7 +7729,7 @@ async function buildSystemMessages(conv) {
     msgs.push({ role: 'system', content: 'Conversation summary:\n' + conv.summary });
   }
   // Memory prompt
-  const mem = await getMemoryPrompt();
+  const mem = isTemporaryConversation(conv) ? '' : await getMemoryPrompt();
   if (mem) msgs.push({ role: 'system', content: mem });
   if (areEmotionSpritesEnabled()) msgs.push({ role: 'system', content: buildEmotionSpriteInstructions() });
   return msgs;
@@ -6467,6 +7917,7 @@ function renderContextPanel() {
   if (readOnlyShare) return;
   const conv = getActiveConv();
   if (!conv) return;
+  renderConversationHeader();
   const conversationChanged = contextPanelConversationId !== conv.id;
   if (conversationChanged) {
     contextPanelConversationId = conv.id;
@@ -6493,6 +7944,46 @@ function renderContextPanel() {
   if (summary && (conversationChanged || document.activeElement !== summary)) summary.value = conv.summary || '';
   const summaryStatus = document.getElementById('summaryStatus');
   if (summaryStatus) summaryStatus.textContent = conv.summary?.trim() ? 'Saved' : 'Empty';
+
+  const project = isTemporaryConversation(conv) ? null : getProject(conv.projectId);
+  const chatDocs = Array.isArray(conv.docs) ? conv.docs : [];
+  const projectDocs = Array.isArray(project?.docs) ? project.docs : [];
+  const fileStatus = document.getElementById('filesStatus');
+  const filesBody = document.getElementById('contextFilesBody');
+  const fileCount = chatDocs.length + projectDocs.length;
+  if (fileStatus) fileStatus.textContent = fileCount ? String(fileCount) : 'None';
+  if (filesBody) {
+    filesBody.replaceChildren();
+    const addFiles = (label, docs) => {
+      if (!docs.length) return;
+      const heading = document.createElement('strong');
+      heading.className = 'context-file-heading';
+      heading.textContent = label;
+      filesBody.appendChild(heading);
+      docs.forEach(doc => {
+        const row = document.createElement('div');
+        row.className = 'context-file-row';
+        row.textContent = doc.name || 'Document';
+        filesBody.appendChild(row);
+      });
+    };
+    addFiles('This chat', chatDocs);
+    addFiles(project ? project.name : 'Project', projectDocs);
+    if (!fileCount) {
+      const empty = document.createElement('p');
+      empty.textContent = isTemporaryConversation(conv)
+        ? 'No files in this temporary chat.'
+        : 'No files in this chat or its project.';
+      filesBody.appendChild(empty);
+    }
+    const search = document.createElement('button');
+    search.type = 'button';
+    search.className = 'btn btn-secondary context-wide-action';
+    search.textContent = 'Search files';
+    search.disabled = !fileCount;
+    search.onclick = () => openFileSearch();
+    filesBody.appendChild(search);
+  }
 
   if (!conv.messages.includes(contextSourceMessage)) contextSourceMessage = null;
   renderContextSources(contextSourceMessage);
@@ -6619,6 +8110,78 @@ function maybeAddAvatar(wrapper) {
   }
 }
 
+const DEFAULT_STARTER_PROMPTS = [
+  'Help me plan today\'s priorities.',
+  'Explain a difficult topic clearly.',
+  'Review and improve some writing.',
+  'Turn my notes into an action plan.'
+];
+
+function getStarterPrompts() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('assistantStarterPrompts') || 'null');
+    if (Array.isArray(saved)) return saved.map(String).map(text => text.trim()).filter(Boolean).slice(0, 8);
+  } catch (error) {
+    console.warn('Starter prompt parse error:', error);
+  }
+  return DEFAULT_STARTER_PROMPTS;
+}
+
+function insertStarterPrompt(text) {
+  const input = document.getElementById('chatInput');
+  if (!input || readOnlyShare) return;
+  input.value = String(text || '');
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
+function renderEmptyConversation(area) {
+  const placeholder = document.createElement('div');
+  placeholder.className = 'chat-placeholder starter-surface';
+  const configured = Boolean((localStorage.getItem('llmProxyUrl') || '').trim()) && (!providerRequiresKey() || Boolean(getApiKey()));
+  const heading = document.createElement('h2');
+  heading.textContent = configured ? 'Start a conversation' : 'Connect a provider to start';
+  const detail = document.createElement('p');
+  detail.textContent = configured
+    ? (localStorage.getItem('llmModel') || 'Choose a model from the toolbar')
+    : 'Your provider receives messages directly from this browser.';
+  placeholder.append(heading, detail);
+
+  if (configured && localStorage.getItem('assistantStarterPromptsHidden') !== 'true') {
+    const prompts = document.createElement('div');
+    prompts.className = 'starter-prompts';
+    getStarterPrompts().forEach(text => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = text;
+      button.onclick = () => insertStarterPrompt(text);
+      prompts.appendChild(button);
+    });
+    if (prompts.children.length) placeholder.appendChild(prompts);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'starter-actions';
+  const addAction = (label, action, primary = false) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn ' + (primary ? 'btn-primary' : 'btn-secondary');
+    button.textContent = label;
+    button.onclick = action;
+    actions.appendChild(button);
+  };
+  if (!configured) {
+    addAction('Connect provider', () => openSettingsSection('api'), true);
+  } else {
+    addAction('Attach a file', () => document.getElementById('fileInput')?.click());
+    addAction('Set a goal', () => openContextSection('goalSection'));
+    addAction('Shortcuts', () => openModal('shortcutsModal'));
+  }
+  placeholder.appendChild(actions);
+  area.appendChild(placeholder);
+}
+
 function renderMessages({ preserveScroll = false } = {}) {
   closeChatSearch();
   renderContextPanel();
@@ -6627,9 +8190,17 @@ function renderMessages({ preserveScroll = false } = {}) {
   const wasAtBottom = area.scrollHeight - area.scrollTop - area.clientHeight <= 4;
   const savedScrollTop = preserveScroll && !wasAtBottom ? area.scrollTop : null;
   area.innerHTML = '';
+  if (isTemporaryConversation(getActiveConv())) {
+    const notice = document.createElement('div');
+    notice.className = 'temporary-chat-notice';
+    notice.setAttribute('role', 'note');
+    notice.textContent = TEMPORARY_CHAT_NOTICE;
+    area.appendChild(notice);
+  }
 
   if (messages.length === 0) {
-    area.innerHTML = '<div class="chat-placeholder">Start a conversation...</div>';
+    renderEmptyConversation(area);
+    updateSendBtnState();
     return;
   }
 
@@ -6699,114 +8270,115 @@ function renderMessages({ preserveScroll = false } = {}) {
     if (msg.role === 'assistant') maybeAddAvatar(wrapper);
     wrapper.appendChild(bubble);
 
-    // Message actions
+    // Keep frequent actions visible and put the rest in one keyboard-capable menu.
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
+    actions.setAttribute('role', 'toolbar');
+    actions.setAttribute('aria-label', (msg.role === 'assistant' ? 'Assistant' : 'User') + ' message actions');
 
     const copyBtn = document.createElement('button');
     copyBtn.className = 'msg-action-btn';
     copyBtn.textContent = 'Copy';
     copyBtn.setAttribute('aria-label', 'Copy message');
-    copyBtn.onclick = () => {
-      navigator.clipboard.writeText(getMsgText(msg));
-      copyBtn.textContent = 'Copied!';
-      setTimeout(() => copyBtn.textContent = 'Copy', 1500);
+    copyBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(getMsgText(msg));
+        copyBtn.textContent = 'Copied';
+        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+      } catch (error) {
+        showToast('Could not copy this message.', 'error');
+      }
     };
     actions.appendChild(copyBtn);
 
-    if (msg.role === 'assistant') {
-      const speakBtn = document.createElement('button');
-      speakBtn.className = 'msg-action-btn';
-      speakBtn.textContent = 'Speak';
-      speakBtn.setAttribute('aria-label', 'Read message aloud');
-      speakBtn.onclick = () => speakMessage(msg, speakBtn);
-      actions.appendChild(speakBtn);
-
-      const toolData = msg.swipeToolUse && msg.swipeToolUse[msg.swipeIndex];
-      const hasSources = (msg.swipeSources?.[msg.swipeIndex]?.length > 0) || (toolData && toolData.some(tb =>
-        (tb.type === 'url_fetch' && (tb.content || tb.url)) ||
-        (tb.results || []).some(r => r.url)
-      ));
-      if (hasSources) {
-        const srcBtn = document.createElement('button');
-        srcBtn.className = 'msg-action-btn';
-        srcBtn.textContent = 'Sources';
-        srcBtn.setAttribute('aria-label', 'View sources');
-        srcBtn.onclick = () => openSourcesDrawer(msg);
-        actions.appendChild(srcBtn);
-      }
+    const request = msg.role === 'assistant' ? getSwipeRequest(msg) : null;
+    const isComparison = msg.role === 'assistant' && msg.comparison === true;
+    if (!isComparison && request && ['failed', 'interrupted', 'stopped'].includes(request.status)) {
+      const retryBtn = document.createElement('button');
+      retryBtn.className = 'msg-action-btn retry-btn';
+      retryBtn.textContent = 'Retry';
+      retryBtn.onclick = () => retryRequest(idx);
+      actions.appendChild(retryBtn);
+    } else if (!isComparison && msg.role === 'assistant' && idx === messages.length - 1) {
+      const regenerateBtn = document.createElement('button');
+      regenerateBtn.className = 'msg-action-btn';
+      regenerateBtn.textContent = 'Regenerate';
+      regenerateBtn.onclick = () => regenerate();
+      actions.appendChild(regenerateBtn);
     }
 
-    const contextBtn = document.createElement('button');
-    contextBtn.className = 'msg-action-btn context-toggle-btn';
-    contextBtn.textContent = msg.includeInContext === false ? 'Include' : 'Exclude';
-    contextBtn.setAttribute('aria-label', (msg.includeInContext === false ? 'Include ' : 'Exclude ') + msg.role + ' message from context');
-    contextBtn.onclick = () => {
-      msg.includeInContext = msg.includeInContext === false;
-      const conv = getActiveConv();
-      if (conv) conv.updatedAt = Date.now();
-      saveConversations();
-      renderMessages();
-      updateTokenInfo();
-      announce(msg.includeInContext === false ? 'Message excluded from future context.' : 'Message included in future context.');
-    };
-    actions.appendChild(contextBtn);
-
-    if (msg.role === 'user') {
-      const editBtn = document.createElement('button');
-      editBtn.className = 'msg-action-btn';
-      editBtn.textContent = 'Edit';
-      editBtn.setAttribute('aria-label', 'Edit message');
-      editBtn.onclick = () => { msg._editing = true; renderMessages(); };
-      actions.appendChild(editBtn);
+    const toolData = msg.role === 'assistant' && msg.swipeToolUse?.[msg.swipeIndex];
+    const hasSources = msg.role === 'assistant' && ((msg.swipeSources?.[msg.swipeIndex]?.length > 0) || (toolData && toolData.some(tb =>
+      (tb.type === 'url_fetch' && (tb.content || tb.url)) || (tb.results || []).some(result => result.url)
+    )));
+    const requestStatus = request?.status;
+    const canContinue = !isComparison && msg.role === 'assistant' && idx === messages.length - 1 &&
+      Boolean(String(getMsgText(msg) || '').trim()) && (!requestStatus || requestStatus === 'complete') &&
+      !NO_TRAILING_ASSISTANT_RE.test(localStorage.getItem('llmModel') || '');
+    const secondaryActions = [];
+    if (msg.role === 'assistant') secondaryActions.push({ label: 'Read aloud', action: () => speakMessage(msg) });
+    if (msg.role === 'assistant' && idx === messages.length - 1 && getMsgText(msg).trim() && (!requestStatus || requestStatus === 'complete')) {
+      secondaryActions.push({ label: 'Suggest follow-ups', action: () => suggestFollowUps(idx) });
     }
-
-    const forkBtn = document.createElement('button');
-    forkBtn.className = 'msg-action-btn';
-    forkBtn.textContent = 'Fork';
-    forkBtn.setAttribute('aria-label', 'Fork conversation');
-    forkBtn.onclick = () => forkBranch(idx);
-    actions.appendChild(forkBtn);
-
-    if (msg.role === 'assistant' && msg.swipes && msg.swipes.length > 1) {
-      const delSwipeBtn = document.createElement('button');
-      delSwipeBtn.className = 'msg-action-btn';
-      delSwipeBtn.textContent = 'Delete Swipe';
-      delSwipeBtn.setAttribute('aria-label', 'Delete current swipe');
-      delSwipeBtn.onclick = () => {
-        if (!confirm('Delete this swipe?')) return;
-        const si = msg.swipeIndex;
-        msg.swipes.splice(si, 1);
-        ['swipeThinking', 'swipeToolUse', 'swipeImages', 'swipeSources', 'swipeLlms', 'swipeRequests', 'swipeTokenEstimates'].forEach(key => {
-          if (Array.isArray(msg[key])) msg[key].splice(si, 1);
-        });
-        msg.swipeIndex = Math.min(si, msg.swipes.length - 1);
-        msg.content = msg.swipes[msg.swipeIndex];
-        if (msg.swipeImages) msg.images = msg.swipeImages[msg.swipeIndex] || [];
+    if (hasSources) secondaryActions.push({ label: 'Sources', action: () => openSourcesDrawer(msg) });
+    secondaryActions.push({
+      label: msg.includeInContext === false ? 'Include in context' : 'Exclude from context',
+      action: () => {
+        msg.includeInContext = msg.includeInContext === false;
         const conv = getActiveConv();
         if (conv) conv.updatedAt = Date.now();
         saveConversations();
         renderMessages();
         updateTokenInfo();
-      };
-      actions.appendChild(delSwipeBtn);
+        announce(msg.includeInContext === false ? 'Message excluded from future context.' : 'Message included in future context.');
+      }
+    });
+    if (msg.role === 'user') secondaryActions.push({ label: 'Edit and resend', action: () => { msg._editing = true; renderMessages(); } });
+    secondaryActions.push({ label: 'Fork from here', action: () => forkBranch(idx) });
+    if (msg.role === 'assistant' && msg.swipes?.length > 1) {
+      secondaryActions.push({
+        label: 'Delete this response version',
+        danger: true,
+        action: () => {
+          if (!confirm('Delete this response version?')) return;
+          const swipeIndex = msg.swipeIndex;
+          msg.swipes.splice(swipeIndex, 1);
+          ['swipeThinking', 'swipeToolUse', 'swipeImages', 'swipeSources', 'swipeLlms', 'swipeRequests', 'swipeTokenEstimates'].forEach(key => {
+            if (Array.isArray(msg[key])) msg[key].splice(swipeIndex, 1);
+          });
+          msg.swipeIndex = Math.min(swipeIndex, msg.swipes.length - 1);
+          msg.content = msg.swipes[msg.swipeIndex];
+          if (msg.swipeImages) msg.images = msg.swipeImages[msg.swipeIndex] || [];
+          const conv = getActiveConv();
+          if (conv) conv.updatedAt = Date.now();
+          saveConversations();
+          renderMessages();
+          updateTokenInfo();
+        }
+      });
     }
-
-    const delBtn = document.createElement('button');
-    delBtn.className = 'msg-action-btn';
-    delBtn.textContent = 'Delete';
-    delBtn.setAttribute('aria-label', 'Delete message');
-    delBtn.onclick = () => {
-      if (msg.role === 'assistant' && !confirm('Delete this response?')) return;
-      messages.splice(idx, 1);
-      const conv = getActiveConv();
-      if (conv) conv.updatedAt = Date.now();
-      saveConversations();
-      renderMessages();
-      updateTokenInfo();
-    };
-    actions.appendChild(delBtn);
-
+    if (canContinue) secondaryActions.push({ label: 'Continue response', action: () => continueMessage() });
+    if (request) secondaryActions.push({ label: 'Request details', action: () => showRequestDetails(request) });
+    secondaryActions.push({
+      label: msg.role === 'assistant' ? 'Delete response' : 'Delete message',
+      danger: true,
+      action: () => {
+        if (msg.role === 'assistant' && !confirm('Delete this response?')) return;
+        messages.splice(idx, 1);
+        const conv = getActiveConv();
+        if (conv) conv.updatedAt = Date.now();
+        saveConversations();
+        renderMessages();
+        updateTokenInfo();
+      }
+    });
+    const moreBtn = document.createElement('button');
+    moreBtn.className = 'msg-action-btn';
+    moreBtn.textContent = 'More';
+    moreBtn.setAttribute('aria-haspopup', 'menu');
+    moreBtn.setAttribute('aria-expanded', 'false');
+    moreBtn.onclick = () => openActionMenu(moreBtn, secondaryActions, 'Message actions');
+    actions.appendChild(moreBtn);
     wrapper.appendChild(actions);
 
     const metaEl = renderMessageMeta(msg);
@@ -6815,20 +8387,8 @@ function renderMessages({ preserveScroll = false } = {}) {
     if (requestMeta) wrapper.appendChild(requestMeta);
 
     if (msg.role === 'assistant') {
-      const request = getSwipeRequest(msg);
       if (request && ['failed', 'interrupted', 'stopped'].includes(request.status)) {
-        const retryBtn = document.createElement('button');
-        retryBtn.className = 'msg-action-btn retry-btn';
-        retryBtn.textContent = 'Retry';
-        retryBtn.setAttribute('aria-label', 'Retry failed request');
-        retryBtn.onclick = () => retryRequest(idx);
-        actions.appendChild(retryBtn);
-        const detailsBtn = document.createElement('button');
-        detailsBtn.className = 'msg-action-btn';
-        detailsBtn.textContent = 'Details';
-        detailsBtn.setAttribute('aria-label', 'Show request details');
-        detailsBtn.onclick = () => showRequestDetails(request);
-        actions.appendChild(detailsBtn);
+        wrapper.classList.add('request-needs-attention');
       }
       // Swipe controls
       const swipeDiv = document.createElement('div');
@@ -6849,33 +8409,6 @@ function renderMessages({ preserveScroll = false } = {}) {
       swipeDiv.appendChild(counter);
       swipeDiv.appendChild(next);
       wrapper.appendChild(swipeDiv);
-
-      const regen = document.createElement('button');
-      regen.className = 'regen-btn';
-      regen.textContent = 'Regenerate';
-      regen.setAttribute('aria-label', 'Regenerate response');
-      regen.onclick = () => regenerate();
-
-      const requestStatus = getSwipeRequest(msg)?.status;
-      const canContinue = idx === messages.length - 1 &&
-        Boolean(String(getMsgText(msg) || '').trim()) &&
-        (!requestStatus || requestStatus === 'complete') &&
-        !NO_TRAILING_ASSISTANT_RE.test(localStorage.getItem('llmModel') || '');
-      if (canContinue) {
-        const continueBtn = document.createElement('button');
-        continueBtn.className = 'regen-btn';
-        continueBtn.textContent = 'Continue';
-        continueBtn.setAttribute('aria-label', 'Continue generation');
-        continueBtn.onclick = () => continueMessage();
-
-        const btnRow = document.createElement('div');
-        btnRow.style.cssText = 'display:flex;gap:6px;justify-content:center';
-        btnRow.appendChild(regen);
-        btnRow.appendChild(continueBtn);
-        wrapper.appendChild(btnRow);
-      } else {
-        wrapper.appendChild(regen);
-      }
     }
 
     // Fade-in on last message only
@@ -7008,7 +8541,7 @@ async function resendAfterEdit() {
     await streamResponse(apiMessages, assistantMsg, 0, bubble, null, null, { conv });
 
     if (getSwipeRequest(assistantMsg)?.status === 'complete') {
-      extractMemories(apiMessages);
+      extractMemories(apiMessages, conv);
     }
     if (conv) conv.updatedAt = Date.now();
     saveConversations();
@@ -7025,9 +8558,7 @@ async function resendAfterEdit() {
 function swipeMsg(idx, dir) {
   const msg = messages[idx];
   if (!msg || !msg.swipes) return;
-  msg.swipeIndex = Math.max(0, Math.min(msg.swipes.length - 1, msg.swipeIndex + dir));
-  msg.content = msg.swipes[msg.swipeIndex];
-  if (msg.swipeImages) msg.images = msg.swipeImages[msg.swipeIndex] || [];
+  selectAssistantSwipe(msg, msg.swipeIndex + dir);
   const conv = getActiveConv();
   if (conv) conv.updatedAt = Date.now();
   debouncedSave();
@@ -7057,6 +8588,7 @@ function forkBranch(msgIdx) {
   newConv.forkMessageIndex = msgIdx;
   newConv.forkedAt = now;
   newConv.queuedFollowUps = [];
+  if (isTemporaryConversation(conv)) temporaryConversations.add(newConv);
   delete newConv.draft;
   delete newConv.shareGistId;
   delete newConv.shareUrl;
@@ -7638,18 +9170,20 @@ function finishRequestMetadata(request, status, error = '', httpStatus = null) {
   request.error = sanitizeErrorDetail(error);
 }
 
-async function authorizeExternalTool(toolName, args, conv) {
+async function authorizeExternalTool(toolName, args, conv, authorization) {
   if (!canUseTool(toolName, conv)) return false;
   const policy = getToolPolicy(conv);
   if (!policy.confirm) return true;
+  if (authorization && typeof authorization.confirmed === 'boolean') return authorization.confirmed;
   const target = toolName === 'web_search' ? extractWebSearchQueryFromArgs(args) : safeHttpUrl(args?.url);
   const confirmed = window.confirm('The assistant wants to use ' + (toolName === 'web_search' ? 'web search' : 'URL fetching') + ':\n\n' + (target || '[invalid target]') + '\n\nAllow this request?');
+  if (authorization) authorization.confirmed = confirmed;
   announce(confirmed ? 'External tool request approved.' : 'External tool request denied.');
   return confirmed;
 }
 
 async function executeAuthorizedTool(toolName, args, conv, signal, authorization) {
-  if (!(await authorizeExternalTool(toolName, args, conv))) {
+  if (!(await authorizeExternalTool(toolName, args, conv, authorization))) {
     return { results: [], content: '', error: 'Tool call denied by user; no external request was made.', denied: true };
   }
   if (toolName === 'web_search') return executeWebSearch(extractWebSearchQueryFromArgs(args), signal);
@@ -9022,7 +10556,7 @@ function updateSendBtnState() {
   if (!btn) return;
   const conv = getActiveConv();
   const queueBtn = document.getElementById('followUpQueueBtn');
-  if (queueBtn) queueBtn.disabled = readOnlyShare || !conv || (conv.queuedFollowUps || []).length >= 20 || queueingFollowUp || (sending && !streaming);
+  if (queueBtn) queueBtn.disabled = readOnlyShare || !conv || pendingAttachmentReads > 0 || (conv.queuedFollowUps || []).length >= 20 || queueingFollowUp || (sending && !streaming);
   if (streaming) {
     btn.textContent = 'Stop';
     btn.setAttribute('aria-label', 'Stop generating response');
@@ -9035,11 +10569,12 @@ function updateSendBtnState() {
     btn.disabled = true;
     return;
   }
-  btn.disabled = false;
   const input = document.getElementById('chatInput');
-  const hasInput = input.value.trim() || pendingAttachments.length > 0;
+  const hasInput = Boolean(input.value.trim() || pendingAttachments.length > 0);
   const lastMsg = messages[messages.length - 1];
-  if (!hasInput && lastMsg && lastMsg.role === 'user') {
+  const canRegenerate = !hasInput && lastMsg?.role === 'user';
+  btn.disabled = readOnlyShare || _syncOperationInFlight || !conv || pendingAttachmentReads > 0 || (!hasInput && !canRegenerate);
+  if (canRegenerate) {
     // ponytail: the word does not fit beside the other controls on a phone.
     btn.textContent = window.innerWidth <= 768 ? '↻' : 'Regenerate';
     btn.setAttribute('aria-label', 'Regenerate response');
@@ -9050,6 +10585,10 @@ function updateSendBtnState() {
 }
 
 function beginSendingAction() {
+  if (_syncOperationInFlight) {
+    showToast('Wait for sync to finish.', 'info');
+    return false;
+  }
   if (sending || streaming) return false;
   sending = true;
   updateSendBtnState();
@@ -9092,7 +10631,7 @@ function renderFollowUpQueue() {
   const armed = Boolean(conv && armedFollowUpConversationIds.has(conv.id));
   panel.hidden = queue.length === 0;
   queueBtn.textContent = queue.length ? 'Queue (' + queue.length + ')' : 'Queue';
-  queueBtn.disabled = readOnlyShare || !conv || queue.length >= 20 || queueingFollowUp || (sending && !streaming);
+  queueBtn.disabled = readOnlyShare || !conv || pendingAttachmentReads > 0 || queue.length >= 20 || queueingFollowUp || (sending && !streaming);
   list.innerHTML = '';
   queue.forEach(item => {
     const row = document.createElement('div');
@@ -9150,6 +10689,10 @@ function restoreComposerSnapshot(conv, input, originalText, attachments, overrid
 
 async function queueFollowUpFromComposer() {
   if (readOnlyShare || queueingFollowUp) return;
+  if (pendingAttachmentReads > 0) {
+    showToast('Wait for attachments to finish reading.', 'info');
+    return;
+  }
   if (sending && !streaming) {
     showToast('Wait until the current request starts before queueing a follow-up.', 'info');
     return;
@@ -9322,7 +10865,12 @@ async function processQueuedFollowUps(convId) {
 // ============================================
 async function sendMessage({ queuedFollowUp = null } = {}) {
   if (streaming && abortController && !queuedFollowUp) { abortController.abort(); return 'stopped'; }
-  if (readOnlyShare || !beginSendingAction()) return 'paused';
+  if (readOnlyShare) return 'paused';
+  if (!queuedFollowUp && pendingAttachmentReads > 0) {
+    showToast('Wait for attachments to finish reading.', 'info');
+    return 'paused';
+  }
+  if (!beginSendingAction()) return 'paused';
   let finalStatus = 'paused';
   let requestConvId = activeConvId;
   try {
@@ -9463,7 +11011,7 @@ async function sendMessage({ queuedFollowUp = null } = {}) {
   finalStatus = await streamResponse(apiMessages, assistantMsg, 0, bubble, overrideModel, null, { conv });
 
   if (getSwipeRequest(assistantMsg)?.status === 'complete') {
-    extractMemories(apiMessages);
+    extractMemories(apiMessages, conv);
   }
   if (conv) conv.updatedAt = Date.now();
   debouncedSave();
@@ -9494,6 +11042,10 @@ async function regenerate() {
   if (lastIdx === -1) return;
 
   const msg = messages[lastIdx];
+  if (msg.comparison === true) {
+    showToast('Comparison responses cannot be regenerated with the active provider.', 'info');
+    return;
+  }
   const conv = getActiveConv();
   const requestContext = await buildRequestMessages(conv, { messageList: messages, untilIndex: lastIdx });
   if (guardContextLimit(requestContext)) return;
@@ -9539,6 +11091,10 @@ async function continueMessage() {
   if (lastIdx === -1) return;
 
   const msg = messages[lastIdx];
+  if (msg.comparison === true) {
+    showToast('Comparison responses cannot be continued with the active provider.', 'info');
+    return;
+  }
   const existingText = typeof msg.content === 'string' ? msg.content : '';
   if (!existingText.trim()) return;
 
@@ -9604,7 +11160,8 @@ const EXPORT_SETTING_ALLOWLIST = [
   'llmEnableStMacros', 'llmRpUserName', 'llmInputCost', 'llmOutputCost', 'llmWebSearch',
   'llmForceSearch', 'llmMemoryEnabled', 'llmHoldScreenshot', 'llmEmotionSprites', 'llmEmotionSpriteSet', 'llmPromptEntries',
   'llmUrlFetch', 'llmToolConfirm', 'llmSearchApiUrl', 'llmCorsProxy',
-  'assistantTheme', 'assistantCustomTheme', 'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth'
+  'assistantTheme', 'assistantStarterPrompts', 'assistantStarterPromptsHidden',
+  'assistantCustomTheme', 'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth'
 ];
 const IMPORT_SETTING_URL_KEYS = new Set(['llmProxyUrl', 'llmSearchApiUrl', 'llmCorsProxy']);
 const IMPORT_SETTING_ALLOWLIST = EXPORT_SETTING_ALLOWLIST.filter(key => ![
@@ -9642,6 +11199,7 @@ function shareSafeText(text) {
 function exportConversation() {
   const conv = getActiveConv();
   if (!conv) return;
+  if (isTemporaryConversation(conv)) { showToast('Temporary chats cannot be exported.', 'info'); return; }
   const data = {
     schema: EXPORT_SCHEMA,
     version: EXPORT_VERSION,
@@ -9661,14 +11219,15 @@ function exportConversation() {
 }
 
 function exportAllConversations() {
+  const persistentConversations = getPersistentConversations();
   const data = {
     schema: EXPORT_SCHEMA,
     version: EXPORT_VERSION,
-    conversations: conversations,
+    conversations: persistentConversations,
     // Advertised as a full backup, so project instructions and files ride along too.
     projects: projects,
     memories: [],
-    drafts: conversations.filter(conv => conv.draft).map(conv => ({ conversationId: conv.id, ...conv.draft })),
+    drafts: persistentConversations.filter(conv => conv.draft).map(conv => ({ conversationId: conv.id, ...conv.draft })),
     exportedAt: new Date().toISOString(),
     settings: buildSafeExportSettings(),
     profiles: buildSafeExportProfiles()
@@ -9695,6 +11254,9 @@ function normalizeImportedData(data) {
   const importedConversations = rawConversations.map(raw => {
     const conv = normalizeConversationRecord(JSON.parse(JSON.stringify(raw)));
     conv.toolPolicy = null;
+    delete conv.shareGistId;
+    delete conv.shareUrl;
+    delete conv.shareId;
     return conv;
   });
   if (!importedConversations.length) throw new Error('No conversations found in this file.');
@@ -9724,6 +11286,9 @@ function renderImportPreview(data) {
   if (!body) return;
   body.innerHTML = '';
   const rows = [
+    ['File', pendingImportMeta?.name || 'JSON import'],
+    ['Schema', pendingImportMeta?.schema || 'Legacy'],
+    ['Exported', pendingImportMeta?.exportedAt ? new Date(pendingImportMeta.exportedAt).toLocaleString() : 'Not provided'],
     ['Conversations', data.conversations.length],
     ['Projects', data.projects.length],
     ['Messages', data.conversations.reduce((total, conv) => total + conv.messages.length, 0)],
@@ -9733,7 +11298,7 @@ function renderImportPreview(data) {
     ['Safe settings', Object.keys(data.settings).length]
   ];
   const intro = document.createElement('p');
-  intro.textContent = 'Parsed successfully. API keys, search keys, sync tokens, and other secret profile fields will not be imported.';
+  intro.textContent = 'Parsed successfully. Provider endpoints, API keys, search settings, sync tokens, and other credentials will not be restored.';
   body.appendChild(intro);
   rows.forEach(([label, value]) => {
     const row = document.createElement('div');
@@ -9743,22 +11308,61 @@ function renderImportPreview(data) {
     row.querySelector('span').textContent = String(value);
     body.appendChild(row);
   });
+  document.querySelector('input[name="importStrategy"][value="merge"]')?.click();
+  updateImportStrategyUI();
 }
 
 function importConversation(event) {
   if (readOnlyShare) return;
   const file = event.target.files[0];
   if (!file) return;
+  event.target.value = '';
+  if (!beginLocalDataOperation()) return;
+  let operationEnded = false;
+  const finishOperation = () => {
+    if (operationEnded) return;
+    operationEnded = true;
+    endLocalDataOperation();
+  };
   const reader = new FileReader();
   reader.onload = (e) => {
     try {
-      pendingImport = normalizeImportedData(JSON.parse(e.target.result));
+      const raw = JSON.parse(e.target.result);
+      pendingImport = normalizeImportedData(raw);
+      pendingImportMeta = {
+        name: file.name,
+        schema: raw.schema ? raw.schema + (raw.version ? ' v' + raw.version : '') : '',
+        exportedAt: raw.exportedAt || ''
+      };
       renderImportPreview(pendingImport);
       openModal('importPreviewModal');
     } catch (err) { showToast('Could not parse import: ' + sanitizeErrorDetail(err), 'error'); }
+    finally { finishOperation(); }
   };
-  reader.readAsText(file);
-  event.target.value = '';
+  reader.onerror = reader.onabort = () => {
+    showToast('Could not read import file.', 'error');
+    finishOperation();
+  };
+  try {
+    reader.readAsText(file);
+  } catch (err) {
+    showToast('Could not read import file.', 'error');
+    finishOperation();
+  }
+}
+
+function updateImportStrategyUI() {
+  const mode = document.querySelector('input[name="importStrategy"]:checked')?.value || 'merge';
+  const button = document.getElementById('applyImportBtn');
+  if (!button) return;
+  button.classList.toggle('btn-danger', mode === 'replace');
+  button.classList.toggle('btn-primary', mode !== 'replace');
+  button.textContent = mode === 'replace' ? 'Replace data' : 'Import';
+}
+
+function applySelectedImport() {
+  const mode = document.querySelector('input[name="importStrategy"]:checked')?.value || 'merge';
+  return applyImport(mode);
 }
 
 function mergeConversationRecords(localList, importedList) {
@@ -9822,7 +11426,10 @@ async function applyImport(mode = 'merge') {
     return;
   }
   if (!['merge', 'copy', 'replace'].includes(mode)) return;
+  if (!beginLocalDataOperation()) return;
+  try {
   const imported = pendingImport;
+  const previousActiveConvId = activeConvId;
   if (mode === 'replace' && !confirm('Replace imported categories? This removes local conversations, projects, memories, and drafts.')) return;
   if ((mode === 'replace' && hasPublicShareIds(conversations)) || (mode !== 'replace' && hasPublicShareIds(imported.conversations))) {
     if (!confirm('Some records have public share IDs. Deleting or replacing them does not revoke the public links. Continue?')) return;
@@ -9881,43 +11488,53 @@ async function applyImport(mode = 'merge') {
     syncRecordTombstones('conversations', conversations.filter(conv => !incomingConversationIds.has(conv.id)).map(conv => conv.id));
     syncRecordTombstones('projects', projects.filter(project => !incomingProjectIds.has(project.id)).map(project => project.id));
     syncRecordTombstones('memories', localMemories.filter(memory => !incomingMemoryIds.has(memory.id)).map(memory => memory.id));
-    conversations = importedConversations;
+    replacePersistentConversations(importedConversations, false);
     projects = importedProjects;
     await saveMemories(importedMemories);
   } else {
-    conversations = mode === 'copy' ? conversations.concat(importedConversations) : mergeConversationRecords(conversations, importedConversations);
+    const persistent = getPersistentConversations();
+    const nextConversations = mode === 'copy' ? persistent.concat(importedConversations) : mergeConversationRecords(persistent, importedConversations);
+    replacePersistentConversations(nextConversations, true);
     projects = mode === 'copy' ? projects.concat(importedProjects) : mergeByUpdatedId(projects, importedProjects);
     const localMemories = await loadMemories();
     await saveMemories(mode === 'copy' ? localMemories.concat(importedMemories) : syncMergeMemoryLists(localMemories, importedMemories));
   }
   imported.drafts.forEach(draft => {
     const conversationId = mode === 'copy' ? copyConversationIds.get(draft.conversationId) : draft.conversationId;
-    const conv = conversations.find(item => item.id === conversationId);
+    const conv = conversations.find(item => item.id === conversationId && !isTemporaryConversation(item));
     if (conv && (!conv.draft || Number(draft.updatedAt || 0) > Number(conv.draft.updatedAt || 0))) conv.draft = { text: draft.text || '', attachments: cloneDraftAttachments(draft.attachments), updatedAt: draft.updatedAt || Date.now() };
   });
   applySafeImportedSettings(imported.settings, imported.profiles);
   armedFollowUpConversationIds.clear();
-  activeConvId = conversations[0]?.id || null;
+  activeConvId = mode !== 'replace' && conversations.some(conv => conv.id === previousActiveConvId)
+    ? previousActiveConvId
+    : (conversations[0]?.id || null);
   messages = getActiveConv()?.messages || [];
   await saveConversationImmediately();
-  saveProjects();
+  await saveProjects();
   pendingImport = null;
+  pendingImportMeta = null;
   closeModal('importPreviewModal');
+  if (document.getElementById('settingsModal')?.classList.contains('open')) closeModal('settingsModal');
   renderSidebar();
   renderMessages();
   restoreActiveDraft();
   updateTokenInfo();
   renderConnectionChip();
   showToast('Import applied (' + mode + ').', 'success');
+  } finally {
+    endLocalDataOperation();
+  }
 }
 
 async function renderStorageSummary() {
   const el = document.getElementById('storageSummary');
   if (!el) return;
+  const persistentConversations = getPersistentConversations();
   const approximate = [
-    ['Conversations', JSON.stringify(conversations).length],
+    ['Conversations', JSON.stringify(persistentConversations).length],
     ['Projects', JSON.stringify(projects).length],
-    ['Drafts and queue', JSON.stringify(conversations.map(conv => ({ draft: conv.draft || null, queuedFollowUps: conv.queuedFollowUps || [] }))).length],
+    ['Drafts and queue', JSON.stringify(persistentConversations.map(conv => ({ draft: conv.draft || null, queuedFollowUps: conv.queuedFollowUps || [] }))).length],
     ['Memories', (await loadMemories()).reduce((total, memory) => total + JSON.stringify(memory).length, 0)]
   ];
   let usageText = 'Storage estimate unavailable.';
@@ -9932,6 +11549,8 @@ async function clearDataCategory(category) {
   if (readOnlyShare) return;
   const labels = { conversations: 'conversations', drafts: 'drafts', memories: 'memories', credentials: 'provider, search, and sync credentials' };
   if (!labels[category] || !confirm('Clear ' + labels[category] + '? This cannot be undone.')) return;
+  if (!beginLocalDataOperation()) return;
+  try {
   if (category === 'conversations') {
     if (hasPublicShareIds(conversations) && !confirm('Some links may remain public after local deletion. Continue?')) return;
     syncRecordTombstones('conversations', conversations.map(conv => conv.id));
@@ -9955,12 +11574,19 @@ async function clearDataCategory(category) {
   } else if (category === 'credentials') {
     ['llmApiKey', 'llmSearchApiKey'].forEach(key => { localStorage.removeItem(key); sessionStorage.removeItem(key); });
     ['assistantSyncGistToken', 'assistantSyncPassphrase', 'assistantSyncGistId', 'assistantSyncSalt', 'assistantSyncLastHash', 'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, SYNC_STATE_GIST_KEY, SYNC_AUTO_PUSH_KEY, SYNC_AUTO_PENDING_KEY].forEach(key => localStorage.removeItem(key));
+    ['setKey', 'setSearchApiKey', 'setupKey', 'setSyncToken', 'setSyncGistId', 'setSyncPassphrase'].forEach(id => {
+      const input = document.getElementById(id);
+      if (input) input.value = '';
+    });
     scrubProfileSecrets();
     renderSyncSettings();
   }
   await renderStorageSummary();
   renderConnectionChip();
   showToast('Cleared ' + labels[category] + '.', 'success');
+  } finally {
+    endLocalDataOperation();
+  }
 }
 
 function synapseSelfTest() {
@@ -10008,12 +11634,53 @@ function synapseSelfTest() {
     assert(isLocalUrl('http://localhost./'), 'trailing-dot private host blocking');
     assert(requestContainsSensitiveData('https://search.example.test/?apiKey=secret'), 'query credential detection');
     assert(!canUseCorsProxy('https://api.example.test/chat', { method: 'POST', body: '{}' }, 'https://corsproxy.io./?url='), 'trailing-dot public proxy blocking');
+    const activeProfileBeforeRequestTests = localStorage.getItem('assistantActiveProfileId');
+    const activeKeyBeforeRequestTests = getApiKey();
+    const explicitTarget = buildRequestTarget({
+      llmProvider: 'openai',
+      llmProxyUrl: 'https://one.example.test/v1',
+      llmModel: 'claude-name-does-not-change-format',
+      llmApiFormat: 'openai'
+    }, { apiKey: 'self-test-key' });
+    const otherAuthority = buildRequestTarget({
+      llmProvider: 'anthropic',
+      llmProxyUrl: 'https://two.example.test/v1',
+      llmModel: 'claude-test',
+      llmApiFormat: 'anthropic'
+    });
+    assert(explicitTarget.apiFormat === 'openai', 'request target format isolation');
+    assert(resolveRequestTargetKey(explicitTarget, explicitTarget) === 'self-test-key', 'same-authority key reuse');
+    assert(resolveRequestTargetKey(otherAuthority, explicitTarget) === '', 'cross-authority key isolation');
+    assert(localStorage.getItem('assistantActiveProfileId') === activeProfileBeforeRequestTests && getApiKey() === activeKeyBeforeRequestTests, 'request target storage isolation');
+    const parsedSuggestions = parseFollowUpSuggestions('```json\n["One", "one", 7, "Two"]\n```');
+    assert(parsedSuggestions.length === 2 && parsedSuggestions[0] === 'One' && parsedSuggestions[1] === 'Two', 'follow-up parsing');
+    const comparisonProbe = { role: 'assistant', comparison: true, content: '', swipes: ['', ''], swipeIndex: 0, swipeRequests: [] };
+    createRequestMetadata(comparisonProbe, 0, { model: 'first' });
+    createRequestMetadata(comparisonProbe, 1, { model: 'second' });
+    const comparisonSuccess = applyComparisonSettledResults(comparisonProbe, [explicitTarget, otherAuthority], [
+      { status: 'rejected', reason: Object.assign(new Error('failed'), { httpStatus: 401 }) },
+      { status: 'fulfilled', value: 'kept response' }
+    ]);
+    assert(comparisonSuccess.length === 1 && comparisonSuccess[0] === 1 && comparisonProbe.swipes.length === 2 &&
+      comparisonProbe.swipeRequests[0].status === 'failed' && comparisonProbe.swipeRequests[1].status === 'complete' &&
+      comparisonProbe.swipeIndex === 1 && comparisonProbe.content === 'kept response', 'comparison result alignment');
+    const normalizedComparison = normalizeConversationRecord({ messages: [comparisonProbe, { role: 'user', comparison: true, content: 'prompt' }] });
+    assert(normalizedComparison.messages[0].comparison === true && !('comparison' in normalizedComparison.messages[1]), 'comparison marker normalization');
+    assert(!JSON.stringify(comparisonProbe).includes('self-test-key'), 'comparison credential isolation');
     const authorityImport = normalizeImportedData({
-      conversation: { messages: [], toolPolicy: { urlFetch: true, confirm: false } },
+      conversation: {
+        messages: [],
+        toolPolicy: { urlFetch: true, confirm: false },
+        shareGistId: 'attacker-gist',
+        shareUrl: 'https://example.test/share',
+        shareId: 'attacker-share'
+      },
       settings: { llmUrlFetch: 'true', llmToolConfirm: 'false' },
       profiles: [{ id: 'imported', settings: { llmProxyUrl: 'https://attacker.test/v1', llmUrlFetch: 'true' } }]
     });
-    assert(authorityImport.conversations[0].toolPolicy === null && !('llmUrlFetch' in authorityImport.settings) && !authorityImport.profiles[0].settings.llmProxyUrl, 'import authority stripping');
+    assert(authorityImport.conversations[0].toolPolicy === null &&
+      !authorityImport.conversations[0].shareGistId && !authorityImport.conversations[0].shareUrl && !authorityImport.conversations[0].shareId &&
+      !('llmUrlFetch' in authorityImport.settings) && !authorityImport.profiles[0].settings.llmProxyUrl, 'import authority stripping');
     const malformedImport = normalizeImportedData({ conversation: { messages: [] }, settings: { llmPromptEntries: '{}' }, projects: [{ id: 'project', name: {}, docs: [null] }] });
     assert(!('llmPromptEntries' in malformedImport.settings) && typeof malformedImport.projects[0].name === 'string' && malformedImport.projects[0].docs.length === 0, 'structured import normalization');
     const legacyBranches = normalizeLoadedConversations([{ id: 'legacy-branches', title: 'Legacy', messages: [
@@ -10029,6 +11696,24 @@ function synapseSelfTest() {
     const appendedConversation = { id: 'persist', updatedAt: 1, messages: [{ role: 'assistant', content: 'reply' }] };
     assert(chooseConversationWinner(appendedConversation, storedConversation, serializeConversation(storedConversation)) === appendedConversation, 'same-tab persistence');
     assert(syncFilterDeletedRecords([storedConversation], { persist: 2 }, 'updatedAt').length === 0, 'conversation tombstone filtering');
+    const originalConversations = conversations;
+    const originalActiveConvId = activeConvId;
+    try {
+      const persistentProbe = normalizeConversationRecord({ id: 'persistent-probe', messages: [] });
+      const temporaryProbe = normalizeConversationRecord({ id: 'temporary-probe', messages: [] });
+      temporaryConversations.add(temporaryProbe);
+      conversations = [persistentProbe, temporaryProbe];
+      activeConvId = temporaryProbe.id;
+      assert(getPersistentConversations().length === 1 && getPersistentConversations()[0] === persistentProbe, 'temporary persistence projection');
+      assert(getPersistentActiveConvId() === persistentProbe.id, 'temporary active ID projection');
+      const spoofedTemporary = normalizeConversationRecord({ id: 'spoofed-temporary', temporary: true, isTemporary: true, messages: [] });
+      assert(!isTemporaryConversation(spoofedTemporary) && !('temporary' in spoofedTemporary) && !('isTemporary' in spoofedTemporary), 'temporary marker trust boundary');
+      replacePersistentConversations([{ id: temporaryProbe.id, messages: [{ role: 'user', content: 'collision' }] }, { id: 'remote-probe', messages: [] }], true);
+      assert(conversations.find(conv => conv.id === temporaryProbe.id) === temporaryProbe && conversations.filter(conv => conv.id === temporaryProbe.id).length === 1, 'temporary collision preservation');
+    } finally {
+      conversations = originalConversations;
+      activeConvId = originalActiveConvId;
+    }
     assert(!syncAutoPushIsConfigured({ token: 'token', passphrase: 'passphrase' }), 'auto-push Gist gating');
     assert(syncAutoPushIsConfigured({ token: 'token', passphrase: 'passphrase', gistId: 'gist' }), 'auto-push configuration');
     const storedSync = syncGetStoredConfig();
@@ -10037,7 +11722,7 @@ function synapseSelfTest() {
       storedSync.passphrase === (localStorage.getItem('assistantSyncPassphrase') || ''), 'auto-push stored configuration');
     EMOTION_SPRITE_TAG_RE.lastIndex = 0;
     assert(EMOTION_SPRITE_TAG_RE.test('<gpt_helpfulness />'), 'emotion sprite tag');
-    const result = { ok: true, checks: ['normalization', 'goal and queue', 'fork lineage', 'context filtering', 'source numbering', 'legacy import', 'legacy branches', 'legacy settings', 'trust boundaries', 'sync filenames', 'persistence arbitration', 'tombstones', 'updatedAt merge', 'auto-push configuration', 'auto-push stored configuration', 'emotion sprite tag'] };
+    const result = { ok: true, checks: ['normalization', 'goal and queue', 'fork lineage', 'context filtering', 'source numbering', 'legacy import', 'legacy branches', 'legacy settings', 'trust boundaries', 'request targets', 'manual AI parsing', 'comparison alignment', 'sync filenames', 'persistence arbitration', 'tombstones', 'temporary chat isolation', 'updatedAt merge', 'auto-push configuration', 'auto-push stored configuration', 'emotion sprite tag'] };
     console.info('Synapse self-test passed', result);
     return result;
   } catch (error) {
@@ -10175,8 +11860,30 @@ function syncSetStatus(state, message, details) {
   if (status) {
     status.textContent = message || 'Not configured';
     status.className = 'debug-status-pill ' + (state || 'unknown');
+    status.setAttribute('aria-live', 'polite');
   }
   if (detailsEl) detailsEl.textContent = details || '';
+}
+
+function setSyncBusy(busy) {
+  if (busy) stopVoiceInput();
+  document.querySelectorAll('#settingsModal button, #settingsModal input, #settingsModal textarea, #settingsModal select').forEach(control => {
+    if (busy) {
+      if (!control.hasAttribute('data-sync-was-disabled')) control.dataset.syncWasDisabled = String(control.disabled);
+      control.disabled = true;
+    } else if (control.hasAttribute('data-sync-was-disabled')) {
+      control.disabled = control.dataset.syncWasDisabled === 'true';
+      delete control.dataset.syncWasDisabled;
+    }
+  });
+  const panel = document.getElementById('settingsTab-sync');
+  if (panel) panel.setAttribute('aria-busy', String(busy));
+  const composer = document.querySelector('.input-area');
+  if (composer) {
+    composer.inert = busy;
+    composer.setAttribute('aria-busy', String(busy));
+  }
+  updateSendBtnState();
 }
 
 function renderSyncSettings() {
@@ -10188,6 +11895,7 @@ function renderSyncSettings() {
   if (gistEl) gistEl.value = localStorage.getItem('assistantSyncGistId') || '';
   if (passEl) passEl.value = localStorage.getItem('assistantSyncPassphrase') || '';
   if (autoEl) autoEl.checked = localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true';
+  setSyncBusy(_syncOperationInFlight);
   _syncInputsLoaded = true;
 
   const token = localStorage.getItem('assistantSyncGistToken') || '';
@@ -10422,7 +12130,10 @@ function syncSaveTombstones(tombstones) {
 function syncRecordTombstones(category, ids, deletedAt = Date.now()) {
   if (!['conversations', 'projects', 'memories'].includes(category)) return;
   const tombstones = syncLoadTombstones();
-  (ids || []).filter(Boolean).forEach(id => {
+  const temporaryIds = category === 'conversations'
+    ? new Set(conversations.filter(isTemporaryConversation).map(conv => conv.id))
+    : new Set();
+  (ids || []).filter(id => id && !temporaryIds.has(id)).forEach(id => {
     tombstones[category][id] = Math.max(Number(tombstones[category][id]) || 0, deletedAt);
   });
   syncSaveTombstones(tombstones);
@@ -10501,7 +12212,7 @@ function syncSaveSettingsState(state) {
   localStorage.setItem(SYNC_SETTINGS_STATE_KEY, JSON.stringify({ settings: state.settings || {}, revisions: state.revisions || {} }));
 }
 
-function syncCollectSettingsState(markInitial = true) {
+function syncCollectSettingsState(markInitial = true, persist = true) {
   const previous = syncReadSettingsState();
   const current = syncCurrentSettingsValues();
   const settings = {};
@@ -10516,7 +12227,7 @@ function syncCollectSettingsState(markInitial = true) {
     else revisions[key] = Number(previous.revisions[key]) || 0;
   });
   const state = { settings, revisions };
-  syncSaveSettingsState(state);
+  if (persist) syncSaveSettingsState(state);
   return state;
 }
 
@@ -10553,6 +12264,17 @@ function syncMergeSettingsStates(localValue, remoteValue) {
   return merged;
 }
 
+function syncRefreshAppliedSettings() {
+  applyTheme(localStorage.getItem('assistantTheme') || 'dark');
+  loadCustomFont(localStorage.getItem('assistantFont') || '');
+  applyMsgOverrides();
+  renderPromptEntries();
+  loadPresets();
+  renderProfileSelect();
+  renderProfileSummary();
+  renderConnectionChip();
+}
+
 function syncApplySettings(state) {
   if (!state?.settings || typeof state.settings !== 'object') return;
   SYNC_SETTINGS_KEYS.forEach(key => {
@@ -10570,13 +12292,7 @@ function syncApplySettings(state) {
     else localStorage.setItem(key, String(value));
   });
   syncSaveSettingsState(state);
-  applyTheme(localStorage.getItem('assistantTheme') || 'dark');
-  loadCustomFont(localStorage.getItem('assistantFont') || '');
-  applyMsgOverrides();
-  renderPromptEntries();
-  loadPresets();
-  renderProfileSelect();
-  renderProfileSummary();
+  syncRefreshAppliedSettings();
 }
 
 async function syncReadRemoteConversations(gist, manifest, passphrase, keyCache = {}) {
@@ -10635,8 +12351,9 @@ async function syncBuildGistFiles(passphrase, existingManifest = null, merged = 
     projects: syncFilterDeletedRecords(normalizeProjectList(merged?.projects || projects), tombstones.projects, 'updatedAt')
   };
   const tombstonesPayload = { version: 1, exportedAt: new Date(now).toISOString(), tombstones };
+  const sourceConversations = merged?.conversations || getPersistentConversations();
   const localConversations = syncFilterDeletedRecords(
-    merged?.conversations || conversations, tombstones.conversations, 'updatedAt').map(syncNormalizeConversation);
+    sourceConversations.filter(conv => !isTemporaryConversation(conv)), tombstones.conversations, 'updatedAt').map(syncNormalizeConversation);
   const files = {
     'settings.json.enc': { content: await syncEncryptPayloadWithKey(settingsPayload, context) },
     'memories.json.enc': { content: await syncEncryptPayloadWithKey(memoriesPayload, context) },
@@ -10694,11 +12411,21 @@ function syncIsOwnedFileName(name) {
 
 async function syncPushToGist(options = {}) {
   const auto = options.auto === true;
+  if (localDataOperationsInFlight > 0) {
+    if (!auto) showToast('Wait for local data changes to finish.', 'info');
+    return false;
+  }
+  if (pendingAttachmentReads > 0) {
+    if (!auto) showToast('Wait for attachments to finish reading.', 'info');
+    return false;
+  }
   if (_syncOperationInFlight) {
     if (!auto) showToast('A sync operation is already in progress.', 'info');
     return false;
   }
+  flushSettingsAutosaves();
   _syncOperationInFlight = true;
+  setSyncBusy(true);
   const pendingAtStart = localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true';
   if (auto || pendingAtStart) localStorage.removeItem(SYNC_AUTO_PENDING_KEY);
   const cfg = auto ? syncGetStoredConfig() : syncSaveSettings(false, false);
@@ -10706,6 +12433,8 @@ async function syncPushToGist(options = {}) {
   try {
     syncValidateConfig(cfg, auto);
     persistDraftFromUI();
+    if (_projectAutosaveTimer) await flushProjectAutosave();
+    await _projectSaveChain;
     await saveConversationImmediately();
     syncSetStatus('checking', 'Pushing...', 'Encrypting local data and writing Gist files.');
     let built;
@@ -10776,6 +12505,7 @@ async function syncPushToGist(options = {}) {
       localStorage.setItem(SYNC_AUTO_PENDING_KEY, 'true');
     }
     _syncOperationInFlight = false;
+    setSyncBusy(false);
     if (succeeded && localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
         localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
   }
@@ -10786,9 +12516,9 @@ async function syncMergeConversationLists(localList, remoteList, tombstones = {}
   let added = 0;
   let updated = 0;
   let tied = 0;
-  localList.map(syncNormalizeConversation).forEach(conv => merged.set(conv.id, conv));
+  (localList || []).filter(conv => !isTemporaryConversation(conv)).map(syncNormalizeConversation).forEach(conv => merged.set(conv.id, conv));
 
-  for (const remoteRaw of remoteList) {
+  for (const remoteRaw of remoteList || []) {
     const remote = syncNormalizeConversation(remoteRaw);
     const local = merged.get(remote.id);
     if (!local) {
@@ -10846,63 +12576,222 @@ function syncMergeMemoryLists(localList, remoteList, tombstones = {}) {
     .sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0));
 }
 
+async function syncPersistPullData({ conversations: nextConversations, memories: nextMemories, projects: nextProjects, persistentActiveId }) {
+  const conversationRecords = (nextConversations || []).map(syncNormalizeConversation);
+  const memoryRecords = normalizeMemoryList(nextMemories || []).memories;
+  const projectRecords = normalizeProjectList(nextProjects || []);
+  const storedActiveId = String(persistentActiveId || '');
+
+  if (!db) {
+    localStorage.setItem('assistantConversations', JSON.stringify(conversationRecords));
+    localStorage.setItem('assistantMemories', JSON.stringify(memoryRecords));
+    localStorage.setItem('assistantProjects', JSON.stringify(projectRecords));
+    localStorage.setItem('assistantActiveConvId', storedActiveId);
+    return;
+  }
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(['conversations', 'memories', 'meta'], 'readwrite');
+    const conversationStore = tx.objectStore('conversations');
+    const memoryStore = tx.objectStore('memories');
+    const metaStore = tx.objectStore('meta');
+    conversationStore.clear();
+    conversationRecords.forEach(record => conversationStore.put(record));
+    memoryStore.clear();
+    memoryRecords.forEach(record => memoryStore.put(record));
+    metaStore.put({ key: 'projects', value: projectRecords });
+    metaStore.put({ key: 'activeConvId', value: storedActiveId });
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error || new Error('Sync data transaction failed.'));
+    tx.onabort = () => reject(tx.error || new Error('Sync data transaction was aborted.'));
+  });
+
+  try {
+    localStorage.setItem('assistantActiveConvId', storedActiveId);
+    localStorage.removeItem('assistantConversations');
+    localStorage.removeItem('assistantMemories');
+    localStorage.removeItem('assistantProjects');
+  } catch (error) {
+    console.warn('Could not update sync fallback metadata:', error);
+  }
+}
+
+async function syncCapturePullSnapshot() {
+  const settingsValues = {};
+  SYNC_SETTINGS_KEYS.forEach(key => { settingsValues[key] = localStorage.getItem(key); });
+  return {
+    settingsValues,
+    settingsStateRaw: localStorage.getItem(SYNC_SETTINGS_STATE_KEY),
+    tombstones: syncCloneJson(syncLoadTombstones()),
+    memories: syncCloneJson(await loadMemories()),
+    projects: syncCloneJson(projects),
+    conversations: syncCloneJson(getPersistentConversations()),
+    activeConvId,
+    persistentActiveId: getPersistentActiveConvId(),
+    autoPushPending: localStorage.getItem(SYNC_AUTO_PENDING_KEY),
+    salt: localStorage.getItem('assistantSyncSalt')
+  };
+}
+
+function syncRestoreSettingsSnapshot(snapshot) {
+  SYNC_SETTINGS_KEYS.forEach(key => {
+    const value = snapshot.settingsValues[key];
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  });
+  if (snapshot.settingsStateRaw === null) localStorage.removeItem(SYNC_SETTINGS_STATE_KEY);
+  else localStorage.setItem(SYNC_SETTINGS_STATE_KEY, snapshot.settingsStateRaw);
+  syncRefreshAppliedSettings();
+}
+
+async function syncRollbackPull(snapshot) {
+  const errors = [];
+  const recordError = (step, error) => {
+    console.error('Sync rollback ' + step + ' failed:', error);
+    errors.push(step + ': ' + (error?.message || String(error)));
+  };
+  clearTimeout(_syncAutoPushTimer);
+  _syncAutoPushTimer = null;
+  try { await syncPersistPullData(snapshot); }
+  catch (error) { recordError('data restore', error); }
+  try { syncRestoreSettingsSnapshot(snapshot); }
+  catch (error) { recordError('settings restore', error); }
+  try { syncSaveTombstones(snapshot.tombstones); }
+  catch (error) { recordError('deletion record restore', error); }
+  try { syncSetStoredValue(SYNC_AUTO_PENDING_KEY, snapshot.autoPushPending); }
+  catch (error) { recordError('auto-push state restore', error); }
+  try { syncSetStoredValue('assistantSyncSalt', snapshot.salt); }
+  catch (error) { recordError('encryption state restore', error); }
+  try {
+    projects = syncCloneJson(snapshot.projects);
+    replacePersistentConversations(syncCloneJson(snapshot.conversations), true);
+    activeConvId = conversations.some(conv => conv.id === snapshot.activeConvId)
+      ? snapshot.activeConvId
+      : (conversations[0]?.id || null);
+    messages = getActiveConv()?.messages || [];
+    setConversationBaseline(snapshot.conversations);
+  } catch (error) {
+    recordError('in-memory restore', error);
+  }
+  try {
+    renderSidebar();
+    renderMessages();
+    updateTokenInfo();
+    updateCharacterUI();
+    restoreActiveDraft();
+  } catch (error) {
+    recordError('interface restore', error);
+  }
+  if (errors.length) throw new Error('Sync rollback was incomplete: ' + errors.join('; '));
+}
+
 async function syncPullFromGist() {
   if (sending || streaming || queueingFollowUp) {
     showToast('Stop the current response before pulling sync data.', 'info');
+    return false;
+  }
+  if (pendingAttachmentReads > 0) {
+    showToast('Wait for attachments to finish reading.', 'info');
+    return false;
+  }
+  if (localDataOperationsInFlight > 0) {
+    showToast('Wait for local data changes to finish.', 'info');
     return false;
   }
   if (_syncOperationInFlight) {
     showToast('A sync operation is already in progress.', 'info');
     return false;
   }
+  flushSettingsAutosaves();
   _syncOperationInFlight = true;
+  setSyncBusy(true);
   const previousActiveConvId = activeConvId;
   const cfg = syncSaveSettings(false, false);
   let succeeded = false;
   try {
     syncValidateConfig(cfg, true);
     persistDraftFromUI();
+    if (_projectAutosaveTimer) await flushProjectAutosave();
+    await _projectSaveChain;
     await saveConversationImmediately();
     syncSetStatus('checking', 'Pulling...', 'Fetching and decrypting sync files.');
     const gist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
     const manifest = await syncReadManifest(gist, cfg.token);
-    if (manifest.salt) localStorage.setItem('assistantSyncSalt', manifest.salt);
     const remote = await syncReadRemoteData(gist, manifest, cfg.passphrase);
-    const tombstones = syncMergeTombstones(syncLoadTombstones(), remote.tombstones);
-    const settingsState = syncMergeSettingsStates(syncCollectSettingsState(false), remote.settingsState);
-    const mergedMemories = syncMergeMemoryLists(await loadMemories(), remote.memories, tombstones.memories);
-    const mergedProjects = syncMergeProjectLists(projects, remote.projects, tombstones.projects);
-    const merged = await syncMergeConversationLists(conversations, remote.conversations, tombstones.conversations);
-
-    // Re-merge immediately before applying so edits made while the network request was
-    // in flight are not replaced by the earlier snapshot.
-    const liveTombstones = syncMergeTombstones(syncLoadTombstones(), tombstones);
-    const liveSettingsState = syncMergeSettingsStates(syncCollectSettingsState(false), settingsState);
-    const liveMemories = syncMergeMemoryLists(await loadMemories(), mergedMemories, liveTombstones.memories);
-    const liveProjects = syncMergeProjectLists(projects, mergedProjects, liveTombstones.projects);
-    const liveMerged = await syncMergeConversationLists(conversations, merged.conversations, liveTombstones.conversations);
-
-    if (sending || streaming || queueingFollowUp) throw new Error('Stop the current response before applying pulled sync data.');
-
-    syncApplySettings(liveSettingsState);
-    syncSaveTombstones(liveTombstones);
-    await saveMemories(liveMemories);
-    projects = liveProjects;
-    if (db) await idbPut('meta', { key: 'projects', value: projects });
-    if (sending || streaming || queueingFollowUp) throw new Error('Stop the current response before applying pulled sync data.');
-    armedFollowUpConversationIds.clear();
-    conversations = liveMerged.conversations;
-    if (conversations.length > 0 && !conversations.find(c => c.id === activeConvId)) activeConvId = conversations[0].id;
-    if (conversations.length === 0) activeConvId = null;
-    messages = getActiveConv()?.messages || [];
-    localStorage.setItem('assistantActiveConvId', activeConvId || '');
+    const remoteTombstones = syncNormalizeTombstones(remote.tombstones);
+    const localTombstonesBeforePull = syncLoadTombstones();
+    const localMemoriesBeforePull = await loadMemories();
+    const incomingDeletionCount = (records, category, timestampKey) => records.filter(record => {
+      const remoteDeletedAt = Number(remoteTombstones[category]?.[record.id]) || 0;
+      const localDeletedAt = Number(localTombstonesBeforePull[category]?.[record.id]) || 0;
+      return remoteDeletedAt > localDeletedAt && remoteDeletedAt >= Number(record[timestampKey] || 0);
+    }).length;
+    const deletionCounts = {
+      conversations: incomingDeletionCount(getPersistentConversations(), 'conversations', 'updatedAt'),
+      projects: incomingDeletionCount(projects, 'projects', 'updatedAt'),
+      memories: incomingDeletionCount(localMemoriesBeforePull, 'memories', 'createdAt')
+    };
+    const totalDeletions = Object.values(deletionCounts).reduce((sum, count) => sum + count, 0);
+    if (totalDeletions) {
+      const detail = Object.entries(deletionCounts).filter(([, count]) => count).map(([name, count]) => count + ' ' + name).join(', ');
+      if (!confirm('Remote sync will remove ' + detail + ' from this browser. Continue?')) {
+        syncSetStatus('current', 'Pull cancelled', 'No local data was changed.');
+        return false;
+      }
+    }
     await saveConversationImmediately();
+    if (sending || streaming || queueingFollowUp) throw new Error('Stop the current response before applying pulled sync data.');
+    if (localDataOperationsInFlight > 0) throw new Error('Wait for local data changes to finish before applying pulled sync data.');
 
-    renderSidebar();
-    renderMessages({ preserveScroll: activeConvId === previousActiveConvId });
-    updateTokenInfo();
-    updateCharacterUI();
-    restoreActiveDraft();
+    const snapshot = await syncCapturePullSnapshot();
+    const liveTombstones = syncMergeTombstones(snapshot.tombstones, remote.tombstones);
+    const liveSettingsState = syncMergeSettingsStates(syncCollectSettingsState(false, false), remote.settingsState);
+    const liveMemories = syncMergeMemoryLists(snapshot.memories, remote.memories, liveTombstones.memories);
+    const liveProjects = syncMergeProjectLists(snapshot.projects, remote.projects, liveTombstones.projects);
+    const liveMerged = await syncMergeConversationLists(snapshot.conversations, remote.conversations, liveTombstones.conversations);
+    const temporaryActive = conversations.find(conv => conv.id === snapshot.activeConvId && isTemporaryConversation(conv));
+    const nextActiveId = temporaryActive?.id ||
+      (liveMerged.conversations.some(conv => conv.id === snapshot.activeConvId) ? snapshot.activeConvId : (liveMerged.conversations[0]?.id || null));
+    const nextPersistentActiveId = liveMerged.conversations.some(conv => conv.id === snapshot.persistentActiveId)
+      ? snapshot.persistentActiveId
+      : (liveMerged.conversations[0]?.id || '');
+
+    try {
+      await syncPersistPullData({
+        conversations: liveMerged.conversations,
+        memories: liveMemories,
+        projects: liveProjects,
+        persistentActiveId: nextPersistentActiveId
+      });
+      syncApplySettings(liveSettingsState);
+      syncSaveTombstones(liveTombstones);
+      projects = liveProjects;
+      armedFollowUpConversationIds.clear();
+      replacePersistentConversations(liveMerged.conversations, true);
+      activeConvId = conversations.some(conv => conv.id === nextActiveId) ? nextActiveId : (conversations[0]?.id || null);
+      messages = getActiveConv()?.messages || [];
+      setConversationBaseline(liveMerged.conversations);
+      if (manifest.salt) localStorage.setItem('assistantSyncSalt', manifest.salt);
+    } catch (applyError) {
+      let error = applyError instanceof Error ? applyError : new Error(String(applyError));
+      try {
+        await syncRollbackPull(snapshot);
+      } catch (rollbackError) {
+        console.error('Sync pull rollback failed:', rollbackError);
+        error = new Error(error.message + ' Some local data could not be restored.');
+      }
+      throw error;
+    }
+
+    try {
+      renderSidebar();
+      renderMessages({ preserveScroll: activeConvId === previousActiveConvId });
+      updateTokenInfo();
+      updateCharacterUI();
+      restoreActiveDraft();
+    } catch (renderError) {
+      console.error('Sync pull render refresh failed:', renderError);
+    }
     localStorage.setItem('assistantSyncLastPullAt', String(Date.now()));
     renderSyncSettings();
     syncSetStatus('current', 'Pulled', 'Merged ' + remote.conversations.length + ' remote conversations. Added ' + liveMerged.added + ', updated ' + liveMerged.updated + '.');
@@ -10917,7 +12806,8 @@ async function syncPullFromGist() {
     return false;
   } finally {
     _syncOperationInFlight = false;
-    if (succeeded && localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
+    setSyncBusy(false);
+    if (localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
         localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
   }
 }
@@ -10932,6 +12822,22 @@ function syncGeneratePassphrase() {
   } catch (err) {
     showToast('Could not generate passphrase: ' + (err.message || err), 'error');
   }
+}
+
+function syncTogglePassphraseVisibility() {
+  const input = document.getElementById('setSyncPassphrase');
+  if (!input) return;
+  input.type = input.type === 'password' ? 'text' : 'password';
+}
+
+async function syncCopyPassphrase() {
+  const passphrase = document.getElementById('setSyncPassphrase')?.value || '';
+  if (!passphrase) {
+    showToast('Generate or enter a passphrase first.', 'info');
+    return;
+  }
+  const copied = await copyShareText(passphrase);
+  showToast(copied ? 'Sync passphrase copied.' : 'Could not copy the sync passphrase.', copied ? 'success' : 'error');
 }
 
 function syncBuildPairingText() {
@@ -10963,6 +12869,10 @@ function syncParsePairingText(text) {
 }
 
 function syncApplyPairingText(text, silent = false) {
+  if (_syncOperationInFlight) {
+    if (!silent) showToast('Wait for sync to finish.', 'info');
+    return false;
+  }
   try {
     const source = text || document.getElementById('syncPairingCode')?.value || '';
     const payload = syncParsePairingText(source);
@@ -11059,6 +12969,7 @@ async function syncImportPairingQr(event) {
   const file = event.target.files[0];
   event.target.value = '';
   if (!file) return;
+  if (!beginLocalDataOperation()) return;
   try {
     syncSetStatus('checking', 'Reading QR...', 'Decoding selected pairing image.');
     await syncLoadScriptOnce('syncJsQrScript', 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js', 'jsQR');
@@ -11077,6 +12988,8 @@ async function syncImportPairingQr(event) {
   } catch (err) {
     syncSetStatus('unknown', 'QR failed', err.message || 'Could not decode QR image.');
     showToast('QR import failed: ' + (err.message || err), 'error', 6000);
+  } finally {
+    endLocalDataOperation();
   }
 }
 
@@ -11150,30 +13063,144 @@ async function copyShareText(text) {
   }
 }
 
-async function shareConversation() {
+function openSettingsSection(tabName) {
+  openSettings();
+  const button = document.getElementById('settingsTabButton-' + tabName);
+  if (button) switchSettingsTab(tabName, button);
+}
+
+function openShareDialog() {
+  closeToolbarMenu(false);
   const conv = getActiveConv();
+  if (isTemporaryConversation(conv)) {
+    showToast('Temporary chats cannot be shared.', 'info');
+    return;
+  }
+  if (!conv || !(conv.messages || []).length) {
+    showToast('Nothing to share in this chat yet.', 'info');
+    return;
+  }
+
+  const overlay = document.createElement('div');
+  overlay.className = 'char-info-overlay';
+  const popup = document.createElement('div');
+  popup.className = 'char-info-popup share-dialog';
+  popup.setAttribute('aria-labelledby', 'shareDialogTitle');
+  const title = document.createElement('h3');
+  title.id = 'shareDialogTitle';
+  title.textContent = 'Share conversation';
+  const state = document.createElement('p');
+  state.className = 'share-state';
+  state.textContent = conv.shareGistId ? 'Shared' : 'Not shared';
+  const privacy = document.createElement('p');
+  privacy.className = 'manual-ai-note';
+  privacy.textContent = 'Anyone with the link can read the selected responses. Keys, files, personas, memories, and alternate responses are excluded.';
+  popup.append(title, state, privacy);
+
+  let close;
+  const token = localStorage.getItem('assistantSyncGistToken') || '';
+  if (conv.shareGistId) {
+    const row = document.createElement('div');
+    row.className = 'share-link-row';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.readOnly = true;
+    input.value = shareLinkFor(conv.shareGistId);
+    input.setAttribute('aria-label', 'Public share link');
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'btn btn-secondary';
+    copy.textContent = 'Copy link';
+    copy.onclick = async () => {
+      const copied = await copyShareText(input.value);
+      showToast(copied ? 'Share link copied.' : 'Could not copy the share link.', copied ? 'success' : 'error');
+    };
+    row.append(input, copy);
+    popup.appendChild(row);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'modal-actions';
+  const done = document.createElement('button');
+  done.type = 'button';
+  done.className = 'btn btn-secondary';
+  done.textContent = 'Close';
+  actions.appendChild(done);
+
+  if (!token) {
+    const configure = document.createElement('button');
+    configure.type = 'button';
+    configure.className = 'btn btn-primary';
+    configure.textContent = 'Open Sync settings';
+    configure.onclick = () => {
+      close();
+      openSettingsSection('sync');
+    };
+    actions.appendChild(configure);
+  } else {
+    const publish = document.createElement('button');
+    publish.type = 'button';
+    publish.className = 'btn btn-primary';
+    publish.textContent = conv.shareGistId ? 'Update link' : 'Publish';
+    publish.onclick = async () => {
+      publish.disabled = true;
+      publish.setAttribute('aria-busy', 'true');
+      const shared = await shareConversation({ confirmPublish: false });
+      if (shared) close();
+      else {
+        publish.disabled = false;
+        publish.removeAttribute('aria-busy');
+      }
+    };
+    actions.appendChild(publish);
+    if (conv.shareGistId) {
+      const revoke = document.createElement('button');
+      revoke.type = 'button';
+      revoke.className = 'btn btn-danger';
+      revoke.textContent = 'Revoke link';
+      revoke.onclick = async () => {
+        revoke.disabled = true;
+        const revoked = await unshareConversation();
+        if (revoked) close();
+        else revoke.disabled = false;
+      };
+      actions.appendChild(revoke);
+    }
+  }
+  popup.appendChild(actions);
+  close = openTransientDialog(overlay, popup, actions.querySelector('.btn-primary') || done);
+  done.onclick = close;
+}
+
+async function shareConversation(options = {}) {
+  const conv = getActiveConv();
+  if (isTemporaryConversation(conv)) {
+    showToast('Temporary chats cannot be shared.', 'info');
+    return false;
+  }
   if (!conv || !(conv.messages || []).length) {
     showToast('Nothing to share in this chat yet.', 'error');
-    return;
+    return false;
   }
   const token = localStorage.getItem('assistantSyncGistToken') || '';
   if (!token) {
     showToast('Add a GitHub token in Settings → Sync first.', 'error');
-    return;
+    return false;
   }
   const payload = buildSharePayload(conv);
   const json = JSON.stringify(payload);
   if (new TextEncoder().encode(json).byteLength > SHARE_MAX_BYTES) {
     showToast('Too large to share.', 'error');
-    return;
+    return false;
   }
-  if (!conv.shareGistId && !confirm(
+  if (!conv.shareGistId && options.confirmPublish !== false && !confirm(
     'Publish this chat to a secret GitHub Gist?\n\n' +
     'Anyone with the link can read it. Your API key, files, personas, memories and ' +
-    'alternate responses are not included.')) return;
+    'alternate responses are not included.')) return false;
 
+  if (!beginLocalDataOperation()) return false;
   try {
-    showToast('Publishing…');
+    showToast('Publishing...', 'info', 2500);
     const files = {};
     files[SHARE_FILE] = { content: json };
     const gist = conv.shareGistId
@@ -11190,32 +13217,41 @@ async function shareConversation() {
     const link = shareLinkFor(gist.id);
     const copied = await copyShareText(link);
     showToast(copied ? 'Link copied. Anyone with it can read this chat.' : 'Shared: ' + link, 'success');
+    return true;
   } catch (err) {
     showToast('Share failed: ' + (err.message || err), 'error');
+    return false;
+  } finally {
+    endLocalDataOperation();
   }
 }
 
-async function unshareConversation() {
+async function unshareConversation(options = {}) {
   const conv = getActiveConv();
   if (!conv || !conv.shareGistId) {
-    showToast('This chat isn’t shared.');
-    return;
+    showToast('This chat is not shared.');
+    return false;
   }
   const token = localStorage.getItem('assistantSyncGistToken') || '';
   if (!token) {
     showToast('Add a GitHub token in Settings → Sync first.', 'error');
-    return;
+    return false;
   }
+  if (options.confirm !== false && !confirm('Revoke this public share link? Anyone using it will lose access.')) return false;
+  if (!beginLocalDataOperation()) return false;
   try {
     await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(conv.shareGistId), { method: 'DELETE' }, token);
+    delete conv.shareGistId;
+    conv.updatedAt = Date.now();
+    saveConversations();
+    showToast('Link revoked.', 'success');
+    return true;
   } catch (err) {
     showToast('Unshare failed: ' + (err.message || err), 'error');
-    return;
+    return false;
+  } finally {
+    endLocalDataOperation();
   }
-  delete conv.shareGistId;
-  conv.updatedAt = Date.now();
-  saveConversations();
-  showToast('Link revoked.', 'success');
 }
 
 async function initShareView(gistId) {
@@ -11287,6 +13323,7 @@ function shareSelfTest() {
 
 function exportMarkdown() {
   const conv = getActiveConv();
+  if (isTemporaryConversation(conv)) { showToast('Temporary chats cannot be exported.', 'info'); return; }
   if (!conv || conv.messages.length === 0) { showToast('No messages to export.', 'info'); return; }
   let md = '# ' + conv.title + '\n\n';
   conv.messages.forEach(m => {
@@ -11324,6 +13361,7 @@ const _selectedMsgs = new Set();
 let _justEnteredSelectMode = false;
 
 function enterSelectMode() {
+  if (isTemporaryConversation(getActiveConv())) { showToast('Temporary chats cannot be saved as screenshots.', 'info'); return; }
   if (messages.length === 0) { showToast('No messages to screenshot.', 'info'); return; }
   _selectMode = true;
   _justEnteredSelectMode = true;
@@ -11361,6 +13399,8 @@ function updateSelectCount() {
 
 async function screenshotSelected() {
   if (_selectedMsgs.size === 0) return;
+  const conversationId = activeConvId;
+  if (isTemporaryConversation(getActiveConv())) { showToast('Temporary chats cannot be saved as screenshots.', 'info'); return; }
   const btn = document.getElementById('ssBtn');
   btn.disabled = true;
   btn.textContent = 'Rendering...';
@@ -11374,6 +13414,7 @@ async function screenshotSelected() {
         document.head.appendChild(s);
       });
     }
+    if (activeConvId !== conversationId || isTemporaryConversation(getActiveConv())) throw new Error('The active chat changed before the screenshot was ready.');
     const indices = [..._selectedMsgs].sort((a, b) => a - b);
     const area = document.getElementById('messagesArea');
     const cs = getComputedStyle(document.documentElement);
@@ -11586,10 +13627,17 @@ function performChatSearch() {
   const query = document.getElementById('chatSearchInput').value.trim();
   if (!query) { document.getElementById('chatSearchCount').textContent = ''; return; }
 
-  const area = document.getElementById('messagesArea');
-  const walker = document.createTreeWalker(area, NodeFilter.SHOW_TEXT, null, false);
   const textNodes = [];
-  while (walker.nextNode()) textNodes.push(walker.currentNode);
+  document.querySelectorAll('#messagesArea .msg-bubble').forEach(bubble => {
+    const walker = document.createTreeWalker(bubble, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        return node.parentElement?.closest('.thinking-block, button')
+          ? NodeFilter.FILTER_REJECT
+          : NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    while (walker.nextNode()) textNodes.push(walker.currentNode);
+  });
 
   const lowerQuery = query.toLowerCase();
   textNodes.forEach(node => {
@@ -11894,46 +13942,55 @@ function extractLegacyDocText(arrayBuffer) {
   return cleanExtractedText([...new Set(chunks)].join('\n'));
 }
 
-async function readAttachmentFile(file) {
+async function readAttachmentFile(file, options = {}) {
+  if (!file) return false;
   const mime = (file.type || '').toLowerCase();
   const name = file.name || 'file';
   const originConvId = activeConvId;
-  const fail = (message) => {
-    queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'application/octet-stream', textContent: message });
+  const deliver = typeof options.onAttachment === 'function'
+    ? options.onAttachment
+    : attachment => queueAttachmentForConversation(originConvId, attachment);
+  const queueText = (text, fallbackMime, typeName) => {
+    const value = String(text || '').trim();
+    if (!value) throw new Error(typeName + ' contains no readable text.');
+    deliver({
+      type: 'file',
+      name,
+      mime: file.type || fallbackMime,
+      textContent: limitAttachmentText(value, name),
+      truncated: value.length > MAX_ATTACHMENT_TEXT_CHARS
+    });
   };
 
+  pendingAttachmentReads++;
+  attachmentStatusMessage = '';
+  renderPreviews();
   try {
     const isImage = mime.startsWith('image/');
     if (isImage) {
       const resizedUrl = await resizeImageIfNeeded(file, 1536, 0.85);
       if (resizedUrl) {
-        queueAttachmentForConversation(originConvId, { type: 'image', dataUrl: resizedUrl, name, mime: 'image/jpeg' });
+        deliver({ type: 'image', dataUrl: resizedUrl, name, mime: 'image/jpeg' });
       } else {
-        queueAttachmentForConversation(originConvId, { type: 'image', dataUrl: await readFileAsDataURL(file), name, mime: file.type });
+        deliver({ type: 'image', dataUrl: await readFileAsDataURL(file), name, mime: file.type });
       }
     } else if (mime === 'application/pdf' || /\.pdf$/i.test(name)) {
-      const text = await extractPdfText(await file.arrayBuffer());
-      queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'application/pdf', textContent: limitAttachmentText(text, name) || '[PDF contains no extractable text]' });
+      queueText(await extractPdfText(await file.arrayBuffer()), 'application/pdf', 'PDF');
     } else if (DOCX_EXTENSIONS.test(name) || DOCX_MIMES.has(mime)) {
-      const text = await extractDocxText(await file.arrayBuffer());
-      queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', textContent: limitAttachmentText(text, name) || '[DOCX contains no extractable text]' });
+      queueText(await extractDocxText(await file.arrayBuffer()), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'DOCX');
     } else if (/\.rtf$/i.test(name) || RTF_MIMES.has(mime)) {
-      const text = extractRtfText(await file.text());
-      queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'text/rtf', textContent: limitAttachmentText(text, name) || '[RTF contains no extractable text]' });
+      queueText(extractRtfText(await file.text()), 'text/rtf', 'RTF');
     } else if (DOC_EXTENSIONS.test(name) || DOC_MIMES.has(mime)) {
-      const text = extractLegacyDocText(await file.arrayBuffer());
-      queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'application/msword', textContent: limitAttachmentText(text, name) || '[Legacy DOC could not be read as text]' });
+      queueText(extractLegacyDocText(await file.arrayBuffer()), 'application/msword', 'DOC');
     } else if (isTextLikeFile(file)) {
-      const text = await file.text();
-      queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'text/plain', textContent: limitAttachmentText(text, name) });
+      queueText(await file.text(), 'text/plain', 'File');
     } else {
       const buffer = await file.arrayBuffer();
       if (isProbablyTextBuffer(buffer)) {
-        const text = new TextDecoder('utf-8').decode(buffer);
-        queueAttachmentForConversation(originConvId, { type: 'file', name, mime: file.type || 'text/plain', textContent: limitAttachmentText(text, name) });
-        return;
+        queueText(new TextDecoder('utf-8').decode(buffer), 'text/plain', 'File');
+        return true;
       }
-      queueAttachmentForConversation(originConvId, {
+      deliver({
         type: 'file',
         dataUrl: await readFileAsDataURL(file),
         name,
@@ -11942,19 +13999,27 @@ async function readAttachmentFile(file) {
         textContent: `[Binary file attached: ${name} (${file.type || 'unknown type'}, ${file.size.toLocaleString()} bytes). This provider may only receive file contents if it supports document uploads.]`
       });
     }
+    return true;
   } catch (e) {
     console.error('File attachment failed:', e);
-    fail(`[${name} could not be read]`);
+    attachmentStatusMessage = 'Could not attach ' + name + '.';
+    showToast(attachmentStatusMessage + ' ' + (e?.message || 'The file could not be read.'), 'error');
+    announce(attachmentStatusMessage);
+    return false;
+  } finally {
+    pendingAttachmentReads = Math.max(0, pendingAttachmentReads - 1);
+    renderPreviews();
   }
 }
 
 function handleFileSelect(event) {
-  Array.from(event.target.files).forEach(readAttachmentFile);
+  Array.from(event.target.files).forEach(file => { void readAttachmentFile(file); });
   event.target.value = '';
 }
 
 function renderPreviews() {
   const container = document.getElementById('imagePreview');
+  const status = document.getElementById('attachmentStatus');
   container.innerHTML = '';
   pendingAttachments.forEach((att, idx) => {
     const thumb = document.createElement('div');
@@ -11967,6 +14032,7 @@ function renderPreviews() {
       thumb.appendChild(imgEl);
     } else {
       thumb.textContent = '\u{1F4C4} ' + (att.name || 'file');
+      if (att.truncated) thumb.title = (att.name || 'file') + ' was truncated to fit the context.';
     }
     const rm = document.createElement('button');
     rm.className = 'remove-thumb';
@@ -11978,6 +14044,14 @@ function renderPreviews() {
     thumb.appendChild(rm);
     container.appendChild(thumb);
   });
+  if (status) {
+    const truncated = pendingAttachments.filter(att => att.truncated).length;
+    const message = pendingAttachmentReads > 0
+      ? 'Reading ' + pendingAttachmentReads + (pendingAttachmentReads === 1 ? ' file…' : ' files…')
+      : attachmentStatusMessage || (truncated ? truncated + (truncated === 1 ? ' file was' : ' files were') + ' truncated to fit.' : '');
+    status.textContent = message;
+    status.hidden = !message;
+  }
   updateSendBtnState();
   persistDraftFromUI();
 }
@@ -12122,6 +14196,7 @@ async function importCharacterCard(event) {
   const file = event.target.files[0];
   if (!file) return;
   event.target.value = '';
+  if (!beginLocalDataOperation()) return;
 
   try {
     let rawCard = null;
@@ -12133,11 +14208,7 @@ async function importCharacterCard(event) {
       if (!rawCard) { showToast('No character data found in PNG.', 'error'); return; }
       // Also store the PNG as avatar
       const blob = new Blob([arrayBuffer], { type: 'image/png' });
-      avatarDataUrl = await new Promise(resolve => {
-        const reader = new FileReader();
-        reader.onload = e => resolve(e.target.result);
-        reader.readAsDataURL(blob);
-      });
+      avatarDataUrl = await readFileAsDataURL(blob);
     } else if (file.name.toLowerCase().endsWith('.json')) {
       const text = await file.text();
       rawCard = JSON.parse(text);
@@ -12191,20 +14262,16 @@ async function importCharacterCard(event) {
     if (window.innerWidth <= 768) toggleSidebar();
   } catch (err) {
     showToast('Error importing character: ' + err.message, 'error');
+  } finally {
+    endLocalDataOperation();
   }
 }
 
 function updateCharacterUI() {
   const conv = getActiveConv();
-  const infoBtn = document.getElementById('charInfoBtn');
-  const titleEl = document.querySelector('.toolbar-title');
-  if (conv && conv.characterCard) {
-    infoBtn.style.display = '';
-    titleEl.textContent = conv.characterCard.name || conv.title;
-  } else {
-    infoBtn.style.display = 'none';
-    titleEl.textContent = 'Synapse';
-  }
+  const infoBtn = document.getElementById('charInfoMenuItem');
+  if (infoBtn) infoBtn.hidden = !conv?.characterCard;
+  renderConversationHeader();
 }
 
 function showCharacterInfo() {
@@ -12254,15 +14321,24 @@ function showCharacterInfo() {
 // ============================================
 // Voice Input
 // ============================================
+function stopVoiceInput() {
+  if (!voiceRec) return;
+  const recognition = voiceRec;
+  voiceRec = null;
+  recognition.onresult = null;
+  recognition.onend = null;
+  recognition.onerror = null;
+  try { recognition.stop(); } catch (error) { console.warn('Voice input stop failed:', error); }
+  document.getElementById('voiceBtn')?.classList.remove('recording');
+}
+
 function toggleVoice() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) return;
   const btn = document.getElementById('voiceBtn');
 
   if (voiceRec) {
-    voiceRec.stop();
-    voiceRec = null;
-    btn.classList.remove('recording');
+    stopVoiceInput();
     return;
   }
 
@@ -12292,6 +14368,7 @@ function toggleVoice() {
 // Window bridge for inline handlers and external hooks
 const __windowBridge = {
   // Share links (inline onclick in index.html; shareSelfTest is for the console)
+  openShareDialog,
   shareConversation,
   unshareConversation,
   buildSharePayload,
@@ -12303,6 +14380,7 @@ const __windowBridge = {
   openProjectsModal,
   selectProjectInModal,
   newProjectFromModal,
+  scheduleProjectAutosave,
   saveProjectFromModal,
   deleteProject,
   addProjectFiles,
@@ -12353,6 +14431,9 @@ const __windowBridge = {
   saveMemories,
   getMemoryPrompt,
   callApiNonStreaming,
+  completeDraft,
+  openCompareModels,
+  suggestFollowUps,
   extractMemories,
   cleanupMemories,
   openManageMemories,
@@ -12388,6 +14469,10 @@ const __windowBridge = {
   applyProviderPreset,
   testConnection,
   renderConnectionChip,
+  renderConnectionPicker,
+  toggleConnectionPicker,
+  closeConnectionPicker,
+  renderConversationHeader,
   setAssistantLlmMetadata,
   prepareAnthropicMessages,
   renderGenImages,
@@ -12429,6 +14514,7 @@ const __windowBridge = {
   loadConversations,
   getActiveConv,
   createConversation,
+  createTemporaryConversation,
   switchConversation,
   deleteConversation,
   clearAllConversations,
@@ -12453,10 +14539,17 @@ const __windowBridge = {
   toggleProjectCollapse,
   toggleToolbarMenu,
   closeToolbarMenu,
+  toggleSidebarMenu,
+  closeSidebarMenu,
+  toggleComposerMenu,
+  closeComposerMenu,
+  toggleSidebarOrganization,
   getSelectedModel,
   saveSetup,
+  continueWithoutProvider,
   switchSettingsTab,
   openSettings,
+  openSettingsSection,
   loadProfiles,
   saveProfiles,
   renderProfileSelect,
@@ -12467,6 +14560,7 @@ const __windowBridge = {
   applyProfileFromSelect,
   saveCurrentAsProfile,
   deleteSelectedProfile,
+  saveSettingsTab,
   saveSettings,
   closeSettings,
   loadPresets,
@@ -12525,6 +14619,8 @@ const __windowBridge = {
   exportAllConversations,
   importConversation,
   normalizeImportedData,
+  applySelectedImport,
+  updateImportStrategyUI,
   applyImport,
   renderStorageSummary,
   clearDataCategory,
@@ -12540,6 +14636,8 @@ const __windowBridge = {
   syncPushToGist,
   syncPullFromGist,
   syncGeneratePassphrase,
+  syncTogglePassphraseVisibility,
+  syncCopyPassphrase,
   syncRenderPairingQr,
   syncCopyPairingText,
   syncApplyPairingText,

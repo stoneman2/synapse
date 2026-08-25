@@ -15,7 +15,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="./styles.css?v=202608251606">
+<link rel="stylesheet" href="./styles.css?v=202608251950">
 </head>
 <body>
 
@@ -30,9 +30,16 @@
 <!-- Sidebar -->
 <aside class="sidebar" id="sidebar" aria-label="Conversations">
   <div class="sidebar-header">
-    <button onclick="createConversation()" aria-label="New chat">+ New Chat</button>
-    <button class="sidebar-icon-btn" onclick="document.getElementById('charImportInput').click()" title="Import character card" aria-label="Import character card" style="padding:10px 12px"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6.5" cy="5" r="2.5"/><path d="M2 13.5c0-2.5 2-4 4.5-4s4.5 1.5 4.5 4"/><path d="M12.5 4.5v4M10.5 6.5h4"/></svg></button>
-    <button class="sidebar-icon-btn" onclick="clearAllConversations()" title="Delete all conversations" aria-label="Delete all conversations" style="padding:10px 12px"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4h11M5.5 4V2.8c0-.4.3-.8.8-.8h3.4c.5 0 .8.4.8.8V4M4.2 4l.6 9.2c0 .5.5.9 1 .9h4.4c.5 0 1-.4 1-.9l.6-9.2M6.5 7v4M9.5 7v4"/></svg></button>
+    <button onclick="createConversation()" aria-label="New chat">+ New chat</button>
+    <div class="sidebar-more">
+      <button class="sidebar-icon-btn" id="sidebarMoreBtn" onclick="toggleSidebarMenu(event)" title="More sidebar actions" aria-label="More sidebar actions" aria-controls="sidebarMenu" aria-expanded="false">&#8943;</button>
+      <div class="toolbar-menu sidebar-menu" id="sidebarMenu" role="menu" aria-label="Sidebar actions">
+        <button role="menuitem" onclick="createTemporaryConversation();closeSidebarMenu()">New temporary chat</button>
+        <button role="menuitem" onclick="document.getElementById('charImportInput').click();closeSidebarMenu()">Import character card</button>
+        <button role="menuitem" onclick="openProjectsModal();closeSidebarMenu()">Projects</button>
+        <button role="menuitem" onclick="toggleSidebarOrganization();closeSidebarMenu()">Organise conversations</button>
+      </div>
+    </div>
     <input type="file" id="charImportInput" accept=".png,.json" style="display:none" onchange="importCharacterCard(event)">
   </div>
   <nav class="sidebar-nav" aria-label="Conversation navigation">
@@ -68,7 +75,6 @@
   </nav>
   <div class="sidebar-footer">
     made by <a href="https://platberlitz.github.io/" target="_blank">purachina</a>
-    <span class="footer-cta">click for more stuff from me</span>
     <div class="update-status" id="updateStatus" hidden></div>
   </div>
 </aside>
@@ -79,36 +85,40 @@
   <header class="toolbar">
     <div class="toolbar-left">
       <button class="toolbar-toggle" onclick="toggleSidebar()" title="Toggle sidebar" aria-label="Toggle sidebar" aria-controls="sidebar" aria-expanded="true">&#9776;</button>
-      <span class="toolbar-title">Synapse</span>
+      <span class="toolbar-title" id="toolbarTitle">New Chat</span>
     </div>
     <div class="toolbar-right">
-      <button class="connection-chip" id="connectionChip" onclick="openSettings()" title="Open API settings" aria-label="Open API settings">
-        <span class="connection-chip-provider" id="connectionChipProvider">Not connected</span>
-        <span class="connection-chip-model" id="connectionChipModel">Set up a provider</span>
-      </button>
+      <div class="connection-picker-wrap">
+        <button class="connection-chip" id="connectionChip" onclick="toggleConnectionPicker(event)" title="Switch model or profile" aria-label="Switch model or profile" aria-controls="connectionPicker" aria-expanded="false">
+          <span class="connection-chip-provider" id="connectionChipProvider">Not connected</span>
+          <span class="connection-chip-model" id="connectionChipModel">Set up a provider</span>
+        </button>
+        <div class="connection-picker" id="connectionPicker" hidden>
+          <label class="sr-only" for="connectionPickerSearch">Search models and profiles</label>
+          <input type="search" id="connectionPickerSearch" placeholder="Search models and profiles..." autocomplete="off" oninput="renderConnectionPicker(this.value)">
+          <div class="connection-picker-results" id="connectionPickerResults" role="menu" aria-label="Models and profiles"></div>
+          <button class="connection-picker-settings" type="button" onclick="closeConnectionPicker();openSettingsSection('api')">API settings</button>
+        </div>
+      </div>
       <div class="toolbar-more">
         <button class="toolbar-btn" id="toolbarMoreBtn" onclick="toggleToolbarMenu(event)" title="More actions" aria-label="More actions" aria-controls="toolbarMenu" aria-expanded="false">&#8943;</button>
         <div class="toolbar-menu" id="toolbarMenu" role="menu" aria-label="More actions">
-          <button role="menuitem" onclick="exportConversation();closeToolbarMenu()">Export chat (JSON)</button>
-          <button role="menuitem" onclick="exportMarkdown();closeToolbarMenu()">Export as Markdown</button>
-          <button role="menuitem" onclick="exportAllConversations();closeToolbarMenu()">Export all chats</button>
-          <button role="menuitem" onclick="document.getElementById('importInput').click();closeToolbarMenu()">Import chat</button>
-          <button role="menuitem" onclick="shareConversation();closeToolbarMenu()">Share chat (link)</button>
-          <button role="menuitem" onclick="unshareConversation();closeToolbarMenu()">Unshare chat</button>
-          <button role="menuitem" onclick="openProjectsModal();closeToolbarMenu()">Projects</button>
-          <button role="menuitem" onclick="openFileSearch();closeToolbarMenu()">Search files</button>
-          <button role="menuitem" onclick="openSummaryModal();closeToolbarMenu()">Conversation summary</button>
+          <span class="menu-label">Chat</span>
           <button role="menuitem" onclick="duplicateConversation();closeToolbarMenu()">Duplicate chat</button>
           <button role="menuitem" onclick="toggleActiveArchive();closeToolbarMenu()">Archive / restore chat</button>
-          <button role="menuitem" onclick="openStatusPanel();closeToolbarMenu()">Status / diagnostics</button>
           <button role="menuitem" onclick="clearChat();closeToolbarMenu()">Clear chat</button>
+          <span class="menu-label">Export and share</span>
+          <button role="menuitem" onclick="exportConversation();closeToolbarMenu()">Export chat</button>
+          <button role="menuitem" onclick="exportMarkdown();closeToolbarMenu()">Export as Markdown</button>
+          <button role="menuitem" onclick="openShareDialog();closeToolbarMenu()">Share chat</button>
           <button role="menuitem" onclick="enterSelectMode();closeToolbarMenu()">Screenshot messages</button>
+          <span class="menu-label">App</span>
+          <button role="menuitem" id="charInfoMenuItem" onclick="showCharacterInfo();closeToolbarMenu()" hidden>Character info</button>
+          <button role="menuitem" onclick="openSettings();closeToolbarMenu()">Settings</button>
+          <button role="menuitem" onclick="openModal('shortcutsModal');closeToolbarMenu()">Keyboard shortcuts</button>
         </div>
       </div>
       <input type="file" id="importInput" accept=".json" style="display:none" onchange="importConversation(event)">
-      <button class="toolbar-btn" id="charInfoBtn" onclick="showCharacterInfo()" title="Character info" aria-label="Character info" style="display:none">&#8505;&#xFE0E;</button>
-      <button class="toolbar-btn" onclick="openSettings()" title="Settings" aria-label="Settings">&#9881;</button>
-      <button class="toolbar-btn" id="themeToggle" onclick="toggleTheme()" title="Theme: dark" aria-label="Toggle theme">&#9790;</button>
       <button class="toolbar-btn context-toggle" id="contextToggle" onclick="toggleContextPanel()" title="Toggle context panel" aria-label="Toggle context panel" aria-controls="contextPanel" aria-expanded="true">Panel</button>
     </div>
   </header>
@@ -136,6 +146,7 @@
   <!-- Input -->
   <footer class="input-area" aria-label="Message composer">
     <div class="image-preview" id="imagePreview"></div>
+    <div class="attachment-status" id="attachmentStatus" role="status" aria-live="polite" hidden></div>
     <div class="model-override-badge" id="modelOverrideBadge">
       <span id="modelOverrideText"></span>
       <button onclick="clearModelOverride()" title="Clear override" aria-label="Clear model override">&times;</button>
@@ -158,8 +169,15 @@
       <textarea id="chatInput" placeholder="Type a message..." rows="1" aria-label="Message" aria-controls="commandDropdown" aria-expanded="false"></textarea>
       <button class="input-btn" id="voiceBtn" onclick="toggleVoice()" title="Voice input" aria-label="Voice input"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="1.5" width="4" height="7.5" rx="2"/><path d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.5M6 14.5h4"/></svg></button>
       <button class="input-control-btn" id="contextBtn" onclick="openContextPreview()" title="Review what will be sent" aria-label="Review message context" aria-controls="contextPanel" aria-expanded="true">Context</button>
-      <button class="input-control-btn" id="toolsBtn" onclick="toggleComposerTools(event)" title="Conversation tool policy" aria-label="Conversation tools" aria-expanded="false">Tools</button>
-      <button class="input-control-btn queue-btn" id="followUpQueueBtn" onclick="queueFollowUpFromComposer()" title="Queue this message after the current response" aria-label="Queue follow-up message">Queue</button>
+      <div class="composer-more">
+        <button class="input-control-btn" id="composerMoreBtn" onclick="toggleComposerMenu(event)" title="More composer actions" aria-label="More composer actions" aria-controls="composerMenu" aria-expanded="false">+</button>
+        <div class="toolbar-menu composer-menu" id="composerMenu" role="menu" aria-label="Composer actions">
+          <button role="menuitem" onclick="completeDraft();closeComposerMenu()">Complete draft</button>
+          <button role="menuitem" onclick="openCompareModels();closeComposerMenu()">Compare models</button>
+          <button role="menuitem" id="followUpQueueBtn" onclick="queueFollowUpFromComposer();closeComposerMenu()">Queue follow-up</button>
+          <button role="menuitem" onclick="openContextSection('toolsSection');closeComposerMenu()">Conversation tools</button>
+        </div>
+      </div>
       <button class="send-btn" id="sendBtn" onclick="sendMessage()" aria-label="Send message">Send</button>
     </div>
     <div class="token-info" id="tokenInfo"></div>
@@ -170,7 +188,7 @@
 <aside class="context-panel" id="contextPanel" aria-label="Conversation context" aria-hidden="false">
   <header class="context-panel-header">
     <div>
-      <span class="context-panel-kicker">Current chat</span>
+      <span class="context-panel-kicker" id="contextConversationTitle">Current chat</span>
       <h2>Context</h2>
     </div>
     <button type="button" class="context-panel-close" onclick="toggleContextPanel(false)" aria-label="Close context panel">&times;</button>
@@ -182,6 +200,13 @@
         <label class="sr-only" for="conversationGoal">Conversation goal</label>
         <textarea id="conversationGoal" rows="4" maxlength="4000" placeholder="What should this conversation accomplish?" oninput="updateConversationGoal(this.value)"></textarea>
         <p>Included in each request for this chat.</p>
+      </div>
+    </details>
+    <details class="context-panel-section" id="filesSection">
+      <summary>Files <span id="filesStatus">None</span></summary>
+      <div class="context-panel-section-body" id="contextFilesBody">
+        <p>No files in this chat or its project.</p>
+        <button class="btn btn-secondary context-wide-action" type="button" onclick="openFileSearch()">Search files</button>
       </div>
     </details>
     <details class="context-panel-section" id="requestContextSection">
@@ -225,9 +250,9 @@
 
 <!-- Setup Modal -->
 <div class="modal-overlay" id="setupModal" aria-hidden="true">
-  <div class="modal" aria-labelledby="setupModalTitle">
+  <form class="modal setup-modal" aria-labelledby="setupModalTitle" onsubmit="saveSetup(); return false">
     <h2 id="setupModalTitle">Welcome to Synapse</h2>
-    <p style="color:var(--text-secondary);font-size:0.9em;margin-bottom:20px">Enter your API settings to get started. Your keys are stored locally and never sent to any server except your configured proxy.</p>
+    <p style="color:var(--text-secondary);font-size:0.9em;margin-bottom:20px">Enter your API settings to get started. Your key is stored locally and sent to the configured endpoint. When needed, it may pass through the custom CORS proxy selected in Tools.</p>
     <label for="setupProvider">Provider</label>
     <select id="setupProvider" onchange="applyProviderPreset('setup', this.value)">
       <option value="openai">OpenAI</option>
@@ -245,11 +270,11 @@
       <option value="openai">OpenAI-compatible</option>
       <option value="anthropic">Anthropic Messages</option>
     </select>
-    <form class="password-field-form" onsubmit="return false">
+    <div class="password-field-form">
       <input class="sr-only" type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true">
       <label for="setupKey">API Key</label>
-    <input type="password" id="setupKey" placeholder="sk-..." autocomplete="current-password">
-    </form>
+      <input type="password" id="setupKey" placeholder="sk-..." autocomplete="current-password">
+    </div>
     <div class="key-storage-row">
       <span class="settings-label">API key storage</span>
       <label><input type="radio" name="setupKeyStorage" value="remember" checked> Remember on this device</label>
@@ -259,32 +284,34 @@
     <label for="setupModelSelect">Model</label>
     <div class="model-selector-row">
       <select id="setupModelSelect" onchange="document.getElementById('setupModelManual').value=''"><option value="">-- Fetch models first --</option></select>
-      <button class="model-refresh-btn" onclick="refreshModels('setup', this)" title="Refresh model list"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1M13.5 1.5v3h-3"/></svg></button>
+      <button class="model-refresh-btn" type="button" onclick="refreshModels('setup', this)" title="Refresh model list" aria-label="Refresh setup model list"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1M13.5 1.5v3h-3"/></svg></button>
     </div>
     <input type="text" id="setupModelManual" placeholder="Or type model name manually" aria-label="Manual model name" oninput="document.getElementById('setupModelSelect').value=''">
     <div class="connection-test-row"><button type="button" class="btn btn-secondary" onclick="testConnection('setup')">Test connection</button><span id="setupConnectionStatus" class="connection-status" aria-live="polite"></span></div>
+    <p class="form-error" id="setupError" role="alert" hidden></p>
     <div class="modal-actions">
-      <button class="btn btn-primary" onclick="saveSetup()">Get Started</button>
+      <button class="btn btn-secondary" type="button" onclick="continueWithoutProvider()">Continue disconnected</button>
+      <button class="btn btn-primary" type="submit">Save and start</button>
     </div>
-  </div>
+  </form>
 </div>
 
 <!-- Settings Modal -->
 <div class="modal-overlay" id="settingsModal" aria-hidden="true">
-  <div class="modal" aria-labelledby="settingsModalTitle">
+  <div class="modal settings-modal" aria-labelledby="settingsModalTitle">
     <h2 id="settingsModalTitle">Settings</h2>
 
-    <div class="settings-tabs">
-      <button class="settings-tab active" onclick="switchSettingsTab('api', this)">API</button>
-      <button class="settings-tab" onclick="switchSettingsTab('prompts', this)">Prompts</button>
-      <button class="settings-tab" onclick="switchSettingsTab('appearance', this)">Appearance</button>
-      <button class="settings-tab" onclick="switchSettingsTab('tools', this)">Tools</button>
-      <button class="settings-tab" onclick="switchSettingsTab('sync', this)">Sync</button>
-      <button class="settings-tab" onclick="switchSettingsTab('data', this)">Data</button>
-      <button class="settings-tab" onclick="switchSettingsTab('debug', this)">Debug</button>
+    <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+      <button class="settings-tab active" id="settingsTabButton-api" role="tab" aria-selected="true" aria-controls="settingsTab-api" tabindex="0" onclick="switchSettingsTab('api', this)">API</button>
+      <button class="settings-tab" id="settingsTabButton-prompts" role="tab" aria-selected="false" aria-controls="settingsTab-prompts" tabindex="-1" onclick="switchSettingsTab('prompts', this)">Prompts</button>
+      <button class="settings-tab" id="settingsTabButton-appearance" role="tab" aria-selected="false" aria-controls="settingsTab-appearance" tabindex="-1" onclick="switchSettingsTab('appearance', this)">Appearance</button>
+      <button class="settings-tab" id="settingsTabButton-tools" role="tab" aria-selected="false" aria-controls="settingsTab-tools" tabindex="-1" onclick="switchSettingsTab('tools', this)">Tools</button>
+      <button class="settings-tab" id="settingsTabButton-sync" role="tab" aria-selected="false" aria-controls="settingsTab-sync" tabindex="-1" onclick="switchSettingsTab('sync', this)">Sync</button>
+      <button class="settings-tab" id="settingsTabButton-data" role="tab" aria-selected="false" aria-controls="settingsTab-data" tabindex="-1" onclick="switchSettingsTab('data', this)">Data</button>
+      <button class="settings-tab" id="settingsTabButton-debug" role="tab" aria-selected="false" aria-controls="settingsTab-debug" tabindex="-1" onclick="switchSettingsTab('debug', this)">Debug</button>
     </div>
 
-    <div class="settings-tab-content active" id="settingsTab-api">
+    <div class="settings-tab-content active" id="settingsTab-api" role="tabpanel" aria-labelledby="settingsTabButton-api">
       <label for="setProvider">Provider</label>
       <select id="setProvider" onchange="applyProviderPreset('settings', this.value)">
         <option value="openai">OpenAI</option>
@@ -310,7 +337,7 @@
       <label for="setModelSelect">Model</label>
       <div class="model-selector-row">
         <select id="setModelSelect" onchange="document.getElementById('setModelManual').value=''"><option value="">-- Fetch models first --</option></select>
-        <button class="model-refresh-btn" onclick="refreshModels('settings', this)" title="Refresh model list"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1M13.5 1.5v3h-3"/></svg></button>
+        <button class="model-refresh-btn" type="button" onclick="refreshModels('settings', this)" title="Refresh model list" aria-label="Refresh settings model list"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1M13.5 1.5v3h-3"/></svg></button>
       </div>
       <input type="text" id="setModelManual" placeholder="Or type model name manually" aria-label="Manual model name" oninput="document.getElementById('setModelSelect').value=''">
       <div class="connection-test-row"><button type="button" class="btn btn-secondary" onclick="testConnection('settings')">Test connection</button><span id="settingsConnectionStatus" class="connection-status" aria-live="polite"></span></div>
@@ -339,7 +366,7 @@
       </label>
       <label class="toggle-row">
         <input type="checkbox" id="setEnterSend" checked> Enter sends message
-        <span class="toggle-hint">Ctrl+Enter if off</span>
+        <span class="toggle-hint">Ctrl/Cmd+Enter if off</span>
       </label>
       <label for="setTemperature">Temperature</label>
       <input type="number" id="setTemperature" step="0.1" min="0" max="2" placeholder="e.g. 0.7 (leave empty for default)">
@@ -373,7 +400,7 @@
       <div class="setting-hint">Not supported by Claude Opus 5 / Sonnet 5 / Opus 4.6+ &mdash; leave empty on those models.</div>
     </div>
 
-    <div class="settings-tab-content" id="settingsTab-prompts">
+    <div class="settings-tab-content" id="settingsTab-prompts" role="tabpanel" aria-labelledby="settingsTabButton-prompts" hidden>
       <label for="setPresetSelect">Preset</label>
       <div class="model-selector-row">
         <select id="setPresetSelect" onchange="applyPreset(this.value)">
@@ -394,12 +421,19 @@
       <input type="text" id="setRpUserName" placeholder="Used for {{user}}; default is User">
       <label style="display:flex;align-items:center;justify-content:space-between">
         Prompt Entries
-        <button class="model-refresh-btn" onclick="addPromptEntry()" title="Add prompt entry">+</button>
+        <button class="model-refresh-btn" type="button" onclick="addPromptEntry()" title="Add prompt entry" aria-label="Add prompt entry">+</button>
       </label>
       <div id="promptEntryList" class="prompt-entry-list"></div>
+      <div class="modal-section">Starter prompts</div>
+      <label for="setStarterPrompts">One prompt per line</label>
+      <textarea id="setStarterPrompts" rows="5" placeholder="Help me plan today's priorities."></textarea>
+      <div class="setting-hint">Starter prompts fill the composer. They do not make an API request.</div>
+      <label class="toggle-row">
+        <input type="checkbox" id="setStarterPromptsHidden"> Hide starter prompts on new chats
+      </label>
     </div>
 
-    <div class="settings-tab-content" id="settingsTab-appearance">
+    <div class="settings-tab-content" id="settingsTab-appearance" role="tabpanel" aria-labelledby="settingsTabButton-appearance" hidden>
     <label for="setTheme">Theme</label>
     <select id="setTheme" onchange="onThemeSelectChange()">
       <option value="system">System (Auto)</option>
@@ -455,9 +489,9 @@
       <div class="theme-color-item"><input type="color" id="cAccentHover" aria-label="Accent hover" oninput="liveCustomTheme()"><span>Accent Hover</span></div>
       <div class="theme-color-item"><input type="color" id="cMsgUser" aria-label="User bubble" oninput="liveCustomTheme()"><span>User Bubble</span></div>
       <div class="theme-color-item"><input type="color" id="cMsgAssistant" aria-label="Assistant bubble" oninput="liveCustomTheme()"><span>Assistant Bubble</span></div>
-      <div class="theme-color-item"><input type="text" id="cBorderRadius" aria-label="Border radius" oninput="liveCustomTheme()" placeholder="16px" style="width:60px"><span>Radius</span></div>
-      <div class="theme-color-item"><input type="text" id="cMsgMaxWidth" aria-label="Message width" oninput="liveCustomTheme()" placeholder="75%" style="width:60px"><span>Msg Width</span></div>
-      <div class="theme-color-item"><input type="text" id="cMsgFontSize" aria-label="Message font size" oninput="liveCustomTheme()" placeholder="0.95em" style="width:60px"><span>Font Size</span></div>
+      <div class="theme-color-item"><input type="text" id="cBorderRadius" aria-label="Border radius" placeholder="16px" style="width:60px"><span>Radius</span></div>
+      <div class="theme-color-item"><input type="text" id="cMsgMaxWidth" aria-label="Message width" placeholder="75%" style="width:60px"><span>Msg Width</span></div>
+      <div class="theme-color-item"><input type="text" id="cMsgFontSize" aria-label="Message font size" placeholder="0.95em" style="width:60px"><span>Font Size</span></div>
       <div class="theme-color-item"><input type="color" id="cCodeBg" aria-label="Code background" oninput="liveCustomTheme()"><span>Code BG</span></div>
       <div class="theme-color-item" style="grid-column: 1 / -1">
         <button onclick="resetCustomTheme()" style="width:100%;padding:6px;cursor:pointer">Clear custom theme</button>
@@ -465,6 +499,7 @@
     </div>
     <label for="setFont">Font</label>
     <input type="text" id="setFont" placeholder="e.g. Inter, Poppins, JetBrains Mono">
+    <div class="setting-hint">A custom font name makes a request to Google Fonts.</div>
     <label for="setMsgFontSize">Message Font Size</label>
     <input type="text" id="setMsgFontSize" placeholder="0.95em (default)">
     <label for="setMsgMaxWidth">Message Width</label>
@@ -483,7 +518,7 @@
     </select>
     </div>
 
-    <div class="settings-tab-content" id="settingsTab-tools">
+    <div class="settings-tab-content" id="settingsTab-tools" role="tabpanel" aria-labelledby="settingsTabButton-tools" hidden>
     <label class="toggle-row">
       <input type="checkbox" id="setWebSearch"> Web Search
       <span class="toggle-hint">Anthropic native · OpenAI via search API</span>
@@ -527,7 +562,7 @@
     <input type="number" id="setOutputCost" step="0.01" placeholder="e.g. 10.00">
     </div>
 
-    <div class="settings-tab-content" id="settingsTab-sync">
+    <div class="settings-tab-content" id="settingsTab-sync" role="tabpanel" aria-labelledby="settingsTabButton-sync" hidden>
       <div class="modal-section">GitHub Gist</div>
       <div class="settings-note">Manual sync stores encrypted conversations, memories, presets, prompts, and appearance settings in a private Gist. API keys, provider URLs, search keys, and proxy settings stay on this device. Push now creates the Gist; Pull now remains manual.</div>
       <form class="password-field-form" onsubmit="return false">
@@ -541,6 +576,8 @@
       <div class="model-selector-row sync-passphrase-row">
         <input type="password" id="setSyncPassphrase" autocomplete="off" placeholder="Used only for local encryption and decryption">
         <button class="model-refresh-btn" type="button" onclick="syncGeneratePassphrase()" title="Generate passphrase" aria-label="Generate sync passphrase"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="2.5" width="11" height="11" rx="2"/><circle cx="5.6" cy="5.6" r=".9" fill="currentColor" stroke="none"/><circle cx="10.4" cy="5.6" r=".9" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="5.6" cy="10.4" r=".9" fill="currentColor" stroke="none"/><circle cx="10.4" cy="10.4" r=".9" fill="currentColor" stroke="none"/></svg></button>
+        <button class="model-refresh-btn" type="button" onclick="syncTogglePassphraseVisibility()" title="Show or hide passphrase" aria-label="Show or hide sync passphrase">Show</button>
+        <button class="model-refresh-btn" type="button" onclick="syncCopyPassphrase()" title="Copy passphrase" aria-label="Copy sync passphrase">Copy</button>
       </div>
       <div class="debug-status-row">
         <span class="debug-status-pill" id="syncStatus">Not configured</span>
@@ -553,8 +590,8 @@
         <span class="toggle-hint">Encrypted, debounced push; needs an existing Gist</span>
       </label>
       <div class="sync-actions">
-        <button class="btn btn-primary" type="button" onclick="syncPushToGist()">Push now</button>
-        <button class="btn btn-secondary" type="button" onclick="syncPullFromGist()">Pull now</button>
+        <button class="btn btn-primary" id="syncPushBtn" type="button" onclick="syncPushToGist()">Push now</button>
+        <button class="btn btn-secondary" id="syncPullBtn" type="button" onclick="syncPullFromGist()">Pull now</button>
       </div>
 
       <div class="modal-section">Pairing</div>
@@ -579,22 +616,29 @@
       <button class="btn btn-secondary sync-wide-btn" type="button" onclick="syncApplyPairingText()">Apply pairing code</button>
     </div>
 
-    <div class="settings-tab-content" id="settingsTab-data">
-      <div class="modal-section">Local data</div>
-      <div class="settings-note">Approximate sizes only. Public share links are not revoked when local records are deleted.</div>
-      <div class="storage-summary" id="storageSummary">Loading storage estimate...</div>
+    <div class="settings-tab-content" id="settingsTab-data" role="tabpanel" aria-labelledby="settingsTabButton-data" hidden>
+      <div class="modal-section">Backup</div>
+      <div class="settings-note">Backups exclude API keys, search credentials, sync tokens, and passphrases.</div>
       <div class="data-actions">
-        <button type="button" class="btn btn-secondary" onclick="clearDataCategory('conversations')">Clear conversations</button>
-        <button type="button" class="btn btn-secondary" onclick="clearDataCategory('drafts')">Clear drafts</button>
-        <button type="button" class="btn btn-secondary" onclick="clearDataCategory('memories')">Clear memories</button>
-        <button type="button" class="btn btn-secondary" onclick="clearDataCategory('credentials')">Clear provider/search/sync credentials</button>
+        <button type="button" class="btn btn-secondary" onclick="exportConversation()">Export current chat</button>
+        <button type="button" class="btn btn-secondary" onclick="exportAllConversations()">Export backup</button>
+        <button type="button" class="btn btn-secondary" onclick="document.getElementById('importInput').click()">Import data</button>
       </div>
-      <div class="modal-section">Import</div>
-      <div class="settings-note">Import parses and previews before it changes anything. Merge keeps the newer record by ID; Copy remaps IDs.</div>
-      <button type="button" class="btn btn-secondary" onclick="document.getElementById('importInput').click()">Choose export file</button>
+      <div class="modal-section">Local data</div>
+      <div class="settings-note">Approximate sizes only. Clearing local data does not revoke public share links.</div>
+      <div class="storage-summary" id="storageSummary">Loading storage estimate...</div>
+      <div class="danger-zone">
+        <strong>Clear local data</strong>
+        <div class="data-actions">
+          <button type="button" class="btn btn-danger" onclick="clearDataCategory('conversations')">Clear conversations</button>
+          <button type="button" class="btn btn-danger" onclick="clearDataCategory('drafts')">Clear drafts</button>
+          <button type="button" class="btn btn-danger" onclick="clearDataCategory('memories')">Clear memories</button>
+          <button type="button" class="btn btn-danger" onclick="clearDataCategory('credentials')">Clear credentials</button>
+        </div>
+      </div>
     </div>
 
-    <div class="settings-tab-content" id="settingsTab-debug">
+    <div class="settings-tab-content" id="settingsTab-debug" role="tabpanel" aria-labelledby="settingsTabButton-debug" hidden>
       <label class="toggle-row">
         <input type="checkbox" id="setDebugLogging" onchange="setDebugPreference()">
         Debug logging
@@ -619,9 +663,10 @@
       </div>
     </div>
 
-    <div class="modal-actions">
-      <button class="btn btn-secondary" onclick="closeSettings()">Cancel</button>
-      <button class="btn btn-primary" onclick="saveSettings()">Save</button>
+    <div class="modal-actions settings-actions">
+      <span class="settings-save-status" id="settingsSaveStatus" role="status"></span>
+      <button class="btn btn-secondary" type="button" onclick="closeSettings()">Close</button>
+      <button class="btn btn-primary" id="settingsSaveBtn" type="button" onclick="saveSettingsTab()">Save API settings</button>
     </div>
   </div>
 </div>
@@ -633,15 +678,15 @@
     <div style="display:grid;grid-template-columns:auto 1fr;gap:8px 16px;font-size:0.85em">
       <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Enter</kbd><span>Send message (configurable)</span>
       <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Shift+Enter</kbd><span>New line in input</span>
-      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl+Enter</kbd><span>Always sends message</span>
-      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl+N</kbd><span>New conversation</span>
-      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl+/</kbd><span>Focus input</span>
-      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl+K</kbd><span>Search conversations</span>
-      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl+F</kbd><span>Search in current chat</span>
-      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl+Shift+E</kbd><span>Export all conversations</span>
-      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl+Shift+R</kbd><span>Regenerate last response</span>
+      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl/Cmd+Enter</kbd><span>Always sends message</span>
+      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl/Cmd+N</kbd><span>New conversation</span>
+      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl/Cmd+/</kbd><span>Focus input</span>
+      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl/Cmd+K</kbd><span>Search conversations</span>
+      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl/Cmd+F</kbd><span>Search in current chat</span>
+      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl/Cmd+Shift+E</kbd><span>Export backup</span>
+      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl/Cmd+Shift+R</kbd><span>Regenerate last response</span>
       <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Escape</kbd><span>Close modal / Stop streaming</span>
-      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl+Shift+?</kbd><span>Show this help</span>
+      <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">Ctrl/Cmd+Shift+?</kbd><span>Show this help</span>
       <kbd style="background:var(--hover);padding:2px 8px;border-radius:4px;font-family:inherit;white-space:nowrap">@model</kbd><span>Override model for one message</span>
     </div>
     <div class="modal-actions" style="margin-top:16px">
@@ -657,25 +702,25 @@
     <div class="setting-hint">A project groups chats and gives them all the same instructions and files.</div>
     <div class="model-selector-row">
       <select id="projSelect" onchange="selectProjectInModal(this.value)" aria-label="Select project"></select>
-      <button class="btn" onclick="newProjectFromModal()">New</button>
-      <button class="btn" onclick="deleteProject(document.getElementById('projSelect').value)">Delete</button>
+      <button class="btn btn-secondary" type="button" onclick="newProjectFromModal()">New</button>
+      <button class="btn btn-danger" type="button" onclick="deleteProject(document.getElementById('projSelect').value)">Delete</button>
     </div>
     <div id="projEmptyState" class="setting-hint" style="display:none">No projects yet. Create one, then move chats into it with the folder button in the sidebar.</div>
     <div id="projEditorBody">
       <label for="projName">Name</label>
-      <input type="text" id="projName" placeholder="Project name">
+      <input type="text" id="projName" placeholder="Project name" oninput="scheduleProjectAutosave()">
       <label for="projInstructions">Project instructions</label>
-      <textarea id="projInstructions" rows="6" placeholder="Applied to every chat in this project."></textarea>
+      <textarea id="projInstructions" rows="6" placeholder="Applied to every chat in this project." oninput="scheduleProjectAutosave()"></textarea>
       <label for="projFileInput">Project files</label>
       <div id="projDocList" class="prompt-entry-list"></div>
       <input type="file" id="projFileInput" multiple style="display:none" onchange="addProjectFiles(event)">
-      <button class="btn" onclick="document.getElementById('projFileInput').click()">Add files</button>
+      <button class="btn btn-secondary" type="button" onclick="document.getElementById('projFileInput').click()">Add files</button>
+      <div class="project-save-status" id="projectSaveStatus" role="status">Saved</div>
       <div class="setting-hint" id="projChatCount"></div>
       <div class="setting-hint">Project files are sent with every message in this project, so they count toward the token cost of each request.</div>
     </div>
     <div class="modal-actions">
-      <button class="btn" onclick="closeModal('projectsModal')">Cancel</button>
-      <button class="btn btn-primary" onclick="saveProjectFromModal()">Save</button>
+      <button class="btn btn-primary" type="button" onclick="saveProjectFromModal()">Close</button>
     </div>
   </div>
 </div>
@@ -696,15 +741,19 @@
   <div class="modal" aria-labelledby="importPreviewTitle">
     <h2 id="importPreviewTitle">Import preview</h2>
     <div id="importPreviewBody" class="import-preview-body"></div>
+    <fieldset class="import-strategy" onchange="updateImportStrategyUI()">
+      <legend>Import strategy</legend>
+      <label><input type="radio" name="importStrategy" value="merge" checked> Merge newer records by ID</label>
+      <label><input type="radio" name="importStrategy" value="copy"> Import as copies</label>
+      <label class="danger-option"><input type="radio" name="importStrategy" value="replace"> Replace imported categories</label>
+    </fieldset>
     <div class="modal-actions import-actions">
       <button class="btn btn-secondary" type="button" onclick="closeModal('importPreviewModal')">Cancel</button>
-      <button class="btn btn-secondary" type="button" onclick="applyImport('merge')">Merge by ID</button>
-      <button class="btn btn-secondary" type="button" onclick="applyImport('copy')">Import as copies</button>
-      <button class="btn btn-primary" type="button" onclick="applyImport('replace')">Replace imported categories</button>
+      <button class="btn btn-primary" id="applyImportBtn" type="button" onclick="applySelectedImport()">Import</button>
     </div>
   </div>
 </div>
 
-<script type="module" src="./js/main.js?v=202608251606"></script>
+<script type="module" src="./js/main.js?v=202608251950"></script>
 </body>
 </html>

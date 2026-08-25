@@ -1,6 +1,6 @@
 # Synapse
 
-Synapse is a browser-only chat app for API-backed assistants. It runs from static files, stores your chats locally, and sends requests only to the endpoint you configure.
+Synapse is my browser-only chat app for API-backed assistants. It runs from static files, stores your chats locally, and sends requests only to the endpoint you configure.
 
 Use it from GitHub Pages, run it from a local server, or download the standalone `synapse.html` file.
 
@@ -13,14 +13,18 @@ Use it from GitHub Pages, run it from a local server, or download the standalone
 - Supports local model servers such as LM Studio, Ollama, and text-generation-webui.
 - Lets you save connection profiles for different base URLs, models, and request settings; API keys stay in the selected device/tab credential store and are scrubbed from profiles, exports, and sync payloads.
 - Supports streaming responses, stop generation, and one-message model overrides with `@model-name`.
-- The toolbar chip shows the active provider, model, and profile. Each assistant swipe records lifecycle, timing, HTTP, and sanitized error metadata.
+- The toolbar chip opens a searchable profile and model picker. Each assistant swipe records lifecycle, timing, HTTP, and sanitised error metadata.
+- Compare two models before sending. Synapse makes two non-streaming requests and stores both replies as response swipes. A cross-provider key stays in memory only for that comparison.
 
 API keys can be saved as **Remember on this device** (`localStorage`) or **This tab only** (`sessionStorage`). Legacy `llmApiKey` values remain remembered until changed. Browser storage is not an encrypted vault.
 
 ### Chats
 
 - Create, rename, tag, search, import, and export conversations. Active and Archived views, collapsible project groups, duplicate/archive/restore, bulk selection, and Updated/Created/Title/Manual sorting are available in the sidebar.
-- Export one chat as JSON or Markdown, or export everything at once.
+- Export one chat as JSON or Markdown, or make a full backup from Data settings.
+- Temporary chats stay only in the current loaded tab, ignore saved memories and project context, and can't be exported, shared, or saved as screenshots by Synapse. Your selected provider still receives the messages.
+- Four editable starter prompts fill the composer locally. They make no API request and can be hidden in Prompts settings.
+- 'Complete draft' and 'Suggest follow-ups' call the selected provider only when you ask. Suggestions fill the composer and never send themselves.
 - Edit a user message and resend from that point.
 - Regenerate assistant messages and switch between swipes.
 - Fork a chat from any message. Parent and child links stay available in the Context panel.
@@ -57,7 +61,7 @@ API keys can be saved as **Remember on this device** (`localStorage`) or **This 
 
 ### Appearance
 
-- A muted forest-green workbench theme by default, plus built-in themes, a custom color picker, and light/dark/system toggle.
+- A muted forest-green workbench theme by default, plus built-in themes, a custom colour picker, and light/dark/system toggle.
 - Custom font, message width, font size, and border radius settings.
 - Syntax highlighting, LaTeX, Mermaid diagrams, tables, code blocks, spoilers, and generated image display.
 - Optional local emotion sprites for Claude, GPT, and Gemini output tags, with automatic or manual sprite-set selection.
@@ -69,13 +73,13 @@ API keys can be saved as **Remember on this device** (`localStorage`) or **This 
 |---|---|
 | `Enter` | Send, or queue a follow-up while streaming, if enabled |
 | `Shift+Enter` | New line |
-| `Ctrl+Enter` | Send message |
-| `Ctrl+N` | New conversation |
-| `Ctrl+/` | Focus input |
-| `Ctrl+K` | Search conversations |
-| `Ctrl+F` | Search current chat |
-| `Ctrl+Shift+E` | Export all conversations |
-| `Ctrl+Shift+R` | Regenerate last response |
+| `Ctrl/Cmd+Enter` | Send message |
+| `Ctrl/Cmd+N` | New conversation |
+| `Ctrl/Cmd+/` | Focus input |
+| `Ctrl/Cmd+K` | Search conversations |
+| `Ctrl/Cmd+F` | Search current chat |
+| `Ctrl/Cmd+Shift+E` | Export backup |
+| `Ctrl/Cmd+Shift+R` | Regenerate last response |
 | `Escape` | Close modal or stop generation |
 | `@model` | Override the model for one message |
 
@@ -139,7 +143,7 @@ Synapse uses browser storage:
 
 | Storage | Contents |
 |---|---|
-| IndexedDB | Conversations, messages, drafts, queued follow-ups, goals, and memories |
+| IndexedDB | Persistent conversations, messages, drafts, queued follow-ups, goals, and memories |
 | `localStorage` | API settings, themes, profiles, prompt entries, presets, cached model list, and UI preferences |
 | `sessionStorage` | A key selected as “This tab only” |
 
@@ -154,9 +158,10 @@ Important keys include:
 | `assistantTheme` | Current theme |
 | `assistantCustomTheme` | Custom theme colors |
 | `llmPromptEntries` | Prompt entries |
+| `assistantStarterPrompts` | Local starter prompts |
 | `assistantDebug` | Debug logging toggle |
 
-Use "Export all chats" from the toolbar menu if you want a backup.
+Temporary chats never enter browser storage and disappear on reload or close. Use 'Export backup' in Data settings when you want a copy of everything persistent.
 
 Optional GitHub Gist sync encrypts conversations, memories, projects, prompts, presets, and appearance settings before storing them in a private Gist. Push now creates or updates it; Pull now is always manual. After the first push, you can opt into debounced automatic pushes from the Sync tab. Automatic push is off by default and never pulls or runs on shared read-only pages.
 
