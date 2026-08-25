@@ -96,7 +96,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-08-25T19:50:24+08:00',
+  buildDate: '2026-08-25T20:04:13+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -587,6 +587,7 @@ function toggleConnectionPicker(event) {
     const search = document.getElementById('connectionPickerSearch');
     search.value = '';
     renderConnectionPicker();
+    clampPopupToViewport(picker);
     search.focus();
   }
 }
@@ -3780,6 +3781,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (window.innerWidth > 1100) document.getElementById('contextOverlay')?.classList.remove('open');
     // The send button label is shortened on narrow screens.
     if ((previousLayoutWidth <= 768) !== (width <= 768)) updateSendBtnState();
+    document.querySelectorAll('.toolbar-menu.open, .connection-picker:not([hidden])').forEach(clampPopupToViewport);
     previousLayoutWidth = width;
   });
 
@@ -6478,6 +6480,21 @@ function handleMenuKeydown(event, menu, closeMenu) {
   items[next].focus();
 }
 
+function clampPopupToViewport(popup) {
+  const pad = 8;
+  const rect = popup.getBoundingClientRect();
+  let dx = 0, dy = 0;
+  if (rect.left < pad) dx = pad - rect.left;
+  else if (rect.right > window.innerWidth - pad) dx = (window.innerWidth - pad) - rect.right;
+  if (rect.top < pad) dy = pad - rect.top;
+  else if (rect.bottom > window.innerHeight - pad) dy = (window.innerHeight - pad) - rect.bottom;
+  if (!dx && !dy) return;
+  const host = popup.offsetParent;
+  const hostRect = host ? host.getBoundingClientRect() : { left: 0, top: 0 };
+  popup.style.left = Math.round(rect.left - hostRect.left + dx) + 'px';
+  popup.style.top = Math.round(rect.top - hostRect.top + dy) + 'px';
+}
+
 function setStaticMenuOpen(menuId, buttonId, open, restoreFocus = false) {
   const menu = document.getElementById(menuId);
   const button = document.getElementById(buttonId);
@@ -6485,6 +6502,7 @@ function setStaticMenuOpen(menuId, buttonId, open, restoreFocus = false) {
   menu.classList.toggle('open', open);
   button.setAttribute('aria-expanded', String(open));
   if (open) {
+    clampPopupToViewport(menu);
     const items = Array.from(menu.querySelectorAll('[role="menuitem"]:not([hidden]):not(:disabled)'));
     items.forEach((item, index) => { item.tabIndex = index === 0 ? 0 : -1; });
     items[0]?.focus();
@@ -6577,6 +6595,7 @@ function toggleToolbarMenu(e) {
   document.getElementById('toolbarMoreBtn')?.setAttribute('aria-expanded', String(open));
   if (open) {
     toolbarMenuFocusReturn = document.activeElement;
+    clampPopupToViewport(menu);
     const items = Array.from(menu.querySelectorAll('[role="menuitem"]:not([hidden]):not(:disabled)'));
     items.forEach((item, index) => { item.tabIndex = index === 0 ? 0 : -1; });
     items[0]?.focus();

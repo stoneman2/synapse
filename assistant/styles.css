@@ -467,6 +467,7 @@ svg.icon {
   border: 1px solid var(--card-border);
   border-radius: 8px;
   min-width: 180px;
+  max-width: calc(100vw - 16px);
   z-index: 100;
   box-shadow: 0 4px 16px rgba(0,0,0,0.4);
   max-height: min(70vh, 520px);
@@ -513,6 +514,7 @@ svg.icon {
   right: 0;
   z-index: 220;
   width: min(360px, calc(100vw - 24px));
+  max-width: calc(100vw - 16px);
   padding: 8px;
   border: 1px solid var(--card-border);
   border-radius: 10px;
