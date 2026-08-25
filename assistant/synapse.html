@@ -787,6 +787,11 @@ svg.icon {
   max-height: 90vh;
   max-height: 90dvh;
   overflow-y: auto;
+  /* Any child wider than the dialog would otherwise let the whole dialog be
+     panned sideways on touch, hiding its left edge. Wide rows scroll or wrap
+     inside themselves instead. */
+  overflow-x: hidden;
+  overscroll-behavior: contain;
 }
 .modal h2 {
   font-size: 1.2em;
@@ -860,6 +865,9 @@ svg.icon {
 }
 .model-selector-row select {
   flex: 1;
+  /* Without this a long model name sets the select's minimum width and widens
+     the whole dialog on a phone. */
+  min-width: 0;
   margin-bottom: 0;
 }
 .model-refresh-btn {
@@ -994,13 +1002,6 @@ svg.icon {
   .code-block-wrapper .code-copy-btn { opacity: 1; }
   .code-block-wrapper .code-download-btn { opacity: 1; }
   .code-block-wrapper .code-preview-btn { opacity: 1; }
-  /* Only the open conversation shows its row actions; otherwise every row
-     becomes a strip of buttons and titles get crushed to nothing. The active
-     row wraps so the title keeps its own line above the actions. */
-  .conv-item.active { flex-wrap: wrap; }
-  .conv-item.active .conv-title { flex: 1 1 55%; }
-  .conv-item.active .conv-delete { display: flex; }
-  .conv-item.active .conv-pin { display: flex; }
 }
 /* Keyboard access to row actions */
 .conv-item:focus-within .conv-delete,
@@ -1031,10 +1032,13 @@ svg.icon {
   .toolbar-toggle { min-width: 44px; min-height: 44px; display: flex; align-items: center; justify-content: center; }
   .input-btn { min-width: 44px; min-height: 44px; display: flex; align-items: center; justify-content: center; }
   /* Two-row composer: full-width textarea above, controls beneath. Five
-     fixed-width controls beside the field left it ~60px of typing room. */
-  .input-row { flex-wrap: wrap; }
+     fixed-width controls beside the field left it ~60px of typing room.
+     The controls stay on one line: the labelled ones give up width first so
+     nothing spills onto a third row. */
+  .input-row { flex-wrap: wrap; gap: 6px; }
   .input-row textarea { flex: 1 1 100%; order: -1; }
-  .send-btn { margin-left: auto; }
+  .input-control-btn { padding-inline: 8px; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .send-btn { margin-left: auto; padding-inline: 14px; }
   .img-thumb .remove-thumb { width: 28px; height: 28px; font-size: 14px; top: -4px; right: -4px; }
   .file-thumb .remove-thumb { width: 28px; height: 28px; font-size: 14px; top: -4px; right: -4px; }
   .msg-action-btn { padding: 8px 12px; font-size: 0.8em; min-height: 36px; }
@@ -1624,7 +1628,6 @@ body.theme-light .hljs-symbol, body.theme-light .hljs-bullet, body.theme-light .
 
 @media (hover: none) {
   .scroll-fab { width: 44px; height: 44px; }
-  .conv-item.active .conv-pin { display: block; }
 }
 
 /* Character card avatar in sidebar */
@@ -2006,6 +2009,24 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .toolbar { padding-inline: 6px; }
   .toolbar-left, .toolbar-right { gap: 2px; }
   .toolbar-title, .connection-chip { display: none; }
+  /* A 320px phone needs ~16px more to keep the controls on one line. */
+  .input-row { gap: 4px; }
+  .input-control-btn { padding-inline: 4px; }
+}
+
+/* Tapping a conversation leaves :hover stuck on that row, which revealed six
+   action buttons and squeezed the title to nothing, so no other conversation
+   could be tapped. On touch only the open conversation shows its actions, on a
+   line of their own under the full-width title. Last in the file so it beats
+   the :hover rules it cancels. */
+@media (hover: none) {
+  .conv-item:hover .conv-delete { display: none; }
+  .conv-item:hover .conv-pin { display: none; }
+  .conv-item:hover .conv-pin.pinned { display: flex; }
+  .conv-item.active { flex-wrap: wrap; justify-content: flex-start; }
+  .conv-item.active .conv-title { flex: 1 1 100%; order: -1; }
+  .conv-item.active .conv-delete,
+  .conv-item.active .conv-pin { display: flex; }
 }
 
 </style>
@@ -2799,7 +2820,7 @@ let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-08-25T13:43:12+08:00',
+  buildDate: '2026-08-25T14:40:02+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -5539,6 +5560,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     if (window.innerWidth > 768) document.getElementById('sidebarOverlay')?.classList.remove('open');
     if (window.innerWidth > 1100) document.getElementById('contextOverlay')?.classList.remove('open');
+    // The send button label is shortened on narrow screens.
+    if ((previousLayoutWidth <= 768) !== (width <= 768)) updateSendBtnState();
     previousLayoutWidth = width;
   });
 
@@ -11768,7 +11791,8 @@ function updateSendBtnState() {
   const hasInput = input.value.trim() || pendingAttachments.length > 0;
   const lastMsg = messages[messages.length - 1];
   if (!hasInput && lastMsg && lastMsg.role === 'user') {
-    btn.textContent = 'Regenerate';
+    // ponytail: the word does not fit beside the other controls on a phone.
+    btn.textContent = window.innerWidth <= 768 ? '↻' : 'Regenerate';
     btn.setAttribute('aria-label', 'Regenerate response');
   } else {
     btn.textContent = 'Send';

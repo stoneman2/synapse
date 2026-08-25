@@ -47,7 +47,7 @@ let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-08-25T13:43:12+08:00',
+  buildDate: '2026-08-25T14:40:02+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -2787,6 +2787,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     if (window.innerWidth > 768) document.getElementById('sidebarOverlay')?.classList.remove('open');
     if (window.innerWidth > 1100) document.getElementById('contextOverlay')?.classList.remove('open');
+    // The send button label is shortened on narrow screens.
+    if ((previousLayoutWidth <= 768) !== (width <= 768)) updateSendBtnState();
     previousLayoutWidth = width;
   });
 
@@ -9016,7 +9018,8 @@ function updateSendBtnState() {
   const hasInput = input.value.trim() || pendingAttachments.length > 0;
   const lastMsg = messages[messages.length - 1];
   if (!hasInput && lastMsg && lastMsg.role === 'user') {
-    btn.textContent = 'Regenerate';
+    // ponytail: the word does not fit beside the other controls on a phone.
+    btn.textContent = window.innerWidth <= 768 ? '↻' : 'Regenerate';
     btn.setAttribute('aria-label', 'Regenerate response');
   } else {
     btn.textContent = 'Send';
