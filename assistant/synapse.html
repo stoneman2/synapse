@@ -529,12 +529,13 @@ svg.icon {
   border-bottom-right-radius: 4px;
   white-space: pre-wrap;
 }
+/* Keep the normal bubble padding here: themes other than the default give the
+   assistant a visible background, and stripping the inset jammed the text
+   against its edge. */
 .msg-bubble.assistant {
   background: var(--msg-assistant);
   color: var(--text-primary);
-  border-radius: 0;
-  padding-left: 0;
-  padding-right: 0;
+  border-bottom-left-radius: 4px;
 }
 
 /* Markdown in messages */
@@ -2820,7 +2821,7 @@ let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-08-25T15:18:05+08:00',
+  buildDate: '2026-08-25T16:06:41+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 

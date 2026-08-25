@@ -47,7 +47,7 @@ let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-08-25T15:18:05+08:00',
+  buildDate: '2026-08-25T16:06:41+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
