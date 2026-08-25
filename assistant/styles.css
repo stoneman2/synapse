@@ -1384,7 +1384,7 @@ body.share-view .main { margin-left: 0; }
 .thinking-block { margin-bottom: 8px; border-radius: 8px; background: var(--hover); overflow: hidden; font-size: 0.85em; }
 .thinking-header { padding: 8px 12px; cursor: pointer; color: var(--text-secondary); display: flex; align-items: center; gap: 6px; user-select: none; }
 .thinking-header:hover { color: var(--text-primary); }
-.thinking-content { padding: 4px 12px 8px; border-top: 1px solid var(--card-border); white-space: pre-wrap; color: var(--text-secondary); max-height: 300px; overflow-y: auto; }
+.thinking-content { padding: 4px 12px 8px; border-top: 1px solid var(--card-border); white-space: pre-wrap; color: var(--text-secondary); max-height: 300px; overflow-y: auto; overscroll-behavior: contain; }
 
 /* Line numbers in code blocks. The spans are display:block, so the \n text nodes
    between them must not render as extra blank lines: the pre drops to normal

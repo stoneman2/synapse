@@ -47,7 +47,7 @@ let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-08-25T14:40:02+08:00',
+  buildDate: '2026-08-25T15:18:05+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -6690,7 +6690,7 @@ function renderMessages({ preserveScroll = false } = {}) {
       const imgData = msg.swipeImages && msg.swipeImages[msg.swipeIndex];
       const _h = stripThinkTags(msg.content);
       const _hThink = _h.thinking ? (thinkData || '') + _h.thinking : (thinkData || '');
-      bubble.innerHTML = renderThinkingHTML(_hThink) + renderToolBlocksHTML(toolData || []) + renderMarkdown(_h.content) + renderGenImages(imgData);
+      setBubbleHTML(bubble, _hThink, renderToolBlocksHTML(toolData || []) + renderMarkdown(_h.content) + renderGenImages(imgData));
       postRenderProcessing(bubble);
     } else {
       bubble.textContent = msg.content;
@@ -7083,6 +7083,28 @@ function renderThinkingHTML(text) {
   const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return '<details class="thinking-block"><summary class="thinking-header">Thinking</summary>' +
     '<div class="thinking-content">' + escaped + '</div></details>';
+}
+
+// Streaming rewrites the whole bubble every 80ms. Replacing the thinking
+// <details> resets its scroll box and cancels any touch drag in progress, so on
+// a phone the reasoning could not be scrolled at all. Update it in place and
+// only follow the tail while it is already scrolled to the bottom.
+function setBubbleHTML(bubbleEl, thinkingText, restHTML) {
+  const block = bubbleEl.firstElementChild;
+  const content = thinkingText && block && block.classList.contains('thinking-block')
+    ? block.querySelector('.thinking-content')
+    : null;
+  if (!content) {
+    bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + restHTML;
+    return;
+  }
+  if (content.textContent !== thinkingText) {
+    const pinned = content.scrollHeight - content.scrollTop - content.clientHeight < 24;
+    content.textContent = thinkingText;
+    if (pinned) content.scrollTop = content.scrollHeight;
+  }
+  while (block.nextSibling) block.nextSibling.remove();
+  block.insertAdjacentHTML('afterend', restHTML);
 }
 
 function stripThinkTags(text) {
@@ -7922,18 +7944,18 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             if (call.name === 'url_fetch') {
               const tb = toolBlocks[call.toolBlockIndex];
               const fetchUrl = call.input?.url || '';
-              bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
               const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
               if (tb) { tb.content = content; tb.searching = false; if (error) tb.error = error; }
-              bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
               toolResultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: formatUrlFetchResultForModel(content, error, fetchUrl) });
             } else if (call.name === 'web_search') {
               const tb = toolBlocks[call.toolBlockIndex];
               const query = extractWebSearchQueryFromArgs(call.input);
-              bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
               const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
               if (tb) { tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet })); tb.searching = false; if (error) tb.error = error; }
-              bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
               toolResultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: formatSearchResultsForModel(results, error) });
             }
           }
@@ -8009,24 +8031,24 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             if (toolName === 'url_fetch') {
               const fetchUrl = args.url || '';
               toolBlocks.push({ type: 'url_fetch', url: fetchUrl, content: '', searching: true });
-              bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
               const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
               const tb = toolBlocks[toolBlocks.length - 1];
               tb.content = content;
               tb.searching = false;
               if (error) tb.error = error;
-              bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
               toolResultMsgs.push({ role: 'tool', tool_call_id: tc.id, content: formatUrlFetchResultForModel(content, error, fetchUrl) });
             } else {
               const query = extractWebSearchQueryFromArgs(args);
               toolBlocks.push({ query, results: [], searching: true });
-              bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
               const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
               const tb = toolBlocks[toolBlocks.length - 1];
               tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
               tb.searching = false;
               if (error) tb.error = error;
-              bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
               toolResultMsgs.push({ role: 'tool', tool_call_id: tc.id, content: formatSearchResultsForModel(results, error) });
             }
           }
@@ -8074,7 +8096,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             if (tc.name === 'url_fetch') {
               const fetchUrl = args.url || '';
               toolBlocks.push({ type: 'url_fetch', url: fetchUrl, content: '', searching: true });
-              bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
               const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
               const tb = toolBlocks[toolBlocks.length - 1];
               tb.content = content; tb.searching = false;
@@ -8083,7 +8105,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             } else {
               const query = extractWebSearchQueryFromArgs(args);
               toolBlocks.push({ query, results: [], searching: true });
-              bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
               const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
               const tb = toolBlocks[toolBlocks.length - 1];
               tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
@@ -8091,7 +8113,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               if (error) tb.error = error;
               textToolResults.push('Web Search (' + query + '):\n' + formatSearchResultsForModel(results, error));
             }
-            bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
           }
           const followUpMessages = [...body.messages,
             { role: 'assistant', content: savedText },
@@ -8130,7 +8152,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
         assistantMsg.swipeToolUse = assistantMsg.swipeToolUse || [];
         assistantMsg.swipeToolUse[swipeIdx] = toolBlocks;
       }
-      bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+      setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
       postRenderProcessing(bubbleEl);
     } else {
       // SSE streaming
@@ -8149,7 +8171,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
           _suppressScrollFlag = true;
           const stripped = stripThinkTags(fullText);
           const displayThinking = stripped.thinking ? thinkingText + stripped.thinking : thinkingText;
-          bubbleEl.innerHTML = renderThinkingHTML(displayThinking) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(stripped.content) + renderGenImages(streamImages);
+          setBubbleHTML(bubbleEl, displayThinking, renderToolBlocksHTML(toolBlocks) + renderMarkdown(stripped.content) + renderGenImages(streamImages));
           if (savedScrollTop !== null) msgsArea.scrollTop = savedScrollTop;
           else msgsArea.scrollTop = msgsArea.scrollHeight;
           _suppressScrollFlag = false;
@@ -8417,7 +8439,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
           const _st = stripThinkTags(fullText);
           const _displayText = _st.content;
           const _displayThinking = _st.thinking ? thinkingText + _st.thinking : thinkingText;
-          bubbleEl.innerHTML = renderThinkingHTML(_displayThinking) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(_displayText) + renderGenImages(streamImages);
+          setBubbleHTML(bubbleEl, _displayThinking, renderToolBlocksHTML(toolBlocks) + renderMarkdown(_displayText) + renderGenImages(streamImages));
           if (thinkingOpen) {
             const details = bubbleEl.querySelector('details.thinking-block');
             if (details) details.open = true;
@@ -8449,7 +8471,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             const tb = toolBlocks[call.toolBlockIndex];
             const fetchUrl = call.input?.url || '';
             if (tb) tb.url = fetchUrl;
-            bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
             const msgsAreaTmp = document.getElementById('messagesArea');
             if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
             const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
@@ -8458,14 +8480,14 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               tb.searching = false;
               if (error) tb.error = error;
             }
-            bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
             if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
             toolResultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: formatUrlFetchResultForModel(content, error, fetchUrl) });
           } else if (call.name === 'web_search') {
             const tb = toolBlocks[call.toolBlockIndex];
             const query = extractWebSearchQueryFromArgs(call.input);
             if (tb) tb.query = query;
-            bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
             const msgsAreaTmp = document.getElementById('messagesArea');
             if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
             const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
@@ -8474,7 +8496,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               tb.searching = false;
               if (error) tb.error = error;
             }
-            bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
             if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
             toolResultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: formatSearchResultsForModel(results, error) });
           }
@@ -8617,7 +8639,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               const savedST = userScrolledAway ? msgsArea2.scrollTop : null;
               _suppressScrollFlag = true;
               const _st2 = stripThinkTags(fullText);
-              bubbleEl.innerHTML = renderThinkingHTML(_st2.thinking ? thinkingText + _st2.thinking : thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(_st2.content) + renderGenImages(streamImages);
+              setBubbleHTML(bubbleEl, _st2.thinking ? thinkingText + _st2.thinking : thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(_st2.content) + renderGenImages(streamImages));
               if (savedST !== null) msgsArea2.scrollTop = savedST;
               else msgsArea2.scrollTop = msgsArea2.scrollHeight;
               _suppressScrollFlag = false;
@@ -8672,7 +8694,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             if (tc.name === 'url_fetch') {
               const fetchUrl = args.url || '';
               toolBlocks.push({ type: 'url_fetch', url: fetchUrl, content: '', searching: true });
-              bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
             const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
               const tb = toolBlocks[toolBlocks.length - 1];
               tb.content = content; tb.searching = false;
@@ -8681,7 +8703,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             } else {
               const query = extractWebSearchQueryFromArgs(args);
               toolBlocks.push({ query, results: [], searching: true });
-              bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
             const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
               const tb = toolBlocks[toolBlocks.length - 1];
               tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
@@ -8689,7 +8711,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               if (error) tb.error = error;
               textToolResults.push('Web Search (' + query + '):\n' + formatSearchResultsForModel(results, error));
             }
-            bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
           }
           // Follow up with results as a user message (compatible with all APIs)
           const followUpMessages = [...(body.messages || []),
@@ -8729,7 +8751,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
                 assistantMsg.content = fullText;
                 const now = Date.now();
                 if (now - lastRender > 80) {
-                  bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+                  setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
                   lastRender = now;
                 }
               }
@@ -8765,21 +8787,21 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
           if (toolName === 'url_fetch') {
             const fetchUrl = args.url || '';
             toolBlocks.push({ type: 'url_fetch', url: fetchUrl, content: '', searching: true });
-            bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
             if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
             const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
             const tb = toolBlocks[toolBlocks.length - 1];
             tb.content = content;
             tb.searching = false;
             if (error) tb.error = error;
-            bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
             if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
             toolResultMsgs.push({ role: 'tool', tool_call_id: tc.id, content: formatUrlFetchResultForModel(content, error, fetchUrl) });
           } else {
             const query = extractWebSearchQueryFromArgs(args);
             // Show searching state
             toolBlocks.push({ query, results: [], searching: true });
-            bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
             if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
             // Execute search
             const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
@@ -8787,7 +8809,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
             tb.searching = false;
             if (error) tb.error = error;
-            bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
             if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
             toolResultMsgs.push({ role: 'tool', tool_call_id: tc.id, content: formatSearchResultsForModel(results, error) });
           }
@@ -8865,7 +8887,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             const _st2 = stripThinkTags(fullText);
             const _displayText2 = _st2.content;
             const _displayThinking2 = _st2.thinking ? thinkingText + _st2.thinking : thinkingText;
-            bubbleEl.innerHTML = renderThinkingHTML(_displayThinking2) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(_displayText2) + renderGenImages(streamImages);
+            setBubbleHTML(bubbleEl, _displayThinking2, renderToolBlocksHTML(toolBlocks) + renderMarkdown(_displayText2) + renderGenImages(streamImages));
             if (savedST !== null) msgsArea2.scrollTop = savedST;
             else msgsArea2.scrollTop = msgsArea2.scrollHeight;
             _suppressScrollFlag = false;
@@ -8927,7 +8949,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       const msgsArea = document.getElementById('messagesArea');
       const savedScrollTop = userScrolledAway ? msgsArea.scrollTop : null;
       _suppressScrollFlag = true;
-      bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages);
+      setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
       postRenderProcessing(bubbleEl);
       if (savedScrollTop !== null) {
         msgsArea.scrollTop = savedScrollTop;
@@ -8963,7 +8985,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     const msgsArea = document.getElementById('messagesArea');
     const savedScrollTop = userScrolledAway ? msgsArea.scrollTop : null;
     _suppressScrollFlag = true;
-    bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images);
+    setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
     if (savedScrollTop !== null) {
       msgsArea.scrollTop = savedScrollTop;
     } else {
@@ -9959,6 +9981,12 @@ function synapseSelfTest() {
     assert(imported.conversations.length === 1 && imported.conversations[0].messages.length === 1, 'legacy import');
     const malformed = normalizeConversationRecord({ id: '\" bad', tag: '<img>', draft: { attachments: [null] }, messages: [] });
     assert(malformed.id !== '\" bad' && !malformed.tag && malformed.draft.attachments.length === 0, 'untrusted conversation normalization');
+    const bubbleProbe = document.createElement('div');
+    setBubbleHTML(bubbleProbe, 'first', '<p>a</p>');
+    const thinkProbe = bubbleProbe.querySelector('.thinking-content');
+    setBubbleHTML(bubbleProbe, 'first second', '<p>b</p>');
+    assert(bubbleProbe.querySelector('.thinking-content') === thinkProbe, 'thinking block reused while streaming');
+    assert(thinkProbe.textContent === 'first second' && bubbleProbe.lastElementChild.textContent === 'b', 'thinking block updated in place');
     const malformedParts = normalizeConversationRecord({ messages: [{ role: 'user', content: [null, { type: 'text', text: 7 }] }, { role: 'assistant', content: 'ok', swipes: [null, 42], swipeIndex: 9 }] });
     assert(malformedParts.messages[0].content.length === 1 && malformedParts.messages[0].content[0].text === '7' && malformedParts.messages[1].swipes[1] === '42' && malformedParts.messages[1].swipeIndex === 1, 'message part normalization');
     const queued = normalizeConversationRecord({ id: 'queue-test', goal: 'g'.repeat(5000), parentConversationId: 'queue-test', queuedFollowUps: [
