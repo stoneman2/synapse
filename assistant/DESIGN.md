@@ -2,19 +2,20 @@
 name: Synapse
 description: Privacy-first client-side AI chat for simple assistant, chatbot, and roleplay workflows.
 colors:
-  app-bg: "#0a0a0f"
-  panel-bg: "#14141a"
-  border-subtle: "#ffffff14"
-  surface-hover: "#ffffff0d"
-  surface-raised: "#ffffff14"
+  app-bg: "#0f1310"
+  panel-bg: "#151a16"
+  border-subtle: "#2a332c"
+  surface-hover: "#91a89512"
+  surface-raised: "#1a211b"
+  message-user: "#223128"
   overlay-soft: "#ffffff1a"
   overlay-medium: "#ffffff26"
   overlay-strong: "#ffffff40"
-  text-primary: "#fffffff2"
-  text-secondary: "#ffffff99"
-  text-on-accent: "#f7f8ff"
-  primary: "#6366f1"
-  primary-hover: "#818cf8"
+  text-primary: "#d8ded7"
+  text-secondary: "#8d998e"
+  text-on-accent: "#111611"
+  primary: "#789a7f"
+  primary-hover: "#8aae91"
   danger: "#ef4444"
   success: "#22c55e"
   warning: "#eab308"
@@ -53,8 +54,8 @@ rounded:
   xs: "4px"
   sm: "6px"
   md: "8px"
-  lg: "12px"
-  xl: "16px"
+  lg: "9px"
+  xl: "12px"
   pill: "999px"
   round: "50%"
 spacing:
@@ -98,16 +99,16 @@ components:
     rounded: "{rounded.md}"
     padding: "12px"
   message-user:
-    backgroundColor: "{colors.primary}"
-    textColor: "{colors.text-on-accent}"
-    typography: "{typography.body}"
-    rounded: "{rounded.xl}"
-    padding: "12px 16px"
-  message-assistant:
-    backgroundColor: "{colors.surface-raised}"
+    backgroundColor: "{colors.message-user}"
     textColor: "{colors.text-primary}"
     typography: "{typography.body}"
-    rounded: "{rounded.xl}"
+    rounded: "{rounded.lg}"
+    padding: "12px 16px"
+  message-assistant:
+    backgroundColor: "transparent"
+    textColor: "{colors.text-primary}"
+    typography: "{typography.body}"
+    rounded: "{rounded.xs}"
     padding: "12px 16px"
   modal-panel:
     backgroundColor: "{colors.panel-bg}"
@@ -129,7 +130,7 @@ The system is dark by default because the app supports long chat sessions, code 
 This system explicitly rejects the PRODUCT.md anti-references: it must not feel janky, clunky, visually noisy, or like a demo glued together from disconnected tools. Advanced features can be dense, but the main send-and-reply loop must remain effortless.
 
 **Key Characteristics:**
-- Compact app-shell structure with a persistent sidebar, toolbar, message stream, and input dock.
+- Three-pane workbench with conversations, chat, and a collapsible context panel.
 - Restrained color with a single primary accent for action, selection, focus, and active state.
 - Soft tonal layering instead of heavy decoration.
 - Rounded, touch-friendly controls that remain professional rather than playful.
@@ -137,18 +138,19 @@ This system explicitly rejects the PRODUCT.md anti-references: it must not feel 
 
 ## 2. Colors
 
-The palette is a restrained dark product system: tinted near-black surfaces, translucent white layers, and a cool indigo primary accent.
+The palette is a restrained dark product system: forest-tinted near-black surfaces, green-gray dividers, and a muted sage primary accent.
 
 ### Primary
-- **Command Indigo** (`primary`): Used for primary actions, active filters, selected state, user messages, focus borders, and status emphasis.
-- **Lifted Indigo** (`primary-hover`): Used only for hover and active feedback on primary actions and accent links.
+- **Moss Control** (`primary`): Used for primary actions, active filters, focus borders, links, and status emphasis.
+- **Lifted Sage** (`primary-hover`): Used only for hover and active feedback on primary actions and accent links.
 
 ### Neutral
-- **Workbench Black** (`app-bg`): The main page background behind the chat.
-- **Panel Charcoal** (`panel-bg`): Sidebar, toolbar, input dock, modal, dropdown, and persistent shell surfaces.
+- **Forest Ink** (`app-bg`): The main page background behind the chat.
+- **Canopy Panel** (`panel-bg`): Sidebar, context panel, toolbar, input dock, modal, dropdown, and persistent shell surfaces.
 - **Soft Border** (`border-subtle`): Default divider, card border, form border, and panel separation.
 - **Hover Veil** (`surface-hover`): Hover surfaces, secondary buttons, compact search fields, and inactive chips.
-- **Raised Surface** (`surface-raised`): Assistant messages, file badges, cards, and local panels that need one step of depth.
+- **Raised Surface** (`surface-raised`): File badges and local panels that need one step of depth.
+- **Toned User Surface** (`message-user`): A quiet dark-green surface that separates user messages without turning them into bright callouts.
 - **Primary Text** (`text-primary`): Main reading color for messages, titles, labels with emphasis, and field values.
 - **Secondary Text** (`text-secondary`): Supporting copy, hints, timestamps, inactive controls, and metadata.
 - **Accent Text** (`text-on-accent`): Text on primary buttons and user messages. Future extensions should keep it slightly tinted rather than introducing raw white.
@@ -159,7 +161,7 @@ The palette is a restrained dark product system: tinted near-black surfaces, tra
 - **Warning Amber** (`warning`): Tag colors, search highlights, caution labels, and soft warning state.
 
 ### Named Rules
-**The One Accent Rule.** Command Indigo carries action, selection, and focus. Do not add decorative accent colors to inactive UI.
+**The One Accent Rule.** Moss Control carries action, selection, and focus. Do not add decorative accent colors to inactive UI.
 
 **The Theme Variable Rule.** New surfaces must use semantic CSS variables, not hard-coded per-theme colors, so the built-in theme gallery and custom theme editor keep working.
 
@@ -208,39 +210,39 @@ Components are compact, predictable, and consistent. The same action shape and f
 
 ### Buttons
 - **Shape:** Gently rounded controls, small and medium radii (`6px` to `12px`) depending on density.
-- **Primary:** Command Indigo background with Accent Text, semibold label, and compact padding (`10px 20px` for send, `12px` for modal buttons).
-- **Hover / Focus:** Hover shifts to Lifted Indigo. Keyboard focus uses a clear 2px accent outline with 2px offset.
+- **Primary:** Moss Control background with dark Accent Text, semibold label, and compact padding (`10px 20px` for send, `12px` for modal buttons).
+- **Hover / Focus:** Hover shifts to Lifted Sage. Keyboard focus uses a clear 2px accent outline with 2px offset.
 - **Secondary / Ghost:** Secondary buttons use Hover Veil with Primary Text. Icon buttons stay transparent until hover and use 44px touch targets on mobile.
 
 ### Chips
 - **Style:** Conversation tags, tag filters, model override badges, and file badges use small rounded forms with dense labels.
-- **State:** Selected chips use Command Indigo with Accent Text. Unselected chips use transparent or Hover Veil surfaces with Soft Border.
+- **State:** Selected chips use Moss Control with Accent Text. Unselected chips use transparent or Hover Veil surfaces with Soft Border.
 
 ### Cards / Containers
-- **Corner Style:** Default containers use medium corners (`8px`). Modals and message bubbles use larger corners (`16px`) to soften long-session reading.
-- **Background:** Use Panel Charcoal for shell containers, Hover Veil for inactive cards, and Raised Surface for assistant messages and file badges.
+- **Corner Style:** Default containers use compact corners (`6px` to `9px`). Modals can use `12px`; assistant messages need no container shape.
+- **Background:** Use Canopy Panel for shell containers, Hover Veil for inactive controls, and Raised Surface only when content needs separation.
 - **Shadow Strategy:** No shadow at rest. Floating menus and overlays use the elevation vocabulary above.
 - **Border:** Use Soft Border for panel separation and form-control outlines.
 - **Internal Padding:** Dense cards use `8px` to `12px`; modals use `28px`.
 
 ### Inputs / Fields
 - **Style:** Inputs use Hover Veil backgrounds, Soft Border strokes, Figtree body text, and medium rounding (`8px` to `12px`).
-- **Focus:** Border changes to Command Indigo. Focus-visible outline remains visible for keyboard users.
+- **Focus:** Border changes to Moss Control. Focus-visible outline remains visible for keyboard users.
 - **Error / Disabled:** Error uses Danger Red. Disabled controls lower opacity and keep their shape so layout does not shift.
 
 ### Navigation
-- **Style:** Sidebar plus top toolbar is the default app shell. Navigation is compact, text-first, and scan-friendly.
-- **States:** Active conversations receive a muted indigo background and Primary Text. Hover states use Hover Veil.
-- **Mobile:** The sidebar becomes an overlay with safe-area padding. Touch controls expand to at least 44px where practical.
+- **Style:** A conversation sidebar, central chat, and Context panel form the desktop shell. Navigation is compact, text-first, and scan-friendly.
+- **States:** Active conversations receive a muted moss background and Primary Text. Hover states use Hover Veil.
+- **Mobile:** The conversation and Context panels become mutually exclusive drawers with safe-area padding. Touch controls expand to at least 44px where practical.
 
 ### Messages
-- **User Bubble:** Command Indigo with Accent Text, right-aligned, large rounded corners with a tighter tail corner.
-- **Assistant Bubble:** Raised Surface with Primary Text, left-aligned, large rounded corners with a tighter tail corner.
+- **User Bubble:** Toned User Surface with Primary Text, right-aligned, and compact rounded corners.
+- **Assistant Message:** Blends into the chat background so long responses read as documents rather than stacked cards.
 - **Actions:** Message actions are quiet until hover on pointer devices and visible on touch devices.
 - **Rich Content:** Code, tables, LaTeX, Mermaid, files, images, tool blocks, and thinking blocks inherit the same tonal layering.
 
 ### Modals And Popups
-- **Structure:** Modals use Panel Charcoal, Soft Border, large rounding, and a blurred overlay.
+- **Structure:** Modals use Canopy Panel, Soft Border, compact rounding, and a plain dimmed overlay.
 - **Density:** Settings tabs, form fields, and section dividers should remain compact enough for power users.
 - **Behavior:** Prefer inline panels where possible, but existing setup, settings, shortcuts, and popups should keep clear focus trapping and escape behavior.
 

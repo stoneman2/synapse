@@ -18,6 +18,12 @@ let _suppressScrollFlag = false;
 let pendingAttachments = [];
 let voiceRec = null;
 let modelOverride = null;
+const armedFollowUpConversationIds = new Set();
+let processingFollowUpConversationId = null;
+let queueingFollowUp = false;
+let contextSourceMessage = null;
+let contextPanelFocusReturn = null;
+let contextPanelConversationId = null;
 let mentionActive = false;
 let mentionIdx = 0;
 let activeTagFilter = null;
@@ -35,14 +41,13 @@ const modalFocusReturn = new WeakMap();
 let transientDialogFocusReturn = null;
 let transientDialogClose = null;
 let toolbarMenuFocusReturn = null;
-let composerToolsFocusReturn = null;
 let globalSearchDismiss = null;
 let debugLogBuffer = [];
 let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-08-24T11:13:33+08:00',
+  buildDate: '2026-08-25T13:43:12+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -206,8 +211,14 @@ const PROVIDER_PRESETS = {
 };
 
 const COMMAND_REGISTRY = [
-  { name: 'search', aliases: ['web', 's'], usage: '/search <query>', description: 'Search the web directly' },
-  { name: 'files', aliases: ['file', 'docs', 'doc'], usage: '/files <query>', description: 'Search attached text locally' }
+  { name: 'search', aliases: ['web', 's'], usage: '/search <query>', description: 'Search the web directly', requiresQuery: true },
+  { name: 'files', aliases: ['file', 'docs', 'doc'], usage: '/files <query>', description: 'Search attached text locally', requiresQuery: true },
+  { name: 'goal', aliases: [], usage: '/goal <text>', description: 'Set this conversation goal', requiresQuery: true },
+  { name: 'context', aliases: [], usage: '/context', description: 'Open the request context', requiresQuery: false },
+  { name: 'summary', aliases: [], usage: '/summary', description: 'Open the conversation summary', requiresQuery: false },
+  { name: 'tools', aliases: [], usage: '/tools', description: 'Open conversation tools', requiresQuery: false },
+  { name: 'settings', aliases: [], usage: '/settings', description: 'Open settings', requiresQuery: false },
+  { name: 'projects', aliases: [], usage: '/projects', description: 'Open projects', requiresQuery: false }
 ];
 
 const SOURCE_CITATION_INSTRUCTION = 'When you use web sources, cite them inline as [1], [2], etc. using the numbered results supplied. Do not invent source numbers.';
@@ -475,6 +486,24 @@ function providerRequiresKey(settings = {}) {
   return getProviderPreset(inferProviderKey(settings)).keyRequired;
 }
 
+function normalizeQueuedFollowUps(raw) {
+  const used = new Set();
+  return (Array.isArray(raw) ? raw : []).filter(item => item && typeof item === 'object').slice(0, 20).map((item, index) => {
+    let id = String(item.id || '');
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(id) || used.has(id)) {
+      id = 'followup_' + (Number(item.createdAt) || Date.now()) + '_' + index;
+    }
+    used.add(id);
+    return {
+      id,
+      text: String(item.text || '').slice(0, 200000),
+      attachments: cloneDraftAttachments(item.attachments),
+      modelOverride: String(item.modelOverride || '').slice(0, 300) || null,
+      createdAt: Number(item.createdAt) || Date.now()
+    };
+  }).filter(item => item.text.trim() || item.attachments.length);
+}
+
 function normalizeConversationRecord(raw) {
   const conv = raw && typeof raw === 'object' ? raw : {};
   const normalized = { ...conv };
@@ -538,6 +567,13 @@ function normalizeConversationRecord(raw) {
   if (normalized.characterAvatar) normalized.characterAvatar = safeMediaUrl(normalized.characterAvatar);
   if (!TAG_COLORS.some(tag => tag.name === normalized.tag)) delete normalized.tag;
   if (!normalized.toolPolicy || typeof normalized.toolPolicy !== 'object') normalized.toolPolicy = null;
+  normalized.goal = String(normalized.goal || '').slice(0, 4000);
+  normalized.parentConversationId = String(normalized.parentConversationId || '');
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(normalized.parentConversationId) || normalized.parentConversationId === normalized.id) delete normalized.parentConversationId;
+  if (!Number.isInteger(normalized.forkMessageIndex) || normalized.forkMessageIndex < 0) delete normalized.forkMessageIndex;
+  normalized.forkedAt = Number(normalized.forkedAt);
+  if (!Number.isFinite(normalized.forkedAt) || normalized.forkedAt <= 0) delete normalized.forkedAt;
+  normalized.queuedFollowUps = normalizeQueuedFollowUps(normalized.queuedFollowUps);
   if (!normalized.draft || typeof normalized.draft !== 'object') normalized.draft = { text: '', attachments: [] };
   normalized.draft.attachments = cloneDraftAttachments(normalized.draft.attachments);
   return normalized;
@@ -1002,7 +1038,7 @@ function showToast(message, type = 'info', duration = 3000, action = null) {
 // Theme Presets
 // ============================================
 const themePresets = {
-  dark:       { bg:'#0a0a0f', sidebar:'#14141a', cardBorder:'rgba(255,255,255,0.08)', textPrimary:'rgba(255,255,255,0.95)', textSecondary:'rgba(255,255,255,0.6)', accent:'#6366f1', accentHover:'#818cf8', msgUser:'#6366f1', msgAssistant:'rgba(255,255,255,0.08)' },
+  dark:       { bg:'#0f1310', sidebar:'#151a16', cardBorder:'#2a332c', textPrimary:'#d8ded7', textSecondary:'#8d998e', accent:'#789a7f', accentHover:'#8aae91', msgUser:'#223128', msgAssistant:'transparent', borderRadius:'9px', msgMaxWidth:'76%', codeBg:'#111713' },
   light:      { bg:'#f5f5f7', sidebar:'#eeeef2', cardBorder:'rgba(0,0,0,0.1)', textPrimary:'rgba(0,0,0,0.9)', textSecondary:'rgba(0,0,0,0.5)', accent:'#6366f1', accentHover:'#818cf8', msgUser:'#6366f1', msgAssistant:'rgba(0,0,0,0.05)' },
   nord:       { bg:'#2e3440', sidebar:'#3b4252', cardBorder:'#434c5e', textPrimary:'#eceff4', textSecondary:'#d8dee9', accent:'#88c0d0', accentHover:'#8fbcbb', msgUser:'#5e81ac', msgAssistant:'#3b4252' },
   catppuccin: { bg:'#1e1e2e', sidebar:'#313244', cardBorder:'#45475a', textPrimary:'#cdd6f4', textSecondary:'#a6adc8', accent:'#cba6f7', accentHover:'#b4befe', msgUser:'#cba6f7', msgAssistant:'#313244' },
@@ -1843,70 +1879,66 @@ function openSearchTest() {
 }
 
 function openSourcesDrawer(msg) {
-  document.querySelectorAll('.char-info-overlay,.char-info-popup').forEach(el => el.remove());
+  contextSourceMessage = msg || null;
+  renderContextSources(contextSourceMessage);
+  openContextSection('sourcesSection');
+}
+
+function renderContextSources(msg = contextSourceMessage) {
+  const body = document.getElementById('contextSourcesBody');
+  const status = document.getElementById('sourcesStatus');
+  if (!body) return;
+  if (!msg) {
+    msg = [...messages].reverse().find(message => message.role === 'assistant' && (
+      message.swipeSources?.[message.swipeIndex || 0]?.length || message.swipeToolUse?.[message.swipeIndex || 0]?.length
+    ));
+  }
+  contextSourceMessage = msg || null;
   const swipeIdx = msg?.swipeIndex || 0;
-  const toolBlocks = msg?.swipeToolUse?.[swipeIdx] || [];
-  const persistedSources = msg?.swipeSources?.[swipeIdx] || [];
-
-  const overlay = document.createElement('div');
-  overlay.className = 'char-info-overlay';
-  const popup = document.createElement('div');
-  popup.className = 'char-info-popup';
-
-  let html = '<h3 id="sourcesDrawerTitle">Sources</h3>';
-  if (persistedSources.length) {
-    persistedSources.forEach(source => {
-      const title = escapeHTML(source.title || source.url || 'Source');
-      const safeUrl = safeHttpUrl(source.url);
-      const snippet = source.snippet ? escapeHTML(source.snippet) : '';
-      html += '<div class="source-drawer-item"><span class="source-number">[' + Number(source.number || 0) + ']</span>' +
-        (safeUrl ? '<a href="' + escapeHTML(safeUrl) + '" target="_blank" rel="noopener">' + title + '</a>' : '<span>' + title + '</span>') +
-        (snippet ? '<div class="source-snippet">' + snippet + '</div>' : '') + '</div>';
-    });
-  } else if (!toolBlocks.length || toolBlocks.every(tb => tb.type === 'url_fetch' ? (!tb.content && !tb.error) : !(tb.results || []).length)) {
-    html += '<div style="color:var(--text-secondary);font-size:0.85em;margin-bottom:12px">No sources available.</div>';
+  const persisted = msg?.swipeSources?.[swipeIdx] || [];
+  const sources = persisted.length ? persisted : (msg?.swipeToolUse?.[swipeIdx] || []).flatMap(block => {
+    if (block.type === 'url_fetch' && (block.url || block.content || block.error)) {
+      return [{ number: 0, title: block.url || 'Fetched page', url: block.url || '', snippet: block.error || String(block.content || '').slice(0, 500) }];
+    }
+    return (block.results || []).filter(result => result.url).map(result => ({
+      number: result.sourceNumber || 0,
+      title: result.title || result.url,
+      url: result.url,
+      snippet: result.snippet || ''
+    }));
+  });
+  body.replaceChildren();
+  if (!sources.length) {
+    const empty = document.createElement('p');
+    empty.textContent = 'No sources for this chat yet.';
+    body.appendChild(empty);
   } else {
-    toolBlocks.forEach(tb => {
-      // --- url_fetch blocks ---
-      if (tb.type === 'url_fetch') {
-        const safeUrl = safeHttpUrl(tb.url);
-        const displayUrl = escapeHTML((safeUrl || String(tb.url || '')).replace(/^https?:\/\//, '').replace(/\/+$/, ''));
-        html += '<div style="margin:10px 0 6px;font-weight:600;font-size:0.9em">' + displayUrl + '</div>';
-        if (tb.error) {
-          html += '<div style="padding:10px;border:1px solid var(--card-border);border-radius:10px;background:var(--hover);margin-bottom:8px;color:var(--error-color,#ff7777);font-size:0.85em">' + escapeHTML(tb.error) + '</div>';
-        } else if (tb.content) {
-          const preview = escapeHTML(tb.content.slice(0, 500));
-          html += '<div style="padding:10px;border:1px solid var(--card-border);border-radius:10px;background:var(--hover);margin-bottom:8px">' +
-            (safeUrl ? '<a href="' + escapeHTML(safeUrl) + '" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;font-weight:600">' + displayUrl + '</a>' : '<span style="font-weight:600">' + displayUrl + '</span>') +
-            '<div style="color:var(--text-secondary);font-size:0.8em;margin-top:6px;white-space:pre-wrap;max-height:150px;overflow-y:auto">' + preview + (tb.content.length > 500 ? '\u2026' : '') + '</div>' +
-          '</div>';
-        }
-        return;
+    sources.forEach((source, index) => {
+      const item = document.createElement('div');
+      item.className = 'source-drawer-item';
+      const number = document.createElement('span');
+      number.className = 'source-number';
+      number.textContent = '[' + Number(source.number || index + 1) + ']';
+      item.appendChild(number);
+      const safeUrl = safeHttpUrl(source.url);
+      const title = document.createElement(safeUrl ? 'a' : 'span');
+      title.textContent = source.title || source.url || 'Source';
+      if (safeUrl) {
+        title.href = safeUrl;
+        title.target = '_blank';
+        title.rel = 'noopener';
       }
-      // --- web_search blocks ---
-      const results = tb.results || [];
-      if (!results.length) return;
-      const q = escapeHTML(tb.query || 'Search');
-      html += '<div style="margin:10px 0 6px;font-weight:600;font-size:0.9em">🔎 ' + q + '</div>';
-      results.forEach(r => {
-        const title = escapeHTML(r.title || r.url || 'Result');
-        const safeUrl = safeHttpUrl(r.url);
-        const displayUrl = escapeHTML((safeUrl || String(r.url || '')).replace(/^https?:\/\//, '').replace(/\/+$/, ''));
-        const snippet = r.snippet ? escapeHTML(r.snippet) : '';
-        html += '<div style="padding:10px;border:1px solid var(--card-border);border-radius:10px;background:var(--hover);margin-bottom:8px">' +
-          (safeUrl ? '<a href="' + escapeHTML(safeUrl) + '" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none;font-weight:600">' + title + '</a>' : '<span style="font-weight:600">' + title + '</span>') +
-          (displayUrl ? '<div style="color:var(--text-secondary);font-size:0.75em;margin-top:4px">' + displayUrl + '</div>' : '') +
-          (snippet ? '<div style="color:var(--text-secondary);font-size:0.85em;margin-top:6px">' + snippet + '</div>' : '') +
-        '</div>';
-      });
+      item.appendChild(title);
+      if (source.snippet) {
+        const snippet = document.createElement('div');
+        snippet.className = 'source-snippet';
+        snippet.textContent = source.snippet;
+        item.appendChild(snippet);
+      }
+      body.appendChild(item);
     });
   }
-
-  html += '<button class="btn btn-primary" type="button" data-close-sources style="width:100%;padding:8px">Close</button>';
-  popup.innerHTML = html;
-
-  const close = openTransientDialog(overlay, popup, popup.querySelector('[data-close-sources]'));
-  popup.querySelector('[data-close-sources]').onclick = close;
+  if (status) status.textContent = sources.length ? String(sources.length) : 'None';
 }
 
 function buildSnippet(text, idx, windowSize = 90) {
@@ -2005,81 +2037,63 @@ function openFileSearch() {
 }
 
 function openSummaryModal() {
-  document.querySelectorAll('.char-info-overlay,.char-info-popup').forEach(el => el.remove());
+  renderContextPanel();
+  openContextSection('summarySection');
+}
+
+function saveConversationSummary() {
   const conv = getActiveConv();
+  const input = document.getElementById('summaryText');
+  if (!conv || !input || readOnlyShare) return;
+  conv.summary = input.value.trim();
+  conv.summaryUpdatedAt = Date.now();
+  conv.updatedAt = conv.summaryUpdatedAt;
+  saveConversations();
+  renderContextPanel();
+  updateTokenInfo();
+  showToast('Summary saved.', 'success');
+}
 
-  const overlay = document.createElement('div');
-  overlay.className = 'char-info-overlay';
-  const popup = document.createElement('div');
-  popup.className = 'char-info-popup';
+function clearConversationSummary() {
+  const conv = getActiveConv();
+  if (!conv || readOnlyShare) return;
+  conv.summary = '';
+  conv.summaryUpdatedAt = null;
+  conv.updatedAt = Date.now();
+  saveConversations();
+  renderContextPanel();
+  updateTokenInfo();
+  showToast('Summary cleared.', 'info');
+}
 
-  popup.innerHTML =
-    '<h3 id="summaryDialogTitle">Conversation Summary</h3>' +
-    '<div style="color:var(--text-secondary);font-size:0.85em;margin-bottom:12px">Generate a compact summary and keep it in the system prompt for this chat.</div>' +
-    '<textarea id="summaryText" aria-label="Conversation summary" style="width:100%;min-height:160px;resize:vertical;font-family:inherit;font-size:0.9em;background:var(--hover);border:1px solid var(--card-border);border-radius:8px;color:var(--text-primary);padding:10px;outline:none"></textarea>' +
-    '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">' +
-      '<button class="btn btn-primary" id="summaryGen" style="flex:1;padding:8px">Generate</button>' +
-      '<button class="btn btn-secondary" id="summarySave" style="flex:1;padding:8px">Save</button>' +
-      '<button class="btn btn-secondary" id="summaryClear" style="flex:1;padding:8px">Clear</button>' +
-      '<button class="btn btn-secondary" id="summaryClose" style="flex:1;padding:8px">Close</button>' +
-    '</div>';
-
-  const ta = popup.querySelector('#summaryText');
-  const genBtn = popup.querySelector('#summaryGen');
-  const saveBtn = popup.querySelector('#summarySave');
-  const clearBtn = popup.querySelector('#summaryClear');
-  const closeBtn = popup.querySelector('#summaryClose');
-  popup.setAttribute('aria-labelledby', 'summaryDialogTitle');
-  const close = openTransientDialog(overlay, popup, ta);
-
-  ta.value = conv?.summary || '';
-
-  closeBtn.onclick = close;
-  clearBtn.onclick = () => {
-    if (!conv) return;
-    conv.summary = '';
-    conv.summaryUpdatedAt = null;
-    conv.updatedAt = Date.now();
-    saveConversations();
-    ta.value = '';
-    showToast('Summary cleared.', 'info');
-  };
-  saveBtn.onclick = () => {
-    if (!conv) return;
-    conv.summary = ta.value.trim();
+async function generateConversationSummary() {
+  const conv = getActiveConv();
+  const genBtn = document.getElementById('summaryGen');
+  if (!conv || !genBtn || readOnlyShare) return;
+  const baseUrl = (localStorage.getItem('llmProxyUrl') || '').trim();
+  const apiKey = getApiKey();
+  if (!baseUrl || (providerRequiresKey() && !apiKey)) { showToast('Set up a provider first.', 'error'); return; }
+  const conversationId = conv.id;
+  genBtn.disabled = true;
+  genBtn.textContent = 'Generating...';
+  try {
+    const summary = await callApiNonStreaming([
+      { role: 'system', content: 'Summarize the conversation into a concise, structured note the assistant can use for context. Focus on facts, preferences, and open tasks. Keep it under 200 words.' },
+      { role: 'user', content: buildConversationTranscript(40, conv.messages) }
+    ]);
+    const cleaned = (summary || '').trim();
+    conv.summary = cleaned;
     conv.summaryUpdatedAt = Date.now();
     conv.updatedAt = conv.summaryUpdatedAt;
     saveConversations();
-    showToast('Summary saved.', 'success');
-  };
-  genBtn.onclick = async () => {
-    if (!conv) return;
-    const baseUrl = (localStorage.getItem('llmProxyUrl') || '').trim();
-    const apiKey = getApiKey();
-    if (!baseUrl || !apiKey) { showToast('Set API Base URL and Key first.', 'error'); return; }
-    genBtn.disabled = true;
-    genBtn.textContent = 'Generating...';
-    try {
-      const transcript = buildConversationTranscript(40);
-      const prompt = [
-        { role: 'system', content: 'Summarize the conversation into a concise, structured note the assistant can use for context. Focus on facts, preferences, and open tasks. Keep it under 200 words.' },
-        { role: 'user', content: transcript }
-      ];
-      const summary = await callApiNonStreaming(prompt);
-      const cleaned = (summary || '').trim();
-      ta.value = cleaned;
-      conv.summary = cleaned;
-      conv.summaryUpdatedAt = Date.now();
-      conv.updatedAt = conv.summaryUpdatedAt;
-      saveConversations();
-      showToast('Summary updated.', 'success');
-    } catch (e) {
-      showToast('Summary failed: ' + (e.message || 'Unknown error'), 'error');
-    } finally {
-      genBtn.disabled = false;
-      genBtn.textContent = 'Generate';
-    }
-  };
+    if (activeConvId === conversationId) renderContextPanel();
+    showToast('Summary updated.', 'success');
+  } catch (e) {
+    showToast('Summary failed: ' + (e.message || 'Unknown error'), 'error');
+  } finally {
+    genBtn.disabled = false;
+    genBtn.textContent = 'Generate';
+  }
 }
 
 function openStatusPanel() {
@@ -2171,7 +2185,7 @@ function renderCommandMenu(ta, query = '') {
     item.querySelector('span').textContent = command.description;
     item.querySelector('small').textContent = command.usage + (command.aliases.length ? ' · aliases: ' + command.aliases.join(', ') : '');
     item.onclick = () => {
-      ta.value = '/' + command.name + ' ';
+      ta.value = '/' + command.name + (command.requiresQuery ? ' ' : '');
       ta.focus();
       closeCommandDropdown();
       persistDraftFromUI();
@@ -2214,11 +2228,24 @@ function handleCommandKeydown(event, ta) {
 }
 
 async function handleCommand(cmd, conv) {
-  if (!cmd || !cmd.query) return;
-  if (['search', 'web', 's'].includes(cmd.cmd)) {
+  if (!cmd) return;
+  if (cmd.cmd === 'search') {
     await handleManualSearch(cmd.query, conv);
-  } else if (['files', 'file', 'docs', 'doc'].includes(cmd.cmd)) {
+  } else if (cmd.cmd === 'files') {
     await handleFileSearch(cmd.query, conv);
+  } else if (cmd.cmd === 'goal') {
+    updateConversationGoal(cmd.query, true);
+    openContextSection('goalSection');
+  } else if (cmd.cmd === 'context') {
+    await openContextPreview();
+  } else if (cmd.cmd === 'summary') {
+    openSummaryModal();
+  } else if (cmd.cmd === 'tools') {
+    toggleComposerTools();
+  } else if (cmd.cmd === 'settings') {
+    openSettings();
+  } else if (cmd.cmd === 'projects') {
+    openProjectsModal();
   }
 }
 
@@ -2289,8 +2316,8 @@ async function handleFileSearch(query, conv) {
   updateTokenInfo();
 }
 
-function buildConversationTranscript(limit = 40) {
-  const slice = messages.filter(m => m.role !== 'system');
+function buildConversationTranscript(limit = 40, sourceMessages = messages) {
+  const slice = (Array.isArray(sourceMessages) ? sourceMessages : []).filter(m => m.role !== 'system');
   const recent = slice.slice(Math.max(0, slice.length - limit));
   return recent.map(m => (m.role === 'assistant' ? 'Assistant: ' : 'User: ') + getMsgText(m)).join('\n');
 }
@@ -2615,12 +2642,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     if (e.key === 'Enter' && e.ctrlKey) {
       e.preventDefault();
-      sendMessage();
+      streaming ? queueFollowUpFromComposer() : sendMessage();
     } else if (e.key === 'Enter' && !e.shiftKey) {
       const enterSends = localStorage.getItem('llmEnterSend') !== 'false';
       if (enterSends) {
         e.preventDefault();
-        sendMessage();
+        streaming ? queueFollowUpFromComposer() : sendMessage();
       }
     }
   });
@@ -2653,8 +2680,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         e.preventDefault();
         return;
       }
-      if (document.getElementById('composerToolsPopover')) {
-        closeComposerTools();
+      const contextPanel = document.getElementById('contextPanel');
+      if (window.innerWidth <= 1100 && contextPanel && !contextPanel.classList.contains('collapsed')) {
+        toggleContextPanel(false);
+        e.preventDefault();
+        return;
+      }
+      const sidebar = document.getElementById('sidebar');
+      if (window.innerWidth <= 768 && sidebar && !sidebar.classList.contains('collapsed')) {
+        toggleSidebar(false);
         e.preventDefault();
         return;
       }
@@ -2705,7 +2739,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   document.addEventListener('click', (e) => {
-    if (!e.target.closest('#composerToolsPopover, #toolsBtn')) closeComposerTools();
     if (!e.target.closest('#commandDropdown, #chatInput')) closeCommandDropdown();
   });
 
@@ -2727,21 +2760,34 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   });
 
-  // Mobile: collapse sidebar by default
-  if (window.innerWidth <= 768) {
-    document.getElementById('sidebar').classList.add('collapsed');
-  }
-  // Keep the sidebar overlay state sane when the viewport crosses the mobile
-  // breakpoint (rotation, window resize): otherwise the sidebar sits open over
-  // the chat with no scrim.
+  toggleSidebar(window.innerWidth > 768, false);
+  toggleContextPanel(window.innerWidth > 1100 && localStorage.getItem('assistantContextPanelOpen') !== 'false', false);
+  document.getElementById('sidebar')?.addEventListener('keydown', event => {
+    const sidebar = document.getElementById('sidebar');
+    if (window.innerWidth <= 768 && !sidebar.classList.contains('collapsed')) trapFocus(sidebar, event);
+  });
+  document.getElementById('contextPanel')?.addEventListener('keydown', event => {
+    const panel = document.getElementById('contextPanel');
+    if (window.innerWidth <= 1100 && !panel.classList.contains('collapsed')) trapFocus(panel, event);
+  });
+  window.addEventListener('pagehide', () => armedFollowUpConversationIds.clear());
+  let previousLayoutWidth = window.innerWidth;
   window.addEventListener('resize', () => {
-    const sb = document.getElementById('sidebar');
-    const overlay = document.getElementById('sidebarOverlay');
-    if (window.innerWidth <= 768) {
-      if (!sb.classList.contains('collapsed') && !overlay.classList.contains('open')) sb.classList.add('collapsed');
-    } else {
-      overlay.classList.remove('open');
+    const width = window.innerWidth;
+    if (previousLayoutWidth > 768 && width <= 768) {
+      toggleSidebar(false, false);
+      toggleContextPanel(false, false);
+    } else if (previousLayoutWidth > 1100 && width <= 1100) {
+      toggleContextPanel(false, false);
+    } else if (previousLayoutWidth <= 768 && width > 768) {
+      toggleSidebar(true, false);
     }
+    if (previousLayoutWidth <= 1100 && width > 1100 && localStorage.getItem('assistantContextPanelOpen') !== 'false') {
+      toggleContextPanel(true, false);
+    }
+    if (window.innerWidth > 768) document.getElementById('sidebarOverlay')?.classList.remove('open');
+    if (window.innerWidth > 1100) document.getElementById('contextOverlay')?.classList.remove('open');
+    previousLayoutWidth = width;
   });
 
   // Scroll-to-bottom FAB
@@ -4000,6 +4046,7 @@ function initConversationChannel() {
 }
 
 function refreshConversationStateAfterExternalChange() {
+  armedFollowUpConversationIds.clear();
   if (!conversations.length) {
     const conv = { id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
     conversations.push(conv);
@@ -4104,6 +4151,10 @@ function migrateLegacyBranches(convs, usedIds) {
           updatedAt: now
         });
         delete fork.draft;
+        fork.queuedFollowUps = [];
+        fork.parentConversationId = conv.id;
+        fork.forkMessageIndex = messageIndex;
+        fork.forkedAt = now;
         delete fork.shareGistId;
         delete fork.shareUrl;
         delete fork.shareId;
@@ -4191,6 +4242,7 @@ function restoreActiveDraft() {
   const conv = getActiveConv();
   if (!input || !conv) return;
   const draft = conv.draft || {};
+  clearModelOverride();
   input.value = draft.text || '';
   pendingAttachments = cloneDraftAttachments(draft.attachments);
   renderPreviews();
@@ -4198,6 +4250,7 @@ function restoreActiveDraft() {
   input.style.height = Math.min(input.scrollHeight, 150) + 'px';
   updateTokenInfo();
   updateSendBtnState();
+  renderFollowUpQueue();
 }
 
 function migratePersonaField(convs) {
@@ -4324,7 +4377,8 @@ function createConversation(projectId) {
   updateCharacterUI();
   restoreActiveDraft();
   announce('New conversation created.');
-  if (window.innerWidth <= 768) toggleSidebar();
+  if (window.innerWidth <= 768) toggleSidebar(false);
+  if (window.innerWidth <= 1100) toggleContextPanel(false, false);
 }
 
 function switchConversation(id) {
@@ -4342,7 +4396,8 @@ function switchConversation(id) {
   updateCharacterUI();
   restoreActiveDraft();
   announce('Opened conversation ' + (conv.title || 'conversation') + '.');
-  if (window.innerWidth <= 768) toggleSidebar();
+  if (window.innerWidth <= 768) toggleSidebar(false);
+  if (window.innerWidth <= 1100) toggleContextPanel(false, false);
 }
 
 function deleteConversation(id, e) {
@@ -4363,7 +4418,25 @@ function clearAllConversations() {
 // are unbounded text — the same reason conversations moved to IndexedDB).
 
 const PROJECT_DOC_CHAR_LIMIT = 20000;
+const COLLAPSED_PROJECTS_KEY = 'assistantCollapsedProjectIds';
 let _projectEditId = null;
+
+function getCollapsedProjectIds() {
+  try {
+    const value = JSON.parse(localStorage.getItem(COLLAPSED_PROJECTS_KEY) || '[]');
+    return new Set(Array.isArray(value) ? value.filter(id => typeof id === 'string') : []);
+  } catch (e) {
+    return new Set();
+  }
+}
+
+function toggleProjectCollapse(projectId) {
+  const collapsed = getCollapsedProjectIds();
+  if (collapsed.has(projectId)) collapsed.delete(projectId);
+  else collapsed.add(projectId);
+  localStorage.setItem(COLLAPSED_PROJECTS_KEY, JSON.stringify([...collapsed]));
+  renderSidebar();
+}
 
 function normalizeProjectRecord(raw, index = 0) {
   const source = raw && typeof raw === 'object' ? raw : {};
@@ -4548,6 +4621,10 @@ function duplicateConversation(id = activeConvId) {
   delete copy.shareGistId;
   delete copy.shareUrl;
   delete copy.shareId;
+  delete copy.parentConversationId;
+  delete copy.forkMessageIndex;
+  delete copy.forkedAt;
+  copy.queuedFollowUps = [];
   conversations.unshift(copy);
   activeConvId = copy.id;
   messages = copy.messages;
@@ -4566,6 +4643,7 @@ function removeConversations(ids, showUndo = true) {
   const publicCount = targets.filter(c => c.shareGistId || c.shareUrl || c.shareId).length;
   if (publicCount && !confirm(publicCount + ' selected conversation' + (publicCount === 1 ? ' has' : 's have') + ' public share IDs. Deleting locally does not revoke those links. Continue?')) return;
   const removed = targets.map(conv => ({ conv, index: conversations.indexOf(conv) }));
+  ids.forEach(id => armedFollowUpConversationIds.delete(id));
   syncRecordTombstones('conversations', targets.map(conv => conv.id));
   conversations = conversations.filter(c => !ids.includes(c.id));
   if (!conversations.length) conversations.push({ id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() });
@@ -4823,7 +4901,7 @@ function renderSidebar() {
   // Unfiled chats sort last so the existing date groups stay where they are.
   const projectSortKey = (c) => {
     const p = getProject(c.projectId);
-    return p ? p.name.toLowerCase() : '￿';
+    return p ? p.name.toLowerCase() + '\u0000' + p.id : '\uffff';
   };
   const sorted = [...visibleConversations].sort((a, b) => {
     if (a.pinned && !b.pinned) return -1;
@@ -4844,33 +4922,42 @@ function renderSidebar() {
   const monthStart = todayStart - 30 * 86400000;
 
   function getGroup(c) {
-    if (c.pinned) return 'Pinned';
+    if (c.pinned) return { key: 'pinned', label: 'Pinned', project: null };
     const p = getProject(c.projectId);
-    if (p) return '\u{1F4C1} ' + p.name;
+    if (p) return { key: 'project:' + p.id, label: p.name, project: p };
     const t = c.updatedAt || c.createdAt || 0;
-    if (t >= todayStart) return 'Today';
-    if (t >= yesterdayStart) return 'Yesterday';
-    if (t >= weekStart) return 'Last 7 Days';
-    if (t >= monthStart) return 'Last 30 Days';
-    return 'Older';
+    if (t >= todayStart) return { key: 'today', label: 'Today', project: null };
+    if (t >= yesterdayStart) return { key: 'yesterday', label: 'Yesterday', project: null };
+    if (t >= weekStart) return { key: 'week', label: 'Last 7 Days', project: null };
+    if (t >= monthStart) return { key: 'month', label: 'Last 30 Days', project: null };
+    return { key: 'older', label: 'Older', project: null };
   }
 
   let lastGroup = '';
+  const collapsedProjects = getCollapsedProjectIds();
   sorted.forEach((c, sortIdx) => {
     const group = getGroup(c);
-    if (group !== lastGroup) {
+    if (group.key !== lastGroup) {
       const header = document.createElement('div');
       header.className = 'conv-group-header';
-      header.dataset.group = group;
-      const proj = getProject(c.projectId);
-      if (proj && !c.pinned) {
+      header.dataset.group = group.key;
+      const proj = group.project;
+      if (proj) {
         header.classList.add('project-header');
         header.dataset.projectId = proj.id;
-        const label = document.createElement('span');
-        label.textContent = group;
+        const collapseBtn = document.createElement('button');
+        collapseBtn.className = 'project-collapse-btn';
+        collapseBtn.textContent = collapsedProjects.has(proj.id) ? '+' : '−';
+        collapseBtn.title = (collapsedProjects.has(proj.id) ? 'Expand ' : 'Collapse ') + proj.name;
+        collapseBtn.setAttribute('aria-label', collapseBtn.title);
+        collapseBtn.setAttribute('aria-expanded', String(!collapsedProjects.has(proj.id)));
+        collapseBtn.onclick = () => toggleProjectCollapse(proj.id);
+        const label = document.createElement('button');
+        label.className = 'project-name-btn';
+        label.textContent = proj.name;
         label.title = 'Edit project';
         label.onclick = () => openProjectsModal(proj.id);
-        header.appendChild(label);
+        header.append(collapseBtn, label);
         const addBtn = document.createElement('button');
         addBtn.className = 'project-add-btn';
         addBtn.textContent = '+';
@@ -4879,15 +4966,16 @@ function renderSidebar() {
         addBtn.onclick = (e) => { e.stopPropagation(); createConversation(proj.id); };
         header.appendChild(addBtn);
       } else {
-        header.textContent = group;
+        header.textContent = group.label;
       }
       list.appendChild(header);
-      lastGroup = group;
+      lastGroup = group.key;
     }
 
     const div = document.createElement('div');
     div.className = 'conv-item' + (c.id === activeConvId ? ' active' : '') + (c.archivedAt ? ' archived' : '');
     div.dataset.convId = c.id;
+    if (group.project) div.dataset.projectId = group.project.id;
 
     // Drag-and-drop (desktop only)
     div.draggable = conversationSort === 'manual' && !bulkMode;
@@ -5010,7 +5098,10 @@ function renderSidebar() {
     div.appendChild(title);
     const state = document.createElement('span');
     state.className = 'conv-state';
-    state.textContent = c.archivedAt ? 'Archived' : '';
+    const stateParts = [];
+    if (c.archivedAt) stateParts.push('Archived');
+    if (c.queuedFollowUps?.length) stateParts.push(c.queuedFollowUps.length + ' queued');
+    state.textContent = stateParts.join(' · ');
     if (state.textContent) div.appendChild(state);
     if (c.tag) {
       const tagEl = document.createElement('span');
@@ -5122,6 +5213,8 @@ function setTagFilter(tag) {
 function filterConversations() {
   const searchEl = document.getElementById('sidebarSearch');
   const query = searchEl ? searchEl.value.toLowerCase() : '';
+  const filtering = Boolean(query || activeTagFilter);
+  const collapsedProjects = getCollapsedProjectIds();
   const items = document.querySelectorAll('.conv-item');
   items.forEach(item => {
     const title = item.querySelector('.conv-title').textContent.toLowerCase();
@@ -5129,7 +5222,8 @@ function filterConversations() {
     const conv = conversations.find(c => c.id === convId);
     const matchesSearch = !query || title.includes(query);
     const matchesTag = !activeTagFilter || (conv && conv.tag === activeTagFilter);
-    item.style.display = (matchesSearch && matchesTag) ? '' : 'none';
+    const hiddenByCollapse = !filtering && item.dataset.projectId && collapsedProjects.has(item.dataset.projectId);
+    item.style.display = (matchesSearch && matchesTag && !hiddenByCollapse) ? '' : 'none';
   });
   // Hide empty group headers
   document.querySelectorAll('.conv-group-header').forEach(header => {
@@ -5139,7 +5233,8 @@ function filterConversations() {
       if (next.classList.contains('conv-item') && next.style.display !== 'none') hasVisible = true;
       next = next.nextElementSibling;
     }
-    header.style.display = hasVisible ? '' : 'none';
+    const collapsedProject = !filtering && header.dataset.projectId && collapsedProjects.has(header.dataset.projectId);
+    header.style.display = (hasVisible || collapsedProject) ? '' : 'none';
   });
 }
 
@@ -5147,17 +5242,64 @@ function isConversationVisibleInSidebar(conv) {
   if (!conv || (conversationView === 'archived') !== Boolean(conv.archivedAt)) return false;
   const query = document.getElementById('sidebarSearch')?.value.trim().toLowerCase() || '';
   const title = String(conv.title || '').toLowerCase();
-  return (!query || title.includes(query)) && (!activeTagFilter || conv.tag === activeTagFilter);
+  const filtering = Boolean(query || activeTagFilter);
+  const hiddenByCollapse = !filtering && !conv.pinned && conv.projectId && getCollapsedProjectIds().has(conv.projectId);
+  return !hiddenByCollapse && (!query || title.includes(query)) && (!activeTagFilter || conv.tag === activeTagFilter);
 }
 
 // ============================================
 // Sidebar Toggle
 // ============================================
-function toggleSidebar() {
+function toggleSidebar(forceOpen, persist = true) {
   const sb = document.getElementById('sidebar');
   const overlay = document.getElementById('sidebarOverlay');
-  sb.classList.toggle('collapsed');
-  overlay.classList.toggle('open', !sb.classList.contains('collapsed') && window.innerWidth <= 768);
+  const open = typeof forceOpen === 'boolean' ? forceOpen : sb.classList.contains('collapsed');
+  if (open && window.innerWidth <= 768) toggleContextPanel(false, false);
+  const trigger = document.querySelector('.toolbar-toggle');
+  if (!open && sb.contains(document.activeElement)) trigger?.focus();
+  sb.classList.toggle('collapsed', !open);
+  sb.inert = !open;
+  sb.setAttribute('aria-hidden', String(!open));
+  if (open && window.innerWidth <= 768) {
+    sb.setAttribute('role', 'dialog');
+    sb.setAttribute('aria-modal', 'true');
+  } else {
+    sb.removeAttribute('role');
+    sb.removeAttribute('aria-modal');
+  }
+  overlay.classList.toggle('open', open && window.innerWidth <= 768);
+  trigger?.setAttribute('aria-expanded', String(open));
+}
+
+function toggleContextPanel(forceOpen, persist = true) {
+  const panel = document.getElementById('contextPanel');
+  const overlay = document.getElementById('contextOverlay');
+  const trigger = document.getElementById('contextToggle');
+  if (!panel || !overlay) return;
+  const open = typeof forceOpen === 'boolean' ? forceOpen : panel.classList.contains('collapsed');
+  if (open && window.innerWidth <= 768) toggleSidebar(false, false);
+  if (open) contextPanelFocusReturn = document.activeElement;
+  if (open) panel.inert = false;
+  panel.classList.toggle('collapsed', !open);
+  panel.setAttribute('aria-hidden', String(!open));
+  if (open && window.innerWidth <= 1100) {
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+  } else {
+    panel.removeAttribute('role');
+    panel.removeAttribute('aria-modal');
+  }
+  overlay.classList.toggle('open', open && window.innerWidth <= 1100);
+  trigger?.setAttribute('aria-expanded', String(open));
+  document.getElementById('contextBtn')?.setAttribute('aria-expanded', String(open));
+  document.getElementById('toolsBtn')?.setAttribute('aria-expanded', String(open));
+  if (persist) localStorage.setItem('assistantContextPanelOpen', String(open));
+  if (open && window.innerWidth <= 1100) panel.querySelector('.context-panel-close')?.focus();
+  if (!open && contextPanelFocusReturn && document.contains(contextPanelFocusReturn)) contextPanelFocusReturn.focus();
+  if (!open) {
+    contextPanelFocusReturn = null;
+    panel.inert = true;
+  }
 }
 
 // ============================================
@@ -6114,6 +6256,9 @@ async function buildSystemMessages(conv) {
   if (msgs.length === 0) {
     msgs.push({ role: 'system', content: 'You are a helpful assistant.' });
   }
+  if (conv && typeof conv.goal === 'string' && conv.goal.trim()) {
+    msgs.push({ role: 'system', content: 'Conversation goal:\n\n' + resolveText(conv.goal.trim()) });
+  }
   // Character card system_prompt (actual instructions from the card)
   if (conv && conv.characterSystemPrompt && conv.characterSystemPrompt.trim()) {
     msgs.push({ role: 'system', content: resolveText(conv.characterSystemPrompt) });
@@ -6240,8 +6385,8 @@ function contextLimitMessage(stats) {
     formatTokenCount(stats.includedTokens + stats.maxOutput) + ' of ' + formatTokenCount(stats.contextWindow) + ' tokens). Exclude older messages or compact the conversation.';
 }
 
-function guardContextLimit(requestContext) {
-  const stats = getRequestContextStats(requestContext?.messages, requestContext?.excluded);
+function guardContextLimit(requestContext, model = localStorage.getItem('llmModel') || '') {
+  const stats = getRequestContextStats(requestContext?.messages, requestContext?.excluded, model);
   const warning = contextLimitMessage(stats);
   if (!warning) return false;
   showToast(warning, 'error', 7000);
@@ -6268,13 +6413,130 @@ async function buildContextPreviewData() {
   return { provider: getLlmProviderInfo(localStorage.getItem('llmModel') || '', detectApiFormat(localStorage.getItem('llmModel') || ''), localStorage.getItem('llmProxyUrl') || ''), model: localStorage.getItem('llmModel') || '(not set)', systemMessages: built.systemMessages, included: built.included, excluded: all.excluded, draft: built.draft, attachments, stats };
 }
 
+function openContextSection(sectionId) {
+  toggleContextPanel(true);
+  const section = document.getElementById(sectionId);
+  if (section) {
+    section.open = true;
+    requestAnimationFrame(() => section.scrollIntoView({ block: 'nearest', behavior: getScrollBehavior() }));
+  }
+}
+
+function updateConversationGoal(value, immediate = false) {
+  const conv = getActiveConv();
+  if (!conv || readOnlyShare) return;
+  const next = String(value || '').slice(0, 4000);
+  if (conv.goal === next) return;
+  conv.goal = next;
+  conv.updatedAt = Date.now();
+  const input = document.getElementById('conversationGoal');
+  if (input && input.value !== next) input.value = next;
+  const status = document.getElementById('goalStatus');
+  if (status) status.textContent = next.trim() ? 'Active' : 'Optional';
+  if (immediate) saveConversations();
+  else debouncedSave();
+  updateTokenInfo();
+}
+
+async function saveConversationTools() {
+  const conv = getActiveConv();
+  if (!conv || readOnlyShare) return;
+  conv.toolPolicy = {
+    webSearch: Boolean(document.getElementById('chatToolWebSearch')?.checked),
+    urlFetch: Boolean(document.getElementById('chatToolUrlFetch')?.checked),
+    confirm: Boolean(document.getElementById('chatToolConfirm')?.checked)
+  };
+  conv.updatedAt = Date.now();
+  await saveConversationImmediately();
+  renderContextPanel();
+  updateTokenInfo();
+  announce('Conversation tool policy saved.');
+  showToast('Tools updated for this conversation.', 'success');
+}
+
+function navigateForkConversation(id) {
+  const target = conversations.find(conv => conv.id === id);
+  if (!target) return;
+  setConversationView(target.archivedAt ? 'archived' : 'active');
+  switchConversation(id);
+}
+
+function renderContextPanel() {
+  if (readOnlyShare) return;
+  const conv = getActiveConv();
+  if (!conv) return;
+  const conversationChanged = contextPanelConversationId !== conv.id;
+  if (conversationChanged) {
+    contextPanelConversationId = conv.id;
+    contextSourceMessage = null;
+    const preview = document.getElementById('contextPreviewBody');
+    if (preview) preview.innerHTML = '<p class="setting-hint">Open this section with the Context button to build a preview.</p>';
+  }
+  const goalInput = document.getElementById('conversationGoal');
+  if (goalInput && (conversationChanged || document.activeElement !== goalInput)) goalInput.value = conv.goal || '';
+  const goalStatus = document.getElementById('goalStatus');
+  if (goalStatus) goalStatus.textContent = conv.goal?.trim() ? 'Active' : 'Optional';
+
+  const policy = getToolPolicy(conv);
+  const web = document.getElementById('chatToolWebSearch');
+  const url = document.getElementById('chatToolUrlFetch');
+  const confirm = document.getElementById('chatToolConfirm');
+  if (web) web.checked = policy.webSearch;
+  if (url) url.checked = policy.urlFetch;
+  if (confirm) confirm.checked = policy.confirm;
+  const toolsStatus = document.getElementById('toolsStatus');
+  if (toolsStatus) toolsStatus.textContent = [policy.webSearch && 'Search', policy.urlFetch && 'Fetch'].filter(Boolean).join(' + ') || 'Off';
+
+  const summary = document.getElementById('summaryText');
+  if (summary && (conversationChanged || document.activeElement !== summary)) summary.value = conv.summary || '';
+  const summaryStatus = document.getElementById('summaryStatus');
+  if (summaryStatus) summaryStatus.textContent = conv.summary?.trim() ? 'Saved' : 'Empty';
+
+  if (!conv.messages.includes(contextSourceMessage)) contextSourceMessage = null;
+  renderContextSources(contextSourceMessage);
+
+  const links = document.getElementById('contextForkLinks');
+  const forkStatus = document.getElementById('forksStatus');
+  if (links) {
+    links.replaceChildren();
+    let count = 0;
+    const addLink = (label, related) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'context-fork-link';
+      button.textContent = label + ': ' + (related.title || 'Untitled chat');
+      button.onclick = () => navigateForkConversation(related.id);
+      links.appendChild(button);
+      count++;
+    };
+    if (conv.parentConversationId) {
+      const parent = conversations.find(item => item.id === conv.parentConversationId);
+      if (parent) addLink('Parent', parent);
+      else {
+        const missing = document.createElement('p');
+        missing.textContent = 'Parent unavailable.';
+        links.appendChild(missing);
+      }
+    }
+    conversations.filter(item => item.parentConversationId === conv.id).forEach(child => addLink('Fork', child));
+    if (!links.children.length) {
+      const empty = document.createElement('p');
+      empty.textContent = 'No related conversations.';
+      links.appendChild(empty);
+    }
+    if (forkStatus) forkStatus.textContent = count ? String(count) : 'None';
+  }
+}
+
 async function openContextPreview() {
   const body = document.getElementById('contextPreviewBody');
   if (!body) return;
+  const conversationId = activeConvId;
   body.textContent = 'Building request preview...';
-  openModal('contextPreviewModal');
+  openContextSection('requestContextSection');
   try {
     const data = await buildContextPreviewData();
+    if (activeConvId !== conversationId) return;
     body.innerHTML = '';
     const summary = document.createElement('div');
     summary.className = 'context-summary';
@@ -6307,7 +6569,7 @@ async function openContextPreview() {
       body.prepend(warning);
     }
   } catch (err) {
-    body.textContent = 'Could not build preview: ' + sanitizeErrorDetail(err);
+    if (activeConvId === conversationId) body.textContent = 'Could not build preview: ' + sanitizeErrorDetail(err);
   }
 }
 
@@ -6357,6 +6619,8 @@ function maybeAddAvatar(wrapper) {
 
 function renderMessages({ preserveScroll = false } = {}) {
   closeChatSearch();
+  renderContextPanel();
+  renderFollowUpQueue();
   const area = document.getElementById('messagesArea');
   const wasAtBottom = area.scrollHeight - area.scrollTop - area.clientHeight <= 4;
   const savedScrollTop = preserveScroll && !wasAtBottom ? area.scrollTop : null;
@@ -6787,6 +7051,10 @@ function forkBranch(msgIdx) {
   });
   newConv.createdAt = now;
   newConv.updatedAt = now;
+  newConv.parentConversationId = conv.id;
+  newConv.forkMessageIndex = msgIdx;
+  newConv.forkedAt = now;
+  newConv.queuedFollowUps = [];
   delete newConv.draft;
   delete newConv.shareGistId;
   delete newConv.shareUrl;
@@ -8719,6 +8987,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     updateSendBtnState();
     activeSourceRegistry = null;
   }
+  return request.status;
 }
 
 // ============================================
@@ -8727,6 +8996,9 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
 function updateSendBtnState() {
   const btn = document.getElementById('sendBtn');
   if (!btn) return;
+  const conv = getActiveConv();
+  const queueBtn = document.getElementById('followUpQueueBtn');
+  if (queueBtn) queueBtn.disabled = readOnlyShare || !conv || (conv.queuedFollowUps || []).length >= 20 || queueingFollowUp || (sending && !streaming);
   if (streaming) {
     btn.textContent = 'Stop';
     btn.setAttribute('aria-label', 'Stop generating response');
@@ -8769,106 +9041,310 @@ function resolveWebSearchEnabled(conv = getActiveConv()) {
 }
 
 function closeComposerTools() {
-  const popover = document.getElementById('composerToolsPopover');
-  if (popover) popover.remove();
   const button = document.getElementById('toolsBtn');
   if (button) button.setAttribute('aria-expanded', 'false');
-  if (composerToolsFocusReturn && document.contains(composerToolsFocusReturn)) composerToolsFocusReturn.focus();
-  composerToolsFocusReturn = null;
 }
 
 function toggleComposerTools(event) {
   event?.stopPropagation();
-  const existing = document.getElementById('composerToolsPopover');
-  if (existing) { closeComposerTools(); return; }
-  const conv = getActiveConv();
-  if (!conv) return;
-  const policy = getToolPolicy(conv);
-  const popover = document.createElement('div');
-  popover.id = 'composerToolsPopover';
-  composerToolsFocusReturn = document.activeElement;
-  popover.className = 'composer-tools-popover';
-  popover.setAttribute('role', 'dialog');
-  popover.setAttribute('aria-label', 'Conversation tool policy');
-  popover.innerHTML =
-    '<strong>Tools for this chat</strong>' +
-    '<label><input type="checkbox" data-tool="webSearch" ' + (policy.webSearch ? 'checked' : '') + '> Web search</label>' +
-    '<label><input type="checkbox" data-tool="urlFetch" ' + (policy.urlFetch ? 'checked' : '') + '> URL fetching</label>' +
-    '<label><input type="checkbox" data-tool="confirm" ' + (policy.confirm ? 'checked' : '') + '> Ask before external tools</label>' +
-    '<small>Global Tools settings are defaults. This choice applies only to this conversation.</small>' +
-    '<div class="composer-tools-actions"><button type="button" class="btn btn-secondary" data-tool-cancel>Cancel</button><button type="button" class="btn btn-primary" data-tool-save>Save</button></div>';
-  document.querySelector('.input-row')?.appendChild(popover);
   const button = document.getElementById('toolsBtn');
   if (button) button.setAttribute('aria-expanded', 'true');
-  popover.querySelector('[data-tool-cancel]').onclick = closeComposerTools;
-  popover.addEventListener('keydown', event => {
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      closeComposerTools();
-      button?.focus();
-    }
+  openContextSection('toolsSection');
+}
+
+// ============================================
+// Follow-up queue
+// ============================================
+function renderFollowUpQueue() {
+  const conv = getActiveConv();
+  const panel = document.getElementById('followUpQueuePanel');
+  const list = document.getElementById('followUpQueueList');
+  const summary = document.getElementById('followUpQueueSummary');
+  const resume = document.getElementById('followUpQueueResume');
+  const queueBtn = document.getElementById('followUpQueueBtn');
+  if (!panel || !list || !summary || !resume || !queueBtn) return;
+  const queue = conv?.queuedFollowUps || [];
+  const armed = Boolean(conv && armedFollowUpConversationIds.has(conv.id));
+  panel.hidden = queue.length === 0;
+  queueBtn.textContent = queue.length ? 'Queue (' + queue.length + ')' : 'Queue';
+  queueBtn.disabled = readOnlyShare || !conv || queue.length >= 20 || queueingFollowUp || (sending && !streaming);
+  list.innerHTML = '';
+  queue.forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'follow-up-item';
+    const copy = document.createElement('div');
+    const text = document.createElement('strong');
+    text.textContent = item.text || 'Attachment-only message';
+    const meta = document.createElement('small');
+    const details = [];
+    if (item.attachments.length) details.push(item.attachments.length + ' attachment' + (item.attachments.length === 1 ? '' : 's'));
+    if (item.modelOverride) details.push(item.modelOverride);
+    meta.textContent = details.join(' · ') || 'Text message';
+    copy.append(text, meta);
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'icon-btn';
+    cancel.textContent = 'Remove';
+    cancel.setAttribute('aria-label', 'Remove queued follow-up');
+    cancel.onclick = () => cancelQueuedFollowUp(item.id);
+    row.append(copy, cancel);
+    list.appendChild(row);
   });
-  popover.querySelector('[data-tool-save]').onclick = async () => {
-    conv.toolPolicy = {
-      webSearch: popover.querySelector('[data-tool="webSearch"]').checked,
-      urlFetch: popover.querySelector('[data-tool="urlFetch"]').checked,
-      confirm: popover.querySelector('[data-tool="confirm"]').checked
-    };
-    conv.updatedAt = Date.now();
-    await saveConversationImmediately();
-    closeComposerTools();
-    announce('Conversation tool policy saved.');
-    showToast('Tools updated for this conversation.', 'success');
+  const state = streaming || sending ? 'after current response' : 'ready';
+  summary.textContent = queue.length + ' queued · ' + (armed ? state : 'paused');
+  resume.textContent = armed ? 'Pause' : 'Resume';
+  resume.disabled = queue.length === 0 || queueingFollowUp;
+}
+
+function restoreComposerSnapshot(conv, input, originalText, attachments, overrideModel) {
+  const restoredAttachments = cloneDraftAttachments(attachments);
+  if (!conv || activeConvId !== conv.id) {
+    if (conv) {
+      if (originalText || restoredAttachments.length) conv.draft = { text: originalText, attachments: restoredAttachments, updatedAt: Date.now() };
+      else delete conv.draft;
+      conv.updatedAt = Date.now();
+    }
+    return;
+  }
+  const currentText = input.value;
+  const separator = originalText && currentText && !/\s$/.test(originalText) ? '\n' : '';
+  input.value = originalText + separator + currentText;
+  pendingAttachments = restoredAttachments.concat(cloneDraftAttachments(pendingAttachments));
+  if (!modelOverride && overrideModel) setModelOverride(overrideModel);
+  if (input.value || pendingAttachments.length) {
+    conv.draft = { text: input.value, attachments: cloneDraftAttachments(pendingAttachments), updatedAt: Date.now() };
+  } else {
+    delete conv.draft;
+  }
+  conv.updatedAt = Date.now();
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 150) + 'px';
+  renderPreviews();
+  updateTokenInfo();
+}
+
+async function queueFollowUpFromComposer() {
+  if (readOnlyShare || queueingFollowUp) return;
+  if (sending && !streaming) {
+    showToast('Wait until the current request starts before queueing a follow-up.', 'info');
+    return;
+  }
+  const conv = getActiveConv();
+  const input = document.getElementById('chatInput');
+  if (!conv || !input) return;
+  const originalText = input.value;
+  const text = originalText.trim();
+  const attachments = cloneDraftAttachments(pendingAttachments);
+  if (!text && attachments.length === 0) {
+    showToast('Write a follow-up or attach a file first.', 'error');
+    return;
+  }
+  const command = parseCommand(text);
+  if (command) {
+    showToast('Run slash commands directly instead of queueing them.', 'error');
+    return;
+  }
+  if ((conv.queuedFollowUps || []).length >= 20) {
+    showToast('This chat already has 20 queued follow-ups.', 'error');
+    return;
+  }
+  const originalOverride = modelOverride;
+  const item = {
+    id: 'followup_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+    text,
+    attachments,
+    modelOverride: originalOverride || null,
+    createdAt: Date.now()
   };
-  popover.querySelector('[data-tool-save]').focus();
+  conv.queuedFollowUps = (conv.queuedFollowUps || []).concat(item);
+  delete conv.draft;
+  conv.updatedAt = Date.now();
+  queueingFollowUp = true;
+  input.value = '';
+  input.style.height = 'auto';
+  pendingAttachments = [];
+  document.getElementById('imagePreview').replaceChildren();
+  clearModelOverride();
+  updateSendBtnState();
+  let saved = false;
+  try {
+    await saveConversationImmediately();
+    saved = true;
+  } catch (error) {
+    conv.queuedFollowUps = (conv.queuedFollowUps || []).filter(queued => queued.id !== item.id);
+    restoreComposerSnapshot(conv, input, originalText, attachments, originalOverride);
+    showToast('Could not save the queued follow-up: ' + sanitizeErrorDetail(error), 'error');
+  } finally {
+    queueingFollowUp = false;
+    updateSendBtnState();
+  }
+  if (!saved) {
+    renderFollowUpQueue();
+    renderSidebar();
+    return;
+  }
+  if (activeConvId !== conv.id) {
+    armedFollowUpConversationIds.delete(conv.id);
+    renderSidebar();
+    return;
+  }
+  armedFollowUpConversationIds.add(conv.id);
+  renderFollowUpQueue();
+  renderSidebar();
+  announce('Follow-up queued.');
+  if (!streaming && !sending) setTimeout(() => processQueuedFollowUps(conv.id), 0);
+}
+
+async function cancelQueuedFollowUp(id) {
+  if (queueingFollowUp) return;
+  const conv = getActiveConv();
+  if (!conv) return;
+  const before = conv.queuedFollowUps || [];
+  conv.queuedFollowUps = before.filter(item => item.id !== id);
+  if (conv.queuedFollowUps.length === before.length) return;
+  const wasArmed = armedFollowUpConversationIds.has(conv.id);
+  const previousUpdatedAt = conv.updatedAt;
+  if (!conv.queuedFollowUps.length) armedFollowUpConversationIds.delete(conv.id);
+  conv.updatedAt = Date.now();
+  queueingFollowUp = true;
+  try {
+    await saveConversationImmediately();
+  } catch (error) {
+    conv.queuedFollowUps = before;
+    conv.updatedAt = previousUpdatedAt;
+    if (wasArmed) armedFollowUpConversationIds.add(conv.id);
+    else armedFollowUpConversationIds.delete(conv.id);
+    showToast('Could not remove the queued follow-up: ' + sanitizeErrorDetail(error), 'error');
+  } finally {
+    queueingFollowUp = false;
+    renderFollowUpQueue();
+    renderSidebar();
+    updateSendBtnState();
+    if (activeConvId === conv.id && armedFollowUpConversationIds.has(conv.id) && conv.queuedFollowUps.length && !sending && !streaming) {
+      setTimeout(() => processQueuedFollowUps(conv.id), 0);
+    }
+  }
+}
+
+async function cancelAllQueuedFollowUps() {
+  if (queueingFollowUp) return;
+  const conv = getActiveConv();
+  if (!conv?.queuedFollowUps?.length) return;
+  const before = conv.queuedFollowUps;
+  const wasArmed = armedFollowUpConversationIds.has(conv.id);
+  const previousUpdatedAt = conv.updatedAt;
+  conv.queuedFollowUps = [];
+  armedFollowUpConversationIds.delete(conv.id);
+  conv.updatedAt = Date.now();
+  queueingFollowUp = true;
+  try {
+    await saveConversationImmediately();
+  } catch (error) {
+    conv.queuedFollowUps = before;
+    conv.updatedAt = previousUpdatedAt;
+    if (wasArmed) armedFollowUpConversationIds.add(conv.id);
+    showToast('Could not clear the follow-up queue: ' + sanitizeErrorDetail(error), 'error');
+  } finally {
+    queueingFollowUp = false;
+    renderFollowUpQueue();
+    renderSidebar();
+    updateSendBtnState();
+  }
+}
+
+function toggleFollowUpQueue() {
+  if (queueingFollowUp) return;
+  const conv = getActiveConv();
+  if (!conv?.queuedFollowUps?.length) return;
+  if (armedFollowUpConversationIds.has(conv.id)) {
+    armedFollowUpConversationIds.delete(conv.id);
+    announce('Follow-up queue paused.');
+  } else {
+    armedFollowUpConversationIds.add(conv.id);
+    announce('Follow-up queue resumed.');
+    if (!streaming && !sending) setTimeout(() => processQueuedFollowUps(conv.id), 0);
+  }
+  renderFollowUpQueue();
+}
+
+async function processQueuedFollowUps(convId) {
+  if (processingFollowUpConversationId || queueingFollowUp || sending || streaming || activeConvId !== convId || !armedFollowUpConversationIds.has(convId)) return;
+  processingFollowUpConversationId = convId;
+  try {
+    while (activeConvId === convId && armedFollowUpConversationIds.has(convId) && !sending && !streaming) {
+      const conv = getActiveConv();
+      const item = conv?.queuedFollowUps?.[0];
+      if (!item) {
+        armedFollowUpConversationIds.delete(convId);
+        break;
+      }
+      const status = await sendMessage({ queuedFollowUp: item });
+      if (status !== 'complete') {
+        armedFollowUpConversationIds.delete(convId);
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  } finally {
+    processingFollowUpConversationId = null;
+    renderFollowUpQueue();
+    renderSidebar();
+  }
 }
 
 // ============================================
 // Send Message
 // ============================================
-async function sendMessage() {
-  if (streaming && abortController) { abortController.abort(); return; }
-  if (readOnlyShare || !beginSendingAction()) return;
+async function sendMessage({ queuedFollowUp = null } = {}) {
+  if (streaming && abortController && !queuedFollowUp) { abortController.abort(); return 'stopped'; }
+  if (readOnlyShare || !beginSendingAction()) return 'paused';
+  let finalStatus = 'paused';
+  let requestConvId = activeConvId;
   try {
 
   const input = document.getElementById('chatInput');
-  const text = input.value.trim();
+  const originalText = queuedFollowUp ? '' : input.value;
+  const text = queuedFollowUp ? queuedFollowUp.text : originalText.trim();
+  const composerAttachments = queuedFollowUp ? cloneDraftAttachments(queuedFollowUp.attachments) : cloneDraftAttachments(pendingAttachments);
   const lastMsg = messages[messages.length - 1];
-  const isRegenFromFork = !text && pendingAttachments.length === 0 && lastMsg && lastMsg.role === 'user';
-  if (!text && pendingAttachments.length === 0 && !isRegenFromFork) return;
+  const isRegenFromFork = !queuedFollowUp && !text && composerAttachments.length === 0 && lastMsg && lastMsg.role === 'user';
+  if (!text && composerAttachments.length === 0 && !isRegenFromFork) return finalStatus;
 
   const proxyUrl = localStorage.getItem('llmProxyUrl');
   const apiKey = getApiKey();
   const conv = getActiveConv();
+  requestConvId = conv?.id || activeConvId;
+  if (queuedFollowUp && conv?.queuedFollowUps?.[0]?.id !== queuedFollowUp.id) return finalStatus;
 
-  if (!isRegenFromFork) {
+  if (!isRegenFromFork && !queuedFollowUp) {
     const cmd = parseCommand(text);
     if (cmd) {
-      if (pendingAttachments.length > 0) { showToast('Commands cannot include attachments.', 'error'); return; }
-      if (!cmd.query) { renderCommandMenu(input, cmd.cmd); return; }
+      if (composerAttachments.length > 0) { showToast('Commands cannot include attachments.', 'error'); return finalStatus; }
+      if (cmd.definition.requiresQuery && !cmd.query) { renderCommandMenu(input, cmd.cmd); return finalStatus; }
       input.value = '';
       input.style.height = 'auto';
       closeCommandDropdown();
       persistDraftFromUI();
       await handleCommand(cmd, conv);
-      return;
+      return 'complete';
     }
   }
 
   if (!proxyUrl || (providerRequiresKey() && !apiKey)) {
     openModal('setupModal', '#setupProxy');
-    return;
+    return finalStatus;
   }
 
-  const queuedAttachments = cloneDraftAttachments(pendingAttachments);
+  const queuedAttachments = composerAttachments;
+  const overrideModel = queuedFollowUp ? queuedFollowUp.modelOverride : modelOverride;
   const addedDocs = [];
   const previousTitle = conv?.title;
   if (!isRegenFromFork) {
     let userContent;
-    if (pendingAttachments.length > 0) {
+    if (composerAttachments.length > 0) {
       if (conv) {
         const docs = conv.docs || (conv.docs = []);
-        pendingAttachments.forEach(att => {
+        composerAttachments.forEach(att => {
           if (att && att.textContent && !att.binary) {
             const text = att.textContent.length > 20000 ? att.textContent.slice(0, 20000) : att.textContent;
             const doc = {
@@ -8882,7 +9358,7 @@ async function sendMessage() {
           }
         });
       }
-      userContent = buildComposerMessage(text, pendingAttachments).content;
+      userContent = buildComposerMessage(text, composerAttachments).content;
     } else {
       userContent = text;
     }
@@ -8891,24 +9367,27 @@ async function sendMessage() {
     updateMessageTokenMetadata(userMsg);
     messages.push(userMsg);
     if (conv) {
-      delete conv.draft;
+      if (queuedFollowUp) conv.queuedFollowUps.shift();
+      else delete conv.draft;
       conv.updatedAt = Date.now();
+    }
+    if (!queuedFollowUp) {
+      input.value = '';
+      input.style.height = 'auto';
+      pendingAttachments = [];
+      document.getElementById('imagePreview').replaceChildren();
+      clearModelOverride();
     }
     try {
       await saveConversationImmediately();
     } catch (err) {
-      if (conv) conv.draft = { text: input.value, attachments: queuedAttachments, updatedAt: Date.now() };
+      if (conv && queuedFollowUp) conv.queuedFollowUps.unshift(queuedFollowUp);
       if (conv && addedDocs.length) conv.docs = (conv.docs || []).filter(doc => !addedDocs.includes(doc));
       messages.pop();
-      pendingAttachments = queuedAttachments;
-      renderPreviews();
+      if (!queuedFollowUp) restoreComposerSnapshot(conv, input, originalText, queuedAttachments, overrideModel);
       showToast('Could not save your message before sending: ' + sanitizeErrorDetail(err), 'error');
-      return;
+      return finalStatus;
     }
-    pendingAttachments = [];
-    document.getElementById('imagePreview').innerHTML = '';
-    input.value = '';
-    input.style.height = 'auto';
 
     // Auto-title
     if (conv && conv.title === 'New Chat') {
@@ -8936,28 +9415,27 @@ async function sendMessage() {
 
   const requestContext = await buildRequestMessages(conv, { messageList: messages });
   const apiMessages = requestContext.messages;
-  if (guardContextLimit(requestContext)) {
+  if (guardContextLimit(requestContext, overrideModel)) {
     messages.pop();
     if (!isRegenFromFork) {
       messages.pop();
       if (conv) {
         if (addedDocs.length) conv.docs = (conv.docs || []).filter(doc => !addedDocs.includes(doc));
-        conv.draft = { text, attachments: queuedAttachments, updatedAt: Date.now() };
+        if (queuedFollowUp) conv.queuedFollowUps.unshift(queuedFollowUp);
+        else restoreComposerSnapshot(conv, input, originalText, queuedAttachments, overrideModel);
         if (previousTitle) conv.title = previousTitle;
       }
-      pendingAttachments = queuedAttachments;
-      renderPreviews();
     }
-    saveConversationImmediately().catch(() => {});
+    try {
+      await saveConversationImmediately();
+    } catch (error) {
+      showToast('The message was restored, but could not be saved: ' + sanitizeErrorDetail(error), 'error');
+    }
     renderMessages();
-    return;
+    return finalStatus;
   }
 
-  // Capture and clear model override
-  const overrideModel = modelOverride;
-  clearModelOverride();
-
-  await streamResponse(apiMessages, assistantMsg, 0, bubble, overrideModel, null, { conv });
+  finalStatus = await streamResponse(apiMessages, assistantMsg, 0, bubble, overrideModel, null, { conv });
 
   if (getSwipeRequest(assistantMsg)?.status === 'complete') {
     extractMemories(apiMessages);
@@ -8968,7 +9446,14 @@ async function sendMessage() {
   updateTokenInfo();
   } finally {
     endSendingAction();
+    if (finalStatus === 'complete' && armedFollowUpConversationIds.has(requestConvId)) {
+      setTimeout(() => processQueuedFollowUps(requestConvId), 0);
+    } else if (armedFollowUpConversationIds.delete(requestConvId)) {
+      renderFollowUpQueue();
+      renderSidebar();
+    }
   }
+  return finalStatus;
 }
 
 // ============================================
@@ -9071,6 +9556,8 @@ function clearChat() {
     conv.summary = '';
     conv.summaryUpdatedAt = null;
     conv.docs = [];
+    conv.queuedFollowUps = [];
+    armedFollowUpConversationIds.delete(conv.id);
     conv.updatedAt = Date.now();
     messages = conv.messages;
     saveConversations();
@@ -9216,6 +9703,7 @@ function renderImportPreview(data) {
     ['Projects', data.projects.length],
     ['Messages', data.conversations.reduce((total, conv) => total + conv.messages.length, 0)],
     ['Drafts', data.drafts.length + data.conversations.filter(conv => conv.draft).length],
+    ['Queued follow-ups', data.conversations.reduce((total, conv) => total + (conv.queuedFollowUps?.length || 0), 0)],
     ['Memories', data.memories.length],
     ['Safe settings', Object.keys(data.settings).length]
   ];
@@ -9288,8 +9776,26 @@ function hasPublicShareIds(list) {
   return (list || []).some(conv => conv.shareGistId || conv.shareUrl || conv.shareId);
 }
 
+function remapCopiedConversationParents(copies, idMap) {
+  copies.forEach(copy => {
+    if (!copy.parentConversationId) return;
+    const parentId = idMap.get(copy.parentConversationId);
+    if (parentId) copy.parentConversationId = parentId;
+    else {
+      delete copy.parentConversationId;
+      delete copy.forkMessageIndex;
+      delete copy.forkedAt;
+    }
+  });
+  return copies;
+}
+
 async function applyImport(mode = 'merge') {
   if (readOnlyShare || !pendingImport) return;
+  if (sending || streaming || queueingFollowUp) {
+    showToast('Stop the current response before importing.', 'info');
+    return;
+  }
   if (!['merge', 'copy', 'replace'].includes(mode)) return;
   const imported = pendingImport;
   if (mode === 'replace' && !confirm('Replace imported categories? This removes local conversations, projects, memories, and drafts.')) return;
@@ -9318,6 +9824,7 @@ async function applyImport(mode = 'merge') {
       copy.messages.forEach(message => delete message._editing);
       return copy;
     });
+    remapCopiedConversationParents(importedConversations, copyConversationIds);
     importedMemories = importedMemories.map(memory => ({ ...memory, id: 'mem_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7) }));
   }
   const localTombstones = syncLoadTombstones();
@@ -9333,13 +9840,22 @@ async function applyImport(mode = 'merge') {
   resurrect(importedProjects, 'projects', 'updatedAt');
   resurrect(importedMemories, 'memories', 'createdAt');
   if (resurrected) syncSaveTombstones(localTombstones);
+  if (sending || streaming || queueingFollowUp) {
+    showToast('Stop the current response before importing.', 'info');
+    return;
+  }
   if (mode === 'replace') {
     const incomingConversationIds = new Set(importedConversations.map(conv => conv.id));
     const incomingProjectIds = new Set(importedProjects.map(project => project.id));
     const incomingMemoryIds = new Set(importedMemories.map(memory => memory.id));
+    const localMemories = await loadMemories();
+    if (sending || streaming || queueingFollowUp) {
+      showToast('Stop the current response before importing.', 'info');
+      return;
+    }
     syncRecordTombstones('conversations', conversations.filter(conv => !incomingConversationIds.has(conv.id)).map(conv => conv.id));
     syncRecordTombstones('projects', projects.filter(project => !incomingProjectIds.has(project.id)).map(project => project.id));
-    syncRecordTombstones('memories', (await loadMemories()).filter(memory => !incomingMemoryIds.has(memory.id)).map(memory => memory.id));
+    syncRecordTombstones('memories', localMemories.filter(memory => !incomingMemoryIds.has(memory.id)).map(memory => memory.id));
     conversations = importedConversations;
     projects = importedProjects;
     await saveMemories(importedMemories);
@@ -9355,6 +9871,7 @@ async function applyImport(mode = 'merge') {
     if (conv && (!conv.draft || Number(draft.updatedAt || 0) > Number(conv.draft.updatedAt || 0))) conv.draft = { text: draft.text || '', attachments: cloneDraftAttachments(draft.attachments), updatedAt: draft.updatedAt || Date.now() };
   });
   applySafeImportedSettings(imported.settings, imported.profiles);
+  armedFollowUpConversationIds.clear();
   activeConvId = conversations[0]?.id || null;
   messages = getActiveConv()?.messages || [];
   await saveConversationImmediately();
@@ -9375,7 +9892,7 @@ async function renderStorageSummary() {
   const approximate = [
     ['Conversations', JSON.stringify(conversations).length],
     ['Projects', JSON.stringify(projects).length],
-    ['Drafts', JSON.stringify(conversations.map(conv => conv.draft || null)).length],
+    ['Drafts and queue', JSON.stringify(conversations.map(conv => ({ draft: conv.draft || null, queuedFollowUps: conv.queuedFollowUps || [] }))).length],
     ['Memories', (await loadMemories()).reduce((total, memory) => total + JSON.stringify(memory).length, 0)]
   ];
   let usageText = 'Storage estimate unavailable.';
@@ -9397,7 +9914,11 @@ async function clearDataCategory(category) {
     activeConvId = null;
     createConversation();
   } else if (category === 'drafts') {
-    conversations.forEach(conv => delete conv.draft);
+    conversations.forEach(conv => {
+      delete conv.draft;
+      conv.queuedFollowUps = [];
+    });
+    armedFollowUpConversationIds.clear();
     pendingAttachments = [];
     const input = document.getElementById('chatInput');
     if (input) input.value = '';
@@ -9437,6 +9958,16 @@ function synapseSelfTest() {
     assert(malformed.id !== '\" bad' && !malformed.tag && malformed.draft.attachments.length === 0, 'untrusted conversation normalization');
     const malformedParts = normalizeConversationRecord({ messages: [{ role: 'user', content: [null, { type: 'text', text: 7 }] }, { role: 'assistant', content: 'ok', swipes: [null, 42], swipeIndex: 9 }] });
     assert(malformedParts.messages[0].content.length === 1 && malformedParts.messages[0].content[0].text === '7' && malformedParts.messages[1].swipes[1] === '42' && malformedParts.messages[1].swipeIndex === 1, 'message part normalization');
+    const queued = normalizeConversationRecord({ id: 'queue-test', goal: 'g'.repeat(5000), parentConversationId: 'queue-test', queuedFollowUps: [
+      { id: 'one', text: 'next', modelOverride: 'model', createdAt: 1 },
+      { id: 'empty', text: '', attachments: [] }
+    ] });
+    assert(queued.goal.length === 4000 && !queued.parentConversationId && queued.queuedFollowUps.length === 1 && queued.queuedFollowUps[0].text === 'next', 'goal and queue normalization');
+    const copiedLineage = remapCopiedConversationParents([
+      { id: 'new-child', parentConversationId: 'old-parent', forkMessageIndex: 2 },
+      { id: 'orphan', parentConversationId: 'missing', forkMessageIndex: 3 }
+    ], new Map([['old-parent', 'new-parent']]));
+    assert(copiedLineage[0].parentConversationId === 'new-parent' && !copiedLineage[1].parentConversationId, 'copied fork lineage');
     const xss = renderMarkdown('![\" onerror=\"alert(1)\" x=\"](https://example.test/image.png)');
     assert(!xss.includes('alt="" onerror='), 'markdown image attributes');
     assert(!canUseCorsProxy('https://api.example.test/chat', { method: 'POST', headers: { Authorization: 'Bearer secret' }, body: '{}' }, 'https://corsproxy.io/?url='), 'credentialed public proxy blocking');
@@ -9475,7 +10006,7 @@ function synapseSelfTest() {
       storedSync.passphrase === (localStorage.getItem('assistantSyncPassphrase') || ''), 'auto-push stored configuration');
     EMOTION_SPRITE_TAG_RE.lastIndex = 0;
     assert(EMOTION_SPRITE_TAG_RE.test('<gpt_helpfulness />'), 'emotion sprite tag');
-    const result = { ok: true, checks: ['normalization', 'context filtering', 'source numbering', 'legacy import', 'legacy branches', 'legacy settings', 'trust boundaries', 'sync filenames', 'persistence arbitration', 'tombstones', 'updatedAt merge', 'auto-push configuration', 'auto-push stored configuration', 'emotion sprite tag'] };
+    const result = { ok: true, checks: ['normalization', 'goal and queue', 'fork lineage', 'context filtering', 'source numbering', 'legacy import', 'legacy branches', 'legacy settings', 'trust boundaries', 'sync filenames', 'persistence arbitration', 'tombstones', 'updatedAt merge', 'auto-push configuration', 'auto-push stored configuration', 'emotion sprite tag'] };
     console.info('Synapse self-test passed', result);
     return result;
   } catch (error) {
@@ -9832,19 +10363,7 @@ function syncCloneJson(value) {
 }
 
 function syncNormalizeConversation(conv) {
-  const normalized = conv && typeof conv === 'object' ? syncCloneJson(conv) : {};
-  normalized.id = normalized.id || genId();
-  normalized.title = normalized.title || 'Untitled Chat';
-  normalized.createdAt = Number(normalized.createdAt) || Date.now();
-  normalized.updatedAt = Number(normalized.updatedAt) || normalized.createdAt || Date.now();
-  normalized.messages = Array.isArray(normalized.messages) ? normalized.messages : [];
-  normalized.messages.forEach(m => {
-    if (m.role === 'assistant' && !m.swipes) {
-      m.swipes = [typeof m.content === 'string' ? m.content : ''];
-      m.swipeIndex = 0;
-    }
-  });
-  return normalized;
+  return normalizeConversationRecord(conv && typeof conv === 'object' ? syncCloneJson(conv) : {});
 }
 
 function syncNormalizeTombstones(value) {
@@ -10297,6 +10816,10 @@ function syncMergeMemoryLists(localList, remoteList, tombstones = {}) {
 }
 
 async function syncPullFromGist() {
+  if (sending || streaming || queueingFollowUp) {
+    showToast('Stop the current response before pulling sync data.', 'info');
+    return false;
+  }
   if (_syncOperationInFlight) {
     showToast('A sync operation is already in progress.', 'info');
     return false;
@@ -10328,11 +10851,15 @@ async function syncPullFromGist() {
     const liveProjects = syncMergeProjectLists(projects, mergedProjects, liveTombstones.projects);
     const liveMerged = await syncMergeConversationLists(conversations, merged.conversations, liveTombstones.conversations);
 
+    if (sending || streaming || queueingFollowUp) throw new Error('Stop the current response before applying pulled sync data.');
+
     syncApplySettings(liveSettingsState);
     syncSaveTombstones(liveTombstones);
     await saveMemories(liveMemories);
     projects = liveProjects;
     if (db) await idbPut('meta', { key: 'projects', value: projects });
+    if (sending || streaming || queueingFollowUp) throw new Error('Stop the current response before applying pulled sync data.');
+    armedFollowUpConversationIds.clear();
     conversations = liveMerged.conversations;
     if (conversations.length > 0 && !conversations.find(c => c.id === activeConvId)) activeConvId = conversations[0].id;
     if (conversations.length === 0) activeConvId = null;
@@ -10698,7 +11225,9 @@ function shareSelfTest() {
     id: 'conv_1', title: 't', projectId: 'proj_1',
     summary: 'SECRET_SUMMARY', persona: 'SECRET_PERSONA',
     characterDescription: 'SECRET_CHAR', characterSystemPrompt: 'SECRET_SYSPROMPT',
-    tag: 'SECRET_TAG', shareGistId: 'SECRET_GIST',
+    tag: 'SECRET_TAG', shareGistId: 'SECRET_GIST', goal: 'SECRET_GOAL',
+    parentConversationId: 'SECRET_PARENT', forkMessageIndex: 2,
+    queuedFollowUps: [{ id: 'SECRET_QUEUE_ID', text: 'SECRET_QUEUE', attachments: [] }],
     docs: [{ id: 'd', name: 'n', text: 'SECRET_DOC' }],
     messages: [
       { role: 'user', content: [
@@ -10716,7 +11245,7 @@ function shareSelfTest() {
   const leaks = ['SECRET_SUMMARY', 'SECRET_PERSONA', 'SECRET_CHAR', 'SECRET_SYSPROMPT', 'SECRET_TAG',
     'SECRET_GIST', 'SECRET_DOC', 'SECRET_URL', 'SECRET_FILE', 'SECRET_SWIPE', 'SECRET_THINK',
     'SECRET_TOOL', 'SECRET_PROFILE', 'SECRET_PROVIDER', 'SECRET_SYSTEM', 'SECRET_INLINE', 'SECRET_IMAGE',
-    'SECRET_ASSISTANT_IMAGE', 'proj_1', 'conv_1']
+    'SECRET_ASSISTANT_IMAGE', 'SECRET_GOAL', 'SECRET_PARENT', 'SECRET_QUEUE_ID', 'SECRET_QUEUE', 'proj_1', 'conv_1']
     .filter(s => json.includes(s));
   if (leaks.length) throw new Error('share payload leaked: ' + leaks.join(', '));
   if (!json.includes('a.txt')) throw new Error('share payload lost the file name');
@@ -11798,10 +12327,14 @@ const __windowBridge = {
   openManageMemories,
   openSearchTest,
   openSourcesDrawer,
+  renderContextSources,
   buildSnippet,
   searchLocalDocs,
   openFileSearch,
   openSummaryModal,
+  generateConversationSummary,
+  saveConversationSummary,
+  clearConversationSummary,
   openStatusPanel,
   parseCommand,
   handleCommand,
@@ -11885,6 +12418,8 @@ const __windowBridge = {
   setTagFilter,
   filterConversations,
   toggleSidebar,
+  toggleContextPanel,
+  toggleProjectCollapse,
   toggleToolbarMenu,
   closeToolbarMenu,
   getSelectedModel,
@@ -11920,6 +12455,10 @@ const __windowBridge = {
   buildRequestMessages,
   filterRequestHistory,
   openContextPreview,
+  openContextSection,
+  renderContextPanel,
+  updateConversationGoal,
+  saveConversationTools,
   compactOlderTurns,
   toggleComposerTools,
   closeComposerTools,
@@ -11943,6 +12482,11 @@ const __windowBridge = {
   updateSendBtnState,
   resolveWebSearchEnabled,
   sendMessage,
+  queueFollowUpFromComposer,
+  cancelQueuedFollowUp,
+  cancelAllQueuedFollowUps,
+  toggleFollowUpQueue,
+  processQueuedFollowUps,
   regenerate,
   continueMessage,
   clearChat,

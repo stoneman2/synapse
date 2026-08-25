@@ -19,13 +19,14 @@ API keys can be saved as **Remember on this device** (`localStorage`) or **This 
 
 ### Chats
 
-- Create, rename, tag, search, import, and export conversations. Active and Archived views, duplicate/archive/restore, bulk selection, and Updated/Created/Title/Manual sorting are available in the sidebar.
+- Create, rename, tag, search, import, and export conversations. Active and Archived views, collapsible project groups, duplicate/archive/restore, bulk selection, and Updated/Created/Title/Manual sorting are available in the sidebar.
 - Export one chat as JSON or Markdown, or export everything at once.
 - Edit a user message and resend from that point.
 - Regenerate assistant messages and switch between swipes.
-- Fork a chat from any message.
-- Generate and save a conversation summary for context.
-- Open **Context** to inspect the exact provider/model, system context, included/excluded history, attachment sizes, estimated tokens, output limit, and context-window usage. Individual messages can be included or excluded; compaction summarizes older turns without deleting them.
+- Fork a chat from any message. Parent and child links stay available in the Context panel.
+- Set a per-chat goal and generate or save a conversation summary for context.
+- Use the right Context panel for goals, request previews, per-chat tools, summaries, sources, and related forks. Individual messages can be included or excluded; compaction summarizes older turns without deleting them.
+- Queue follow-up messages, attachments, and one-message model overrides while a response is streaming. Queues persist across reloads but remain paused until you choose Resume.
 - Draft text and pending attachments are saved per conversation and restored after switching chats or reloading.
 - Select message ranges for screenshots.
 
@@ -47,7 +48,7 @@ API keys can be saved as **Remember on this device** (`localStorage`) or **This 
 ### Tools and Diagnostics
 
 - Web search through Anthropic tools, SearXNG, Brave, or a custom search endpoint.
-- `/search` (aliases `/web`, `/s`) and `/files` (aliases `/file`, `/docs`, `/doc`) are discoverable from the composer. Per-chat web-search, URL-fetch, and confirmation policies override global defaults.
+- Composer commands include `/search`, `/files`, `/goal`, `/context`, `/summary`, `/tools`, `/settings`, and `/projects`. Per-chat web-search, URL-fetch, and confirmation policies override global defaults.
 - Tool calls show their state, require one confirmation per response when enabled, and persist deduplicated numbered sources for citations and the Sources drawer.
 - Optional memory across conversations.
 - Status and diagnostics panel for connection/search checks.
@@ -56,7 +57,7 @@ API keys can be saved as **Remember on this device** (`localStorage`) or **This 
 
 ### Appearance
 
-- Built-in themes, custom color picker, and light/dark/system toggle.
+- A muted forest-green workbench theme by default, plus built-in themes, a custom color picker, and light/dark/system toggle.
 - Custom font, message width, font size, and border radius settings.
 - Syntax highlighting, LaTeX, Mermaid diagrams, tables, code blocks, spoilers, and generated image display.
 - Optional local emotion sprites for Claude, GPT, and Gemini output tags, with automatic or manual sprite-set selection.
@@ -66,7 +67,7 @@ API keys can be saved as **Remember on this device** (`localStorage`) or **This 
 
 | Shortcut | Action |
 |---|---|
-| `Enter` | Send message, if enabled |
+| `Enter` | Send, or queue a follow-up while streaming, if enabled |
 | `Shift+Enter` | New line |
 | `Ctrl+Enter` | Send message |
 | `Ctrl+N` | New conversation |
@@ -138,7 +139,7 @@ Synapse uses browser storage:
 
 | Storage | Contents |
 |---|---|
-| IndexedDB | Conversations, messages, drafts, and memories |
+| IndexedDB | Conversations, messages, drafts, queued follow-ups, goals, and memories |
 | `localStorage` | API settings, themes, profiles, prompt entries, presets, cached model list, and UI preferences |
 | `sessionStorage` | A key selected as “This tab only” |
 

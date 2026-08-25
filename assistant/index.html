@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <link rel="icon" href="favicon.ico" type="image/x-icon">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<meta name="theme-color" content="#1a1a1a">
+<meta name="theme-color" content="#0f1310">
 <link rel="manifest" href="./manifest.json">
 <title>Synapse</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -15,19 +15,20 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="./styles.css?v=202608241113">
+<link rel="stylesheet" href="./styles.css?v=202608251343">
 </head>
 <body>
 
 <!-- Sidebar overlay for mobile -->
-<div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+<div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar(false)"></div>
+<div class="context-overlay" id="contextOverlay" onclick="toggleContextPanel(false)"></div>
 
 <!-- Toast container -->
 <div class="toast-container" id="toastContainer" role="status" aria-live="polite" aria-relevant="additions text"></div>
 <div class="live-status" id="liveStatus" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <!-- Sidebar -->
-<aside class="sidebar" id="sidebar">
+<aside class="sidebar" id="sidebar" aria-label="Conversations">
   <div class="sidebar-header">
     <button onclick="createConversation()" aria-label="New chat">+ New Chat</button>
     <button class="sidebar-icon-btn" onclick="document.getElementById('charImportInput').click()" title="Import character card" aria-label="Import character card" style="padding:10px 12px"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6.5" cy="5" r="2.5"/><path d="M2 13.5c0-2.5 2-4 4.5-4s4.5 1.5 4.5 4"/><path d="M12.5 4.5v4M10.5 6.5h4"/></svg></button>
@@ -77,7 +78,7 @@
   <!-- Toolbar -->
   <header class="toolbar">
     <div class="toolbar-left">
-      <button class="toolbar-toggle" onclick="toggleSidebar()" title="Toggle sidebar" aria-label="Toggle sidebar">&#9776;</button>
+      <button class="toolbar-toggle" onclick="toggleSidebar()" title="Toggle sidebar" aria-label="Toggle sidebar" aria-controls="sidebar" aria-expanded="true">&#9776;</button>
       <span class="toolbar-title">Synapse</span>
     </div>
     <div class="toolbar-right">
@@ -108,6 +109,7 @@
       <button class="toolbar-btn" id="charInfoBtn" onclick="showCharacterInfo()" title="Character info" aria-label="Character info" style="display:none">&#8505;&#xFE0E;</button>
       <button class="toolbar-btn" onclick="openSettings()" title="Settings" aria-label="Settings">&#9881;</button>
       <button class="toolbar-btn" id="themeToggle" onclick="toggleTheme()" title="Theme: dark" aria-label="Toggle theme">&#9790;</button>
+      <button class="toolbar-btn context-toggle" id="contextToggle" onclick="toggleContextPanel()" title="Toggle context panel" aria-label="Toggle context panel" aria-controls="contextPanel" aria-expanded="true">Panel</button>
     </div>
   </header>
 
@@ -138,6 +140,16 @@
       <span id="modelOverrideText"></span>
       <button onclick="clearModelOverride()" title="Clear override" aria-label="Clear model override">&times;</button>
     </div>
+    <section class="follow-up-queue" id="followUpQueuePanel" hidden aria-label="Queued follow-ups" aria-live="polite">
+      <div class="follow-up-queue-head">
+        <strong id="followUpQueueSummary">No queued follow-ups</strong>
+        <div>
+          <button type="button" class="queue-action" id="followUpQueueResume" onclick="toggleFollowUpQueue()">Resume</button>
+          <button type="button" class="queue-action" onclick="cancelAllQueuedFollowUps()">Clear</button>
+        </div>
+      </div>
+      <div class="follow-up-queue-list" id="followUpQueueList"></div>
+    </section>
     <div class="input-row" style="position:relative">
       <div class="mention-dropdown" id="mentionDropdown"></div>
       <div class="command-dropdown" id="commandDropdown" role="menu" aria-label="Slash commands"></div>
@@ -145,13 +157,71 @@
       <input type="file" id="fileInput" multiple style="display:none" onchange="handleFileSelect(event)">
       <textarea id="chatInput" placeholder="Type a message..." rows="1" aria-label="Message" aria-controls="commandDropdown" aria-expanded="false"></textarea>
       <button class="input-btn" id="voiceBtn" onclick="toggleVoice()" title="Voice input" aria-label="Voice input"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="1.5" width="4" height="7.5" rx="2"/><path d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.5M6 14.5h4"/></svg></button>
-      <button class="input-control-btn" id="contextBtn" onclick="openContextPreview()" title="Review what will be sent" aria-label="Review message context">Context</button>
+      <button class="input-control-btn" id="contextBtn" onclick="openContextPreview()" title="Review what will be sent" aria-label="Review message context" aria-controls="contextPanel" aria-expanded="true">Context</button>
       <button class="input-control-btn" id="toolsBtn" onclick="toggleComposerTools(event)" title="Conversation tool policy" aria-label="Conversation tools" aria-expanded="false">Tools</button>
+      <button class="input-control-btn queue-btn" id="followUpQueueBtn" onclick="queueFollowUpFromComposer()" title="Queue this message after the current response" aria-label="Queue follow-up message">Queue</button>
       <button class="send-btn" id="sendBtn" onclick="sendMessage()" aria-label="Send message">Send</button>
     </div>
     <div class="token-info" id="tokenInfo"></div>
   </footer>
 </main>
+
+<!-- Conversation context -->
+<aside class="context-panel" id="contextPanel" aria-label="Conversation context" aria-hidden="false">
+  <header class="context-panel-header">
+    <div>
+      <span class="context-panel-kicker">Current chat</span>
+      <h2>Context</h2>
+    </div>
+    <button type="button" class="context-panel-close" onclick="toggleContextPanel(false)" aria-label="Close context panel">&times;</button>
+  </header>
+  <div class="context-panel-body">
+    <details class="context-panel-section" id="goalSection" open>
+      <summary>Goal <span id="goalStatus">Optional</span></summary>
+      <div class="context-panel-section-body">
+        <label class="sr-only" for="conversationGoal">Conversation goal</label>
+        <textarea id="conversationGoal" rows="4" maxlength="4000" placeholder="What should this conversation accomplish?" oninput="updateConversationGoal(this.value)"></textarea>
+        <p>Included in each request for this chat.</p>
+      </div>
+    </details>
+    <details class="context-panel-section" id="requestContextSection">
+      <summary>Request context <span>Preview</span></summary>
+      <div class="context-panel-section-body">
+        <div id="contextPreviewBody" class="context-preview-body"><p class="setting-hint">Open this section with the Context button to build a preview.</p></div>
+        <button class="btn btn-secondary context-wide-action" type="button" onclick="compactOlderTurns()">Compact older turns</button>
+      </div>
+    </details>
+    <details class="context-panel-section" id="toolsSection">
+      <summary>Tools <span id="toolsStatus">Defaults</span></summary>
+      <div class="context-panel-section-body context-tool-list">
+        <label><input type="checkbox" id="chatToolWebSearch"> Web search</label>
+        <label><input type="checkbox" id="chatToolUrlFetch"> URL fetching</label>
+        <label><input type="checkbox" id="chatToolConfirm"> Ask before external tools</label>
+        <button class="btn btn-primary context-wide-action" type="button" onclick="saveConversationTools()">Save tools</button>
+      </div>
+    </details>
+    <details class="context-panel-section" id="summarySection">
+      <summary>Summary <span id="summaryStatus">Empty</span></summary>
+      <div class="context-panel-section-body">
+        <label class="sr-only" for="summaryText">Conversation summary</label>
+        <textarea id="summaryText" rows="7" placeholder="A compact note retained in the system context"></textarea>
+        <div class="context-panel-actions">
+          <button class="btn btn-primary" id="summaryGen" type="button" onclick="generateConversationSummary()">Generate</button>
+          <button class="btn btn-secondary" type="button" onclick="saveConversationSummary()">Save</button>
+          <button class="btn btn-secondary" type="button" onclick="clearConversationSummary()">Clear</button>
+        </div>
+      </div>
+    </details>
+    <details class="context-panel-section" id="sourcesSection">
+      <summary>Sources <span id="sourcesStatus">None</span></summary>
+      <div class="context-panel-section-body" id="contextSourcesBody"><p>No sources for this chat yet.</p></div>
+    </details>
+    <details class="context-panel-section" id="forksSection">
+      <summary>Forks <span id="forksStatus">None</span></summary>
+      <div class="context-panel-section-body context-fork-links" id="contextForkLinks"><p>No related conversations.</p></div>
+    </details>
+  </div>
+</aside>
 
 <!-- Setup Modal -->
 <div class="modal-overlay" id="setupModal" aria-hidden="true">
@@ -621,18 +691,6 @@
   </div>
 </div>
 
-<!-- Context preview -->
-<div class="modal-overlay" id="contextPreviewModal" aria-hidden="true">
-  <div class="modal context-preview-modal" aria-labelledby="contextPreviewTitle">
-    <h2 id="contextPreviewTitle">What will be sent</h2>
-    <div id="contextPreviewBody" class="context-preview-body"></div>
-    <div class="modal-actions">
-      <button class="btn btn-secondary" type="button" onclick="compactOlderTurns()">Compact older turns</button>
-      <button class="btn btn-primary" type="button" onclick="closeModal('contextPreviewModal')">Done</button>
-    </div>
-  </div>
-</div>
-
 <!-- Import preview -->
 <div class="modal-overlay" id="importPreviewModal" aria-hidden="true">
   <div class="modal" aria-labelledby="importPreviewTitle">
@@ -647,6 +705,6 @@
   </div>
 </div>
 
-<script type="module" src="./js/main.js?v=202608241113"></script>
+<script type="module" src="./js/main.js?v=202608251343"></script>
 </body>
 </html>
