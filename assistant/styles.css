@@ -2283,8 +2283,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .toolbar { padding-inline: 6px; }
   .toolbar-left, .toolbar-right { gap: 2px; }
   .toolbar-title { display: none; }
-  .connection-chip { display: inline-flex; max-width: 120px; }
-  .connection-chip-model { max-width: 105px; }
+  /* The hidden title left the middle of the bar empty, so the chip takes that
+     room and shows the model name instead of truncating it at 105px. */
+  .toolbar-right, .connection-picker-wrap { flex: 1; min-width: 0; }
+  .connection-chip { display: flex; width: 100%; max-width: none; overflow: hidden; }
+  .connection-chip-provider, .connection-chip-model { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .starter-prompts { grid-template-columns: 1fr; }
   /* A 320px phone needs ~16px more to keep the controls on one line. */
   .input-row { gap: 4px; }
