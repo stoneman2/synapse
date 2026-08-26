@@ -3192,8 +3192,8 @@ let debugLogBuffer = [];
 let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
 function beginLocalDataOperation() {
-  if (_syncOperationInFlight) {
-    showToast('Wait for sync to finish.', 'info');
+  if (_syncPullInFlight) {
+    showToast('Wait for sync pull to finish.', 'info');
     return false;
   }
   localDataOperationsInFlight++;
@@ -3202,7 +3202,7 @@ function beginLocalDataOperation() {
 
 function endLocalDataOperation() {
   localDataOperationsInFlight = Math.max(0, localDataOperationsInFlight - 1);
-  if (localDataOperationsInFlight === 0 && !_syncOperationInFlight &&
+  if (localDataOperationsInFlight === 0 && !_syncPullInFlight &&
       localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
       localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
 }
@@ -3490,8 +3490,8 @@ function openModal(modalOrId, focusSelector) {
 function closeModal(modalOrId, restoreFocus = true) {
   const modal = typeof modalOrId === 'string' ? document.getElementById(modalOrId) : modalOrId;
   if (!modal) return;
-  if (modal.id === 'settingsModal' && _syncOperationInFlight) {
-    showToast('Wait for sync to finish.', 'info');
+  if (modal.id === 'settingsModal' && _syncPullInFlight) {
+    showToast('Wait for sync pull to finish.', 'info');
     return;
   }
   if (modal.id === 'projectsModal') void flushProjectAutosave();
@@ -8507,7 +8507,7 @@ function getActiveConv() { return conversations.find(c => c.id === activeConvId)
 
 function createConversation(projectId) {
   if (readOnlyShare) return;
-  if (_syncOperationInFlight) { showToast('Wait for sync to finish.', 'info'); return; }
+  if (_syncPullInFlight) { showToast('Wait for sync pull to finish.', 'info'); return; }
   if (sending || streaming) { showToast('Stop the current response before creating another chat.', 'info'); return; }
   persistDraftFromUI();
   const conv = { id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
@@ -8531,7 +8531,7 @@ function createConversation(projectId) {
 
 function createTemporaryConversation() {
   if (readOnlyShare) return;
-  if (_syncOperationInFlight) { showToast('Wait for sync to finish.', 'info'); return; }
+  if (_syncPullInFlight) { showToast('Wait for sync pull to finish.', 'info'); return; }
   if (sending || streaming) { showToast('Stop the current response before creating another chat.', 'info'); return; }
   persistDraftFromUI();
   const conv = { id: genId(), title: 'Temporary chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
@@ -8553,7 +8553,7 @@ function createTemporaryConversation() {
 }
 
 function switchConversation(id) {
-  if (_syncOperationInFlight) { showToast('Wait for sync to finish.', 'info'); return; }
+  if (_syncPullInFlight) { showToast('Wait for sync pull to finish.', 'info'); return; }
   if (sending || streaming) { showToast('Stop the current response before switching chats.', 'info'); return; }
   const conv = conversations.find(c => c.id === id);
   if (!conv) return;
@@ -13727,7 +13727,7 @@ function updateSendBtnState() {
   const hasInput = Boolean(input.value.trim() || pendingAttachments.length > 0);
   const lastMsg = messages[messages.length - 1];
   const canRegenerate = !hasInput && lastMsg?.role === 'user';
-  btn.disabled = readOnlyShare || _syncOperationInFlight || !conv || pendingAttachmentReads > 0 || (!hasInput && !canRegenerate);
+  btn.disabled = readOnlyShare || _syncPullInFlight || !conv || pendingAttachmentReads > 0 || (!hasInput && !canRegenerate);
   if (canRegenerate) {
     // ponytail: the word does not fit beside the other controls on a phone.
     btn.textContent = window.innerWidth <= 768 ? '↻' : 'Regenerate';
@@ -13739,8 +13739,8 @@ function updateSendBtnState() {
 }
 
 function beginSendingAction() {
-  if (_syncOperationInFlight) {
-    showToast('Wait for sync to finish.', 'info');
+  if (_syncPullInFlight) {
+    showToast('Wait for sync pull to finish.', 'info');
     return false;
   }
   if (sending || streaming) return false;
@@ -14906,6 +14906,10 @@ function syncGetDeviceId() {
 let _syncInputsLoaded = false;
 let _syncAutoPushTimer;
 let _syncOperationInFlight = false;
+// Pull replaces all local state, so it alone must lock the UI. Push only
+// snapshots local data into the Gist; anything changed mid-push is picked up
+// by the next auto-push, so the app stays usable while a push runs.
+let _syncPullInFlight = false;
 
 function syncAutoPushIsConfigured(cfg) {
   return !!(cfg?.token && cfg?.passphrase && cfg?.gistId);
@@ -15049,7 +15053,7 @@ function renderSyncSettings() {
   if (gistEl) gistEl.value = localStorage.getItem('assistantSyncGistId') || '';
   if (passEl) passEl.value = localStorage.getItem('assistantSyncPassphrase') || '';
   if (autoEl) autoEl.checked = localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true';
-  setSyncBusy(_syncOperationInFlight);
+  setSyncBusy(_syncPullInFlight);
   _syncInputsLoaded = true;
 
   const token = localStorage.getItem('assistantSyncGistToken') || '';
@@ -15579,7 +15583,6 @@ async function syncPushToGist(options = {}) {
   }
   flushSettingsAutosaves();
   _syncOperationInFlight = true;
-  setSyncBusy(true);
   const pendingAtStart = localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true';
   if (auto || pendingAtStart) localStorage.removeItem(SYNC_AUTO_PENDING_KEY);
   const cfg = auto ? syncGetStoredConfig() : syncSaveSettings(false, false);
@@ -15659,7 +15662,6 @@ async function syncPushToGist(options = {}) {
       localStorage.setItem(SYNC_AUTO_PENDING_KEY, 'true');
     }
     _syncOperationInFlight = false;
-    setSyncBusy(false);
     if (succeeded && localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
         localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
   }
@@ -15858,6 +15860,7 @@ async function syncPullFromGist() {
   }
   flushSettingsAutosaves();
   _syncOperationInFlight = true;
+  _syncPullInFlight = true;
   setSyncBusy(true);
   const previousActiveConvId = activeConvId;
   const cfg = syncSaveSettings(false, false);
@@ -15960,6 +15963,7 @@ async function syncPullFromGist() {
     return false;
   } finally {
     _syncOperationInFlight = false;
+    _syncPullInFlight = false;
     setSyncBusy(false);
     if (localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
         localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
@@ -16023,8 +16027,8 @@ function syncParsePairingText(text) {
 }
 
 function syncApplyPairingText(text, silent = false) {
-  if (_syncOperationInFlight) {
-    if (!silent) showToast('Wait for sync to finish.', 'info');
+  if (_syncPullInFlight) {
+    if (!silent) showToast('Wait for sync pull to finish.', 'info');
     return false;
   }
   try {
