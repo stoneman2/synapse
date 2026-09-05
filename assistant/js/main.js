@@ -12,6 +12,8 @@ let activeConvId = null;
 let readOnlyShare = false;
 let messages = [];
 let abortController = null;
+let foregroundAction = null;
+const requestTargets = new WeakMap();
 let streaming = false;
 let sending = false;
 let userScrolledAway = false;
@@ -20,6 +22,8 @@ let pendingAttachments = [];
 let pendingAttachmentReads = 0;
 let attachmentStatusMessage = '';
 let voiceRec = null;
+let spokenMessage = null;
+let speechUtterance = null;
 let modelOverride = null;
 const armedFollowUpConversationIds = new Set();
 let processingFollowUpConversationId = null;
@@ -27,6 +31,14 @@ let queueingFollowUp = false;
 let contextSourceMessage = null;
 let contextPanelFocusReturn = null;
 let contextPanelConversationId = null;
+const contextDrafts = new WeakMap();
+const contextRevisions = new WeakMap();
+const summaryJobs = new Set();
+let memoryEpoch = 0;
+let memoryEnabledState = parseEnabledSetting(localStorage.getItem('llmMemoryEnabled'));
+window.addEventListener('storage', event => {
+  if (event.key === null || event.key === SYNC_TOMBSTONES_KEY || (event.key === 'llmMemoryEnabled' && !parseEnabledSetting(event.newValue))) memoryEpoch++;
+});
 let mentionActive = false;
 let mentionIdx = 0;
 let activeTagFilter = null;
@@ -37,6 +49,7 @@ const selectedConversationIds = new Set();
 let pendingImport = null;
 let pendingImportMeta = null;
 let activeSettingsTab = 'api';
+const dirtySettingsTabs = new Set();
 let _promptSettingsAutosaveTimer = null;
 let _appearanceSettingsAutosaveTimer = null;
 let _promptSettingsAutosavePending = false;
@@ -62,6 +75,8 @@ function beginLocalDataOperation() {
     return false;
   }
   localDataOperationsInFlight++;
+  // Invalidate before an import/deletion can yield to storage.
+  memoryEpoch++;
   return true;
 }
 
@@ -96,7 +111,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-09-05T08:56:03+08:00',
+  buildDate: '2026-09-05T11:10:36+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -124,17 +139,35 @@ const SYNC_PROFILE_SECRET_KEYS = [
   'llmApiKey', 'llmSearchApiKey', 'assistantSyncGistToken', 'assistantSyncPassphrase'
 ];
 const PROFILE_SECRET_KEY_RE = /(?:api[-_ ]?key|token|secret|passphrase|password|authorization|credential|cookie)/i;
+const PROFILE_SETTING_KEYS = new Set([
+  'llmProvider', 'llmProxyUrl', 'llmModel', 'llmApiFormat', 'llmStreaming', 'llmEnterSend',
+  'llmTemperature', 'llmMaxTokens', 'llmContextWindow', 'llmPromptCache', 'llmThinking',
+  'llmThinkingEffort', 'llmExtraParams', 'llmExcludeParams', 'llmPrefill', 'llmWebSearch',
+  'llmForceSearch', 'llmUrlFetch', 'llmToolConfirm', 'llmSearchApiUrl', 'llmCorsProxy',
+  'llmMemoryEnabled', 'llmHoldScreenshot', 'llmEmotionSprites', 'llmEmotionSpriteSet',
+  'llmInputCost', 'llmOutputCost', 'llmEnableStMacros', 'llmRpUserName'
+]);
 
 function isCredentialSettingKey(key) {
+  if (/^(?:llmMaxTokens|(?:max(?:_completion)?|min|budget|input|output)_tokens|(?:bos|eos|pad|stop|allowed)_token_ids?)$/i.test(key)) return false;
   return SYNC_PROFILE_SECRET_KEYS.includes(key) || PROFILE_SECRET_KEY_RE.test(String(key || ''));
 }
 
 function stripCredentialSettings(settings) {
-  const safe = {};
-  Object.entries(settings && typeof settings === 'object' ? settings : {}).forEach(([key, value]) => {
-    if (!isCredentialSettingKey(key)) safe[key] = value;
-  });
-  return safe;
+  if (Array.isArray(settings)) return settings.map(stripCredentialSettings);
+  if (!settings || typeof settings !== 'object') return settings;
+  return Object.fromEntries(Object.entries(settings)
+    .filter(([key]) => !isCredentialSettingKey(key))
+    .map(([key, value]) => [key, stripCredentialSettings(value)]));
+}
+
+function sanitizeExtraParams(value) {
+  if (!value) return '';
+  try {
+    const parsed = JSON.parse(String(value));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? JSON.stringify(stripCredentialSettings(parsed)) : '';
+  } catch { return ''; }
 }
 
 function sanitizeStoredUrl(value) {
@@ -179,7 +212,10 @@ function safeFileUrl(value) {
 }
 
 function sanitizeProfileSettings(settings) {
-  const safe = stripCredentialSettings(settings);
+  const safe = Object.fromEntries(Object.entries(settings && typeof settings === 'object' ? settings : {})
+    .filter(([key, value]) => PROFILE_SETTING_KEYS.has(key) && ['string', 'number', 'boolean'].includes(typeof value))
+    .map(([key, value]) => [key, String(value)]));
+  if ('llmExtraParams' in safe) safe.llmExtraParams = sanitizeExtraParams(safe.llmExtraParams);
   ['llmProxyUrl', 'llmSearchApiUrl', 'llmCorsProxy'].forEach(key => {
     if (safe[key] != null) safe[key] = sanitizeStoredUrl(safe[key]);
   });
@@ -216,7 +252,7 @@ function normalizePresetRecords(raw) {
       name: String(preset.name || 'Untitled').slice(0, 120),
       persona: String(preset.persona || ''),
       temperature: String(preset.temperature ?? ''),
-      extraParams: String(preset.extraParams || '')
+      extraParams: sanitizeExtraParams(preset.extraParams)
     };
     const promptEntries = normalizePromptEntries(preset.promptEntries);
     if (promptEntries) normalized.promptEntries = promptEntries;
@@ -227,6 +263,7 @@ function normalizePresetRecords(raw) {
 
 function normalizeStructuredSettingValue(key, value) {
   if (value === null || value === undefined) return null;
+  if (key === 'llmExtraParams') return sanitizeExtraParams(value);
   if (!['llmPromptEntries', 'assistantPresets', 'assistantProfiles', 'assistantCustomTheme'].includes(key)) return String(value);
   try {
     const parsed = JSON.parse(String(value));
@@ -332,6 +369,13 @@ function getEmotionSpriteAssetUrl(name) {
   return EMOTION_SPRITE_ASSET_URLS[name] || EMOTION_SPRITE_ASSET_PATH + name + '.webp';
 }
 
+function getFocusReturnTarget(fallback = null) {
+  const active = document.activeElement;
+  const menu = active?.closest('[role="menu"]');
+  const trigger = menu?.id && document.querySelector('[aria-controls="' + CSS.escape(menu.id) + '"]');
+  return trigger || (active instanceof HTMLElement && active !== document.body ? active : fallback);
+}
+
 function openModal(modalOrId, focusSelector) {
   const modal = typeof modalOrId === 'string' ? document.getElementById(modalOrId) : modalOrId;
   if (!modal) return;
@@ -344,7 +388,7 @@ function openModal(modalOrId, focusSelector) {
   }
 
   if (!modal.classList.contains('open')) {
-    modalFocusReturn.set(modal, document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    modalFocusReturn.set(modal, getFocusReturnTarget(document.getElementById('toolbarMoreBtn')));
     modal.classList.add('open');
   }
   modal.inert = false;
@@ -352,9 +396,12 @@ function openModal(modalOrId, focusSelector) {
 
   if (!openModalStack.includes(modal)) openModalStack.push(modal);
 
-  const focusTarget = (focusSelector && modal.querySelector(focusSelector)) || getFocusableElements(dialog)[0] || dialog;
   requestAnimationFrame(() => {
-    if (focusTarget && typeof focusTarget.focus === 'function') focusTarget.focus();
+    if (!modal.classList.contains('open') || modal.inert) return;
+    const focusable = getFocusableElements(dialog);
+    const preferred = focusSelector && modal.querySelector(focusSelector);
+    const focusTarget = focusable.includes(preferred) ? preferred : focusable[0] || dialog;
+    focusTarget.focus();
   });
 }
 
@@ -366,7 +413,12 @@ function closeModal(modalOrId, restoreFocus = true) {
     return;
   }
   if (modal.id === 'projectsModal') void flushProjectAutosave();
-  if (modal.id === 'settingsModal') flushSettingsAutosaves();
+  if (modal.id === 'settingsModal') {
+    flushSettingsAutosaves();
+    if (dirtySettingsTabs.size && !confirm('Discard unsaved ' + Array.from(dirtySettingsTabs, tab => tab === 'api' ? 'API' : 'Tools').join(' and ') + ' changes? Choose Cancel to keep editing, then use Save.')) return;
+    dirtySettingsTabs.clear();
+    updateSettingsFooter();
+  }
   modal.classList.remove('open');
   modal.inert = true;
   modal.setAttribute('aria-hidden', 'true');
@@ -379,7 +431,7 @@ function closeModal(modalOrId, restoreFocus = true) {
 
   if (!restoreFocus) return;
   const prevFocus = modalFocusReturn.get(modal);
-  if (prevFocus && document.contains(prevFocus) && typeof prevFocus.focus === 'function') {
+  if (prevFocus && getFocusableElements(document).includes(prevFocus)) {
     prevFocus.focus();
   }
 }
@@ -480,10 +532,17 @@ function announce(message) {
   requestAnimationFrame(() => { live.textContent = String(message || ''); });
 }
 
-function sanitizeErrorDetail(error) {
+function sanitizeErrorDetail(error, secrets = []) {
   if (error == null || String(error?.message || error || '').trim() === '') return '';
   let text = String(error?.message || error);
-  text = text.replace(/(authorization|x-api-key|api[-_ ]?key|token|secret)\s*[:=]\s*[^\s,;]+/ig, '$1: [redacted]');
+  const known = [...secrets, getStoredApiCredential().value,
+    ...['llmSearchApiKey', 'assistantSyncGistToken', 'assistantSyncPassphrase'].map(key => localStorage.getItem(key))];
+  known.filter(value => typeof value === 'string' && value).forEach(value => {
+    for (const encoded of [JSON.stringify(value).slice(1, -1), value]) text = text.split(encoded).join('[redacted]');
+  });
+  text = text.replace(/\\+(?=["'])/g, '');
+  text = text.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9+/_=.\-]+/ig, '$1 [redacted]');
+  text = text.replace(/(["']?(?:authorization|x-api-key|api[-_ ]?key|(?:access|refresh)[-_]?token|token|secret|password|passphrase)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/ig, '$1[redacted]');
   text = text.replace(/https?:\/\/[^\s]+/ig, match => {
     try { const url = new URL(match); return url.origin + url.pathname; } catch { return '[url]'; }
   });
@@ -516,13 +575,21 @@ function renderConversationHeader() {
   if (contextTitle) contextTitle.textContent = title;
 }
 
-function readCachedModels() {
+function modelCacheKey(baseUrl = localStorage.getItem('llmProxyUrl') || '', provider = localStorage.getItem('llmProvider') || '', apiFormat = localStorage.getItem('llmApiFormat') || 'auto') {
+  const base = sanitizeStoredUrl(String(baseUrl).replace(/\/(?:chat\/completions|messages)\/?$/i, '')).replace(/\/+$/, '');
+  return 'llmModelCache:' + JSON.stringify([base, provider || inferRequestProvider({ llmProxyUrl: base, llmApiFormat: apiFormat }), apiFormat]);
+}
+
+function readModelMetadata(key = modelCacheKey()) {
   try {
-    const models = JSON.parse(localStorage.getItem('llmModelList') || '[]');
-    return Array.isArray(models) ? models.filter(model => typeof model === 'string' && model.trim()) : [];
+    return normalizeModelMetadata(JSON.parse(localStorage.getItem(key) || '[]'));
   } catch (e) {
     return [];
   }
+}
+
+function readCachedModels() {
+  return readModelMetadata().map(model => model.id);
 }
 
 function renderConnectionPicker(query = '') {
@@ -614,33 +681,47 @@ function getKeyStorageMode() {
   return localStorage.getItem('llmApiKey') ? 'remember' : (sessionStorage.getItem('llmApiKey') ? 'session' : 'remember');
 }
 
-function getApiKey() {
-  return (sessionStorage.getItem('llmApiKey') || localStorage.getItem('llmApiKey') || '').trim();
+function getStoredApiCredential() {
+  const value = (sessionStorage.getItem('llmApiKey') || localStorage.getItem('llmApiKey') || '').trim();
+  try {
+    const saved = JSON.parse(value);
+    if (saved && typeof saved.value === 'string' && typeof saved.destination === 'string') return saved;
+  } catch {}
+  // Legacy keys have no recorded destination. Keep them available for explicit confirmation, never transmission.
+  return { value, destination: '' };
+}
+
+function getCredentialDestination(settings) {
+  settings ||= Object.fromEntries(['llmProvider', 'llmProxyUrl', 'llmApiFormat', 'llmModel'].map(key => [key, localStorage.getItem(key) || '']));
+  const provider = inferRequestProvider(settings);
+  const base = sanitizeStoredUrl(String(settings.llmProxyUrl || '').trim().replace(/\/(?:chat\/completions|messages)\/?$/i, '')).replace(/\/+$/, '');
+  return JSON.stringify([base, provider, resolveRequestApiFormat(settings, provider, settings.llmModel || '')]);
+}
+
+function getApiKey(settings) {
+  const saved = getStoredApiCredential();
+  return saved.destination === getCredentialDestination(settings) ? saved.value : '';
+}
+
+function getApiKeyForForm() {
+  const saved = getStoredApiCredential();
+  return saved.destination ? getApiKey() : saved.value;
 }
 
 function setApiKey(key, mode = getKeyStorageMode()) {
   const value = String(key || '').trim();
+  const store = mode === 'session' ? sessionStorage : localStorage;
+  if (value) store.setItem('llmApiKey', JSON.stringify({ value, destination: getCredentialDestination() }));
+  else store.removeItem('llmApiKey');
+  (mode === 'session' ? localStorage : sessionStorage).removeItem('llmApiKey');
   localStorage.setItem('llmKeyStorage', mode === 'session' ? 'session' : 'remember');
-  localStorage.removeItem('llmApiKey');
-  sessionStorage.removeItem('llmApiKey');
-  if (value) (mode === 'session' ? sessionStorage : localStorage).setItem('llmApiKey', value);
-  if (mode === 'session') scrubProfileSecrets('llmApiKey');
+  scrubProfileSecrets();
 }
 
-function scrubProfileSecrets(field = null) {
+function scrubProfileSecrets() {
   const profiles = loadProfiles();
-  let changed = false;
-  profiles.forEach(profile => {
-    if (!profile.settings) return;
-    const safe = field
-      ? Object.fromEntries(Object.entries(profile.settings).filter(([key]) => key !== field))
-      : stripCredentialSettings(profile.settings);
-    if (JSON.stringify(safe) !== JSON.stringify(profile.settings)) {
-      profile.settings = safe;
-      changed = true;
-    }
-  });
-  if (changed) saveProfiles(profiles);
+  const raw = localStorage.getItem('assistantProfiles');
+  if (raw !== null && raw !== JSON.stringify(profiles)) saveProfiles(profiles);
 }
 
 function getSelectedKeyStorage(target) {
@@ -696,13 +777,20 @@ function normalizeQueuedFollowUps(raw) {
 function normalizeConversationRecord(raw) {
   const conv = raw && typeof raw === 'object' ? raw : {};
   const normalized = { ...conv };
+  const text = value => ['string', 'number', 'boolean'].includes(typeof value) ? String(value) : '';
+  const object = value => value && typeof value === 'object' && !Array.isArray(value);
+  const number = value => ['number', 'string'].includes(typeof value) && Number.isFinite(Number(value)) ? Number(value) : 0;
+  const sources = value => (Array.isArray(value) ? value : []).filter(object).map(source => ({
+    ...source, title: text(source.title), snippet: text(source.snippet), url: safeHttpUrl(text(source.url)),
+    number: number(source.number), sourceNumber: number(source.sourceNumber)
+  })).filter(source => source.url || source.title);
   delete normalized.temporary;
   delete normalized.isTemporary;
-  normalized.id = String(normalized.id || '');
+  normalized.id = text(normalized.id);
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(normalized.id)) normalized.id = genId();
-  normalized.title = String(normalized.title || 'New Chat');
-  normalized.createdAt = Number(normalized.createdAt) || Date.now();
-  normalized.updatedAt = Number(normalized.updatedAt) || normalized.createdAt;
+  normalized.title = text(normalized.title) || 'New Chat';
+  normalized.createdAt = number(normalized.createdAt) > 0 ? number(normalized.createdAt) : Date.now();
+  normalized.updatedAt = number(normalized.updatedAt) > 0 ? number(normalized.updatedAt) : normalized.createdAt;
   normalized.messages = (Array.isArray(normalized.messages) ? normalized.messages : [])
     .filter(message => message && (message.role === 'user' || message.role === 'assistant' || message.role === 'system'))
     .map(source => {
@@ -710,19 +798,19 @@ function normalizeConversationRecord(raw) {
       if (Array.isArray(message.content)) {
         message.content = message.content.map(part => {
           if (!part || typeof part !== 'object') return null;
-          if (part.type === 'text') return { type: 'text', text: String(part.text ?? '') };
+          if (part.type === 'text') return { type: 'text', text: text(part.text) };
           if (part.type === 'image_url') {
-            const url = safeMediaUrl(part.image_url?.url);
+            const url = safeMediaUrl(text(part.image_url?.url));
             return url ? { type: 'image_url', image_url: { ...(part.image_url || {}), url } } : null;
           }
           if (part.type === 'file') {
             const file = part.file && typeof part.file === 'object' ? part.file : {};
-            const url = file.url ? safeFileUrl(file.url) : '';
+            const url = file.url ? safeFileUrl(text(file.url)) : '';
             if (!url && typeof file.textContent !== 'string') return null;
             return { type: 'file', file: {
               ...file,
-              name: String(file.name || 'file'),
-              mime: String(file.mime || ''),
+              name: text(file.name) || 'file',
+              mime: text(file.mime),
               url,
               textContent: typeof file.textContent === 'string' ? file.textContent : ''
             } };
@@ -730,23 +818,40 @@ function normalizeConversationRecord(raw) {
           return null;
         }).filter(Boolean);
       } else if (typeof message.content !== 'string') {
-        message.content = message.content == null ? '' : String(message.content);
+        message.content = object(message.content) ? JSON.stringify(message.content) : text(message.content);
       }
-      if (Array.isArray(message.images)) message.images = message.images.map(safeMediaUrl).filter(Boolean);
-      if (Array.isArray(message.swipeImages)) message.swipeImages = message.swipeImages.map(images => (Array.isArray(images) ? images.map(safeMediaUrl).filter(Boolean) : []));
-      if (Array.isArray(message.swipeSources)) message.swipeSources = message.swipeSources.map(sources => (Array.isArray(sources) ? sources.map(source => ({ ...source, url: safeHttpUrl(source?.url) })).filter(source => source.url) : []));
-      if (Array.isArray(message.swipeToolUse)) message.swipeToolUse = message.swipeToolUse.map(blocks => (Array.isArray(blocks) ? blocks.map(block => ({
-        ...block,
-        url: block?.url ? safeHttpUrl(block.url) : block?.url,
-        results: Array.isArray(block?.results) ? block.results.map(result => ({ ...result, url: safeHttpUrl(result?.url) })).filter(result => result.url || result.title) : block?.results
-      })) : []));
+      ['images', 'swipeImages', 'swipeThinking', 'swipeSources', 'swipeToolUse', 'swipeRequests', 'swipeLlms', 'swipeTokenEstimates'].forEach(key => {
+        if (key in message && !Array.isArray(message[key])) message[key] = [];
+      });
+      if (message.images) message.images = message.images.map(value => safeMediaUrl(text(value))).filter(Boolean);
+      if (message.swipeImages) message.swipeImages = message.swipeImages.map(images => (Array.isArray(images) ? images.map(value => safeMediaUrl(text(value))).filter(Boolean) : []));
+      if (message.swipeThinking) message.swipeThinking = message.swipeThinking.map(text);
+      if (message.swipeSources) message.swipeSources = message.swipeSources.map(sources);
+      if (message.swipeToolUse) message.swipeToolUse = message.swipeToolUse.map(blocks => (Array.isArray(blocks) ? blocks : []).filter(object).map(block => ({
+        ...block, type: text(block.type), query: text(block.query), content: text(block.content),
+        error: text(block.error), url: safeHttpUrl(text(block.url)), results: sources(block.results)
+      })));
+      if (message.swipeRequests) message.swipeRequests = message.swipeRequests.map(request => {
+        if (!object(request)) return null;
+        const safe = { ...request };
+        ['status', 'requestId', 'model', 'apiFormat', 'error'].forEach(key => { if (key in safe) safe[key] = text(safe[key]); });
+        ['startedAt', 'completedAt', 'durationMs', 'httpStatus', 'messageCount', 'promptTokens', 'contextWindow'].forEach(key => {
+          if (key in safe) safe[key] = safe[key] != null && ['number', 'string'].includes(typeof safe[key]) ? number(safe[key]) : null;
+        });
+        return safe;
+      });
+      const llm = value => object(value) ? Object.fromEntries(Object.entries(value).map(([key, value]) => [key, text(value)])) : null;
+      if (message.swipeLlms) message.swipeLlms = message.swipeLlms.map(llm);
+      if ('llm' in message) message.llm = llm(message.llm);
+      ['model', 'apiFormat'].forEach(key => { if (key in message) message[key] = text(message[key]); });
+      if ('timestamp' in message) message.timestamp = number(message.timestamp);
       if (message.role === 'assistant') {
         if (message.comparison !== true) delete message.comparison;
-        message.swipes = Array.isArray(message.swipes) ? message.swipes.map(value => String(value ?? '')) : [];
-        if (message.swipes.length === 0) {
-          const content = Array.isArray(message.content)
-            ? message.content.filter(part => part.type === 'text').map(part => part.text).join('')
-            : message.content;
+        message.swipes = Array.isArray(message.swipes) ? message.swipes.map(value => object(value) ? JSON.stringify(value) : text(value)) : [];
+        const content = Array.isArray(message.content)
+          ? message.content.filter(part => part.type === 'text').map(part => part.text).join('')
+          : message.content;
+        if (message.swipes.length === 0 || (content && message.swipes.every(value => !value))) {
           message.swipes = [String(content || '')];
         }
         if (!Number.isInteger(message.swipeIndex)) message.swipeIndex = 0;
@@ -756,18 +861,37 @@ function normalizeConversationRecord(raw) {
       if (message.includeInContext !== false) message.includeInContext = true;
       return message;
     });
-  if (normalized.characterAvatar) normalized.characterAvatar = safeMediaUrl(normalized.characterAvatar);
+  if (normalized.characterAvatar) normalized.characterAvatar = safeMediaUrl(text(normalized.characterAvatar));
+  if (object(normalized.characterCard)) {
+    normalized.characterCard = { ...normalized.characterCard };
+    ['name', 'description', 'personality', 'scenario', 'first_mes', 'system_prompt', 'mes_example', 'creator_notes'].forEach(key => {
+      if (key in normalized.characterCard) normalized.characterCard[key] = text(normalized.characterCard[key]);
+    });
+  } else delete normalized.characterCard;
+  ['sortOrder', 'archivedAt', 'summaryUpdatedAt'].forEach(key => {
+    if (key in normalized) normalized[key] = normalized[key] == null ? null : number(normalized[key]);
+  });
+  ['summary', 'persona', 'characterDescription', 'characterSystemPrompt'].forEach(key => {
+    if (key in normalized) normalized[key] = text(normalized[key]);
+  });
+  if ('docs' in normalized) normalized.docs = (Array.isArray(normalized.docs) ? normalized.docs : []).filter(object).map(doc => ({ ...doc, name: text(doc.name), text: text(doc.text) }));
   if (!TAG_COLORS.some(tag => tag.name === normalized.tag)) delete normalized.tag;
   if (!normalized.toolPolicy || typeof normalized.toolPolicy !== 'object') normalized.toolPolicy = null;
-  normalized.goal = String(normalized.goal || '').slice(0, 4000);
-  normalized.parentConversationId = String(normalized.parentConversationId || '');
+  normalized.goal = text(normalized.goal).slice(0, 4000);
+  normalized.parentConversationId = text(normalized.parentConversationId);
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(normalized.parentConversationId) || normalized.parentConversationId === normalized.id) delete normalized.parentConversationId;
   if (!Number.isInteger(normalized.forkMessageIndex) || normalized.forkMessageIndex < 0) delete normalized.forkMessageIndex;
-  normalized.forkedAt = Number(normalized.forkedAt);
+  normalized.forkedAt = number(normalized.forkedAt);
   if (!Number.isFinite(normalized.forkedAt) || normalized.forkedAt <= 0) delete normalized.forkedAt;
-  normalized.queuedFollowUps = normalizeQueuedFollowUps(normalized.queuedFollowUps);
-  if (!normalized.draft || typeof normalized.draft !== 'object') normalized.draft = { text: '', attachments: [] };
-  normalized.draft.attachments = cloneDraftAttachments(normalized.draft.attachments);
+  normalized.queuedFollowUps = normalizeQueuedFollowUps((Array.isArray(normalized.queuedFollowUps) ? normalized.queuedFollowUps : []).filter(object).map(item => ({
+    ...item, id: text(item.id), text: text(item.text), modelOverride: text(item.modelOverride), createdAt: number(item.createdAt)
+  })));
+  const draft = object(normalized.draft) ? normalized.draft : {};
+  normalized.draft = { ...draft, text: text(draft.text), attachments: cloneDraftAttachments(draft.attachments) };
+  if ('updatedAt' in draft) normalized.draft.updatedAt = number(draft.updatedAt);
+  if (normalized.syncVersion) normalized.syncVersion = normalizeConversationVersion(normalized.syncVersion);
+  if (normalized.conflictOf && (typeof normalized.conflictOf !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(normalized.conflictOf))) delete normalized.conflictOf;
+  if ('conflictTitle' in normalized) normalized.conflictTitle = text(normalized.conflictTitle);
   return normalized;
 }
 
@@ -838,12 +962,12 @@ function summarizeContentPartForDebug(part, includeText) {
     return {
       type,
       chars: String(part.text || '').length,
-      text: includeText ? part.text || '' : shortenForDebug(part.text || '')
+      text: includeText ? part.text || '' : '[redacted text]'
     };
   }
   if (type === 'image_url') {
     const url = part.image_url?.url || '';
-    return { type, imageUrl: url ? shortenForDebug(url, 80) : '' };
+    return { type, imageUrl: url ? (includeText ? shortenForDebug(url, 80) : '[redacted image]') : '' };
   }
   if (type === 'file') {
     const file = part.file || {};
@@ -867,7 +991,7 @@ function summarizeMessageForDebug(message, includeText) {
     summary.content = {
       type: 'text',
       chars: message.content.length,
-      text: includeText ? message.content : shortenForDebug(message.content)
+      text: includeText ? message.content : '[redacted text]'
     };
   } else if (message.content === null) {
     summary.content = null;
@@ -879,7 +1003,7 @@ function summarizeMessageForDebug(message, includeText) {
       id: tc.id,
       type: tc.type,
       name: tc.function?.name || tc.name || '',
-      arguments: includeText ? tc.function?.arguments : shortenForDebug(tc.function?.arguments || '')
+      arguments: includeText ? tc.function?.arguments : '[redacted arguments]'
     }));
   }
   if (message.tool_call_id) summary.toolCallId = message.tool_call_id;
@@ -901,7 +1025,7 @@ function summarizeLlmPayloadForDebug(payload, includeText = isDebugTextIncluded(
     summary.system = {
       chars: systemText.length,
       cached,
-      text: includeText ? systemText : shortenForDebug(systemText)
+      text: includeText ? systemText : '[redacted text]'
     };
   }
   if (Array.isArray(payload?.messages)) {
@@ -1233,44 +1357,44 @@ function showToast(message, type = 'info', duration = 3000, action = null) {
 // ============================================
 const themePresets = {
   dark:       { bg:'#0f1310', sidebar:'#151a16', cardBorder:'#2a332c', textPrimary:'#d8ded7', textSecondary:'#8d998e', accent:'#789a7f', accentHover:'#8aae91', msgUser:'#223128', msgAssistant:'transparent', borderRadius:'9px', msgMaxWidth:'76%', codeBg:'#111713' },
-  light:      { bg:'#f5f5f7', sidebar:'#eeeef2', cardBorder:'rgba(0,0,0,0.1)', textPrimary:'rgba(0,0,0,0.9)', textSecondary:'rgba(0,0,0,0.5)', accent:'#6366f1', accentHover:'#818cf8', msgUser:'#6366f1', msgAssistant:'rgba(0,0,0,0.05)' },
+  light:      { bg:'#f5f5f7', sidebar:'#eeeef2', cardBorder:'rgba(0,0,0,0.1)', textPrimary:'rgba(0,0,0,0.9)', textSecondary:'#646565', accent:'#5457c9', accentHover:'#565ea0', msgUser:'#5457c9', msgAssistant:'rgba(0,0,0,0.05)' },
   nord:       { bg:'#2e3440', sidebar:'#3b4252', cardBorder:'#434c5e', textPrimary:'#eceff4', textSecondary:'#d8dee9', accent:'#88c0d0', accentHover:'#8fbcbb', msgUser:'#5e81ac', msgAssistant:'#3b4252' },
   catppuccin: { bg:'#1e1e2e', sidebar:'#313244', cardBorder:'#45475a', textPrimary:'#cdd6f4', textSecondary:'#a6adc8', accent:'#cba6f7', accentHover:'#b4befe', msgUser:'#cba6f7', msgAssistant:'#313244' },
-  dracula:    { bg:'#282a36', sidebar:'#44475a', cardBorder:'#6272a4', textPrimary:'#f8f8f2', textSecondary:'#bd93f9', accent:'#bd93f9', accentHover:'#ff79c6', msgUser:'#bd93f9', msgAssistant:'#44475a' },
-  gruvbox:    { bg:'#282828', sidebar:'#3c3836', cardBorder:'#504945', textPrimary:'#ebdbb2', textSecondary:'#a89984', accent:'#fabd2f', accentHover:'#fe8019', msgUser:'#fabd2f', msgAssistant:'#3c3836' },
-  tokyonight: { bg:'#1a1b26', sidebar:'#24283b', cardBorder:'#414868', textPrimary:'#c0caf5', textSecondary:'#565f89', accent:'#7aa2f7', accentHover:'#bb9af7', msgUser:'#7aa2f7', msgAssistant:'#24283b' },
-  solarized:  { bg:'#002b36', sidebar:'#073642', cardBorder:'#586e75', textPrimary:'#fdf6e3', textSecondary:'#93a1a1', accent:'#268bd2', accentHover:'#2aa198', msgUser:'#268bd2', msgAssistant:'#073642' },
-  onedark:    { bg:'#282c34', sidebar:'#21252b', cardBorder:'#3e4451', textPrimary:'#abb2bf', textSecondary:'#5c6370', accent:'#61afef', accentHover:'#c678dd', msgUser:'#61afef', msgAssistant:'#2c313c' },
+  dracula:    { bg:'#282a36', sidebar:'#44475a', cardBorder:'#6272a4', textPrimary:'#f8f8f2', textSecondary:'#cdaff8', accent:'#cdaff8', accentHover:'#fd9ed4', msgUser:'#bd93f9', msgAssistant:'#44475a' },
+  gruvbox:    { bg:'#282828', sidebar:'#3c3836', cardBorder:'#504945', textPrimary:'#ebdbb2', textSecondary:'#b2a593', accent:'#fabd2f', accentHover:'#fe8019', msgUser:'#fabd2f', msgAssistant:'#3c3836' },
+  tokyonight: { bg:'#1a1b26', sidebar:'#24283b', cardBorder:'#414868', textPrimary:'#c0caf5', textSecondary:'#8e95af', accent:'#7aa2f7', accentHover:'#bb9af7', msgUser:'#7aa2f7', msgAssistant:'#24283b' },
+  solarized:  { bg:'#002b36', sidebar:'#073642', cardBorder:'#586e75', textPrimary:'#fdf6e3', textSecondary:'#93a1a1', accent:'#58a5db', accentHover:'#47ada5', msgUser:'#268bd2', msgAssistant:'#073642' },
+  onedark:    { bg:'#282c34', sidebar:'#21252b', cardBorder:'#3e4451', textPrimary:'#abb2bf', textSecondary:'#989ea4', accent:'#61afef', accentHover:'#ca82df', msgUser:'#61afef', msgAssistant:'#2c313c' },
   rosepine:   { bg:'#191724', sidebar:'#1f1d2e', cardBorder:'#26233a', textPrimary:'#e0def4', textSecondary:'#908caa', accent:'#c4a7e7', accentHover:'#ebbcba', msgUser:'#c4a7e7', msgAssistant:'#1f1d2e' },
   // Gallery
   monochrome:     { bg:'#131313', sidebar:'#222222', cardBorder:'#333333', textPrimary:'#e0e0e0', textSecondary:'rgba(224,224,224,0.6)', accent:'#FCFCFC', accentHover:'#ffffff', msgUser:'#FCFCFC', msgAssistant:'#222222' },
   pewter:         { bg:'#222222', sidebar:'#333333', cardBorder:'#444444', textPrimary:'#e0e0e0', textSecondary:'rgba(224,224,224,0.6)', accent:'#D9D9D9', accentHover:'#eeeeee', msgUser:'#D9D9D9', msgAssistant:'#333333' },
   deepSea:        { bg:'#061234', sidebar:'#0f1e44', cardBorder:'#182a54', textPrimary:'#d0e0d0', textSecondary:'rgba(208,224,208,0.6)', accent:'#50AA09', accentHover:'#6ec42a', msgUser:'#50AA09', msgAssistant:'#0f1e44' },
-  gunmetal:       { bg:'#1E212B', sidebar:'#2a2e3a', cardBorder:'#363a48', textPrimary:'#c8cdd2', textSecondary:'rgba(200,205,210,0.6)', accent:'#5B6B76', accentHover:'#7b8b96', msgUser:'#5B6B76', msgAssistant:'#2a2e3a' },
-  clearSky:       { bg:'#1e4c84', sidebar:'#2a5a94', cardBorder:'#3668a4', textPrimary:'#e0f0ff', textSecondary:'rgba(224,240,255,0.6)', accent:'#7ed6ff', accentHover:'#9ee6ff', msgUser:'#7ed6ff', msgAssistant:'#2a5a94' },
-  cobalt:         { bg:'#0D55B2', sidebar:'#1a64c0', cardBorder:'#2874d0', textPrimary:'#e0f0f8', textSecondary:'rgba(224,240,248,0.6)', accent:'#249CB6', accentHover:'#44bcd6', msgUser:'#249CB6', msgAssistant:'#1a64c0' },
+  gunmetal:       { bg:'#1E212B', sidebar:'#2a2e3a', cardBorder:'#363a48', textPrimary:'#c8cdd2', textSecondary:'#979ba2', accent:'#929da3', accentHover:'#8f9da5', msgUser:'#5B6B76', msgAssistant:'#2a2e3a' },
+  clearSky:       { bg:'#1e4c84', sidebar:'#2a5a94', cardBorder:'#3668a4', textPrimary:'#e0f0ff', textSecondary:'#c9d8e6', accent:'#9cdffd', accentHover:'#9ee6ff', msgUser:'#7ed6ff', msgAssistant:'#2a5a94', danger:'#f5ccca', success:'#a4e5bb', warning:'#f0d478' },
+  cobalt:         { bg:'#0D55B2', sidebar:'#1a64c0', cardBorder:'#2874d0', textPrimary:'#e0f0f8', textSecondary:'#e3ecf2', accent:'#deeeee', accentHover:'#d9eff1', msgUser:'#249CB6', msgAssistant:'#1a64c0', danger:'#f6e7e4', success:'#d5f1de', warning:'#f4ebc6' },
   nightshade:     { bg:'#07040C', sidebar:'#16121e', cardBorder:'#251e30', textPrimary:'#e0d8e8', textSecondary:'rgba(224,216,232,0.6)', accent:'#BDA8DC', accentHover:'#ddc8fc', msgUser:'#BDA8DC', msgAssistant:'#16121e' },
-  plumWine:       { bg:'#1E2233', sidebar:'#2a2e44', cardBorder:'#363a54', textPrimary:'#dcd0e0', textSecondary:'rgba(220,208,224,0.6)', accent:'#822195', accentHover:'#a241b5', msgUser:'#822195', msgAssistant:'#2a2e44' },
-  neonDusk:       { bg:'#495495', sidebar:'#5a64a5', cardBorder:'#6a74b5', textPrimary:'#f0e0f8', textSecondary:'rgba(240,224,248,0.6)', accent:'#ff7edb', accentHover:'#ff9eeb', msgUser:'#ff7edb', msgAssistant:'#5a64a5' },
-  lavenderHaze:   { bg:'#5D69CE', sidebar:'#6d79de', cardBorder:'#7d89ee', textPrimary:'#f0e8f0', textSecondary:'rgba(240,232,240,0.6)', accent:'#A45785', accentHover:'#c477a5', msgUser:'#A45785', msgAssistant:'#6d79de' },
+  plumWine:       { bg:'#1E2233', sidebar:'#2a2e44', cardBorder:'#363a54', textPrimary:'#dcd0e0', textSecondary:'#9e99a9', accent:'#bb8bc5', accentHover:'#c287ce', msgUser:'#822195', msgAssistant:'#2a2e44' },
+  neonDusk:       { bg:'#495495', sidebar:'#5a64a5', cardBorder:'#6a74b5', textPrimary:'#f4edf7', textSecondary:'#eeeff2', accent:'#f8edf3', accentHover:'#f8ecf4', msgUser:'#ff7edb', msgAssistant:'#5a64a5', danger:'#f7eeeb', success:'#e2f4e7', warning:'#f5f0d7' },
+  lavenderHaze:   { bg:'#414b96', sidebar:'#4b56ab', cardBorder:'#7d89ee', textPrimary:'#f0e8f0', textSecondary:'#e2dfee', accent:'#f0d8ed', accentHover:'#f5e1f1', msgUser:'#A45785', msgAssistant:'#4b56ab', danger:'#ffe5e5', success:'#c9f0d8', warning:'#f7e4b5' },
   jadeMist:       { bg:'#14161E', sidebar:'#20222e', cardBorder:'#2c2e3e', textPrimary:'#d8e8e0', textSecondary:'rgba(216,232,224,0.6)', accent:'#95D3AF', accentHover:'#b5f3cf', msgUser:'#95D3AF', msgAssistant:'#20222e' },
-  mossStone:      { bg:'#373C3F', sidebar:'#454b4f', cardBorder:'#555b5f', textPrimary:'#d8e8d8', textSecondary:'rgba(216,232,216,0.6)', accent:'#83B38E', accentHover:'#a3d3ae', msgUser:'#83B38E', msgAssistant:'#454b4f' },
-  emeraldForest:  { bg:'#295233', sidebar:'#376243', cardBorder:'#457253', textPrimary:'#d8f0d0', textSecondary:'rgba(216,240,208,0.6)', accent:'#89E574', accentHover:'#a9ff94', msgUser:'#89E574', msgAssistant:'#376243' },
+  mossStone:      { bg:'#373C3F', sidebar:'#454b4f', cardBorder:'#555b5f', textPrimary:'#d8e8d8', textSecondary:'#b9c2bb', accent:'#a6c8ad', accentHover:'#a3d3ae', msgUser:'#83B38E', msgAssistant:'#454b4f' },
+  emeraldForest:  { bg:'#295233', sidebar:'#376243', cardBorder:'#457253', textPrimary:'#d8f0d0', textSecondary:'#cadaca', accent:'#89E574', accentHover:'#a9ff94', msgUser:'#89E574', msgAssistant:'#376243', danger:'#f5ccca', success:'#a4e5bb', warning:'#f0d478' },
   winterBreeze:   { bg:'#141b1e', sidebar:'#20282e', cardBorder:'#2c343e', textPrimary:'#d0e0f0', textSecondary:'rgba(208,224,240,0.6)', accent:'#67b0e8', accentHover:'#87d0ff', msgUser:'#67b0e8', msgAssistant:'#20282e' },
   neonNoir:       { bg:'#000000', sidebar:'#141414', cardBorder:'#282828', textPrimary:'#e0e0e0', textSecondary:'rgba(224,224,224,0.6)', accent:'#fada16', accentHover:'#ffea46', msgUser:'#fada16', msgAssistant:'#141414' },
-  hotPink:        { bg:'#2d2a2e', sidebar:'#3d3a3e', cardBorder:'#4d4a4e', textPrimary:'#f8f8f2', textSecondary:'rgba(248,248,242,0.6)', accent:'#f92672', accentHover:'#ff4692', msgUser:'#f92672', msgAssistant:'#3d3a3e' },
+  hotPink:        { bg:'#2d2a2e', sidebar:'#3d3a3e', cardBorder:'#4d4a4e', textPrimary:'#f8f8f2', textSecondary:'rgba(248,248,242,0.6)', accent:'#f887af', accentHover:'#fc83b4', msgUser:'#f92672', msgAssistant:'#3d3a3e' },
   roseQuartz:     { bg:'#161616', sidebar:'#262626', cardBorder:'#363636', textPrimary:'#e8d8e0', textSecondary:'rgba(232,216,224,0.6)', accent:'#EE5396', accentHover:'#ff73b6', msgUser:'#EE5396', msgAssistant:'#262626' },
   ember:          { bg:'#0D0D0D', sidebar:'#1d1d1d', cardBorder:'#2d2d2d', textPrimary:'#e8d8c8', textSecondary:'rgba(232,216,200,0.6)', accent:'#E0701E', accentHover:'#ff903e', msgUser:'#E0701E', msgAssistant:'#1d1d1d' },
   moltenCore:     { bg:'#351810', sidebar:'#452820', cardBorder:'#553830', textPrimary:'#f0e0c8', textSecondary:'rgba(240,224,200,0.6)', accent:'#FABD2F', accentHover:'#ffdd4f', msgUser:'#FABD2F', msgAssistant:'#452820' },
-  orchidTeal:     { bg:'#821595', sidebar:'#9225a5', cardBorder:'#a235b5', textPrimary:'#e0f0f0', textSecondary:'rgba(224,240,240,0.6)', accent:'#259E9C', accentHover:'#45bebc', msgUser:'#259E9C', msgAssistant:'#9225a5' },
-  acidGlow:       { bg:'#4B0082', sidebar:'#5b1092', cardBorder:'#6b20a2', textPrimary:'#d8f8e0', textSecondary:'rgba(216,248,224,0.6)', accent:'#00FF66', accentHover:'#33ff88', msgUser:'#00FF66', msgAssistant:'#5b1092' },
+  orchidTeal:     { bg:'#821595', sidebar:'#9225a5', cardBorder:'#a235b5', textPrimary:'#e0f0f0', textSecondary:'#e0d3e7', accent:'#badfdc', accentHover:'#aee1de', msgUser:'#259E9C', msgAssistant:'#9225a5', danger:'#f5cecb', success:'#a6e5bc', warning:'#f1d67f' },
+  acidGlow:       { bg:'#4B0082', sidebar:'#5b1092', cardBorder:'#6b20a2', textPrimary:'#d8f8e0', textSecondary:'#b1a8c8', accent:'#00FF66', accentHover:'#33ff88', msgUser:'#00FF66', msgAssistant:'#5b1092' },
   fjord:          { bg:'#2E3440', sidebar:'#3b4252', cardBorder:'#434c5e', textPrimary:'#eceff4', textSecondary:'#d8dee9', accent:'#88C0D0', accentHover:'#a8e0f0', msgUser:'#88C0D0', msgAssistant:'#3b4252' },
   oxide:          { bg:'#0f1115', sidebar:'#151922', cardBorder:'#252a36', textPrimary:'#e8e6e3', textSecondary:'#a8a3a0', accent:'#f26a2e', accentHover:'#ff7b43', msgUser:'#f26a2e', msgAssistant:'#1b202b', borderRadius:'16px', msgMaxWidth:'72%', codeBg:'rgba(242,106,46,0.08)' },
   blueprint:      { bg:'#0b1220', sidebar:'#101a2e', cardBorder:'#1e2b46', textPrimary:'#e6edf6', textSecondary:'#9fb0c6', accent:'#4aa3ff', accentHover:'#6bb6ff', msgUser:'#4aa3ff', msgAssistant:'#131f33', borderRadius:'18px', msgMaxWidth:'70%', codeBg:'rgba(74,163,255,0.10)' },
-  paperInk:       { bg:'#f6f3ee', sidebar:'#f0ece5', cardBorder:'#d8d3c8', textPrimary:'#1f1b16', textSecondary:'#6e645b', accent:'#2f6fb2', accentHover:'#3f82c8', msgUser:'#2f6fb2', msgAssistant:'#ffffff', borderRadius:'20px', msgMaxWidth:'68%', codeBg:'rgba(47,111,178,0.08)' },
+  paperInk:       { bg:'#f6f3ee', sidebar:'#f0ece5', cardBorder:'#d8d3c8', textPrimary:'#1f1b16', textSecondary:'#6e645b', accent:'#2d69a7', accentHover:'#34699e', msgUser:'#2f6fb2', msgAssistant:'#ffffff', borderRadius:'20px', msgMaxWidth:'68%', codeBg:'rgba(47,111,178,0.08)' },
   moss:           { bg:'#101612', sidebar:'#161d17', cardBorder:'#2a332c', textPrimary:'#e0e7df', textSecondary:'#a6b2a4', accent:'#7ac27b', accentHover:'#8fd990', msgUser:'#7ac27b', msgAssistant:'#1a231c', borderRadius:'16px', msgMaxWidth:'72%', codeBg:'rgba(122,194,123,0.10)' },
-  claude:         { bg:'#FAF9F5', sidebar:'#EBE7DF', cardBorder:'rgba(0,0,0,0.08)', textPrimary:'#1a1915', textSecondary:'rgba(26,25,21,0.55)', accent:'#D97757', accentHover:'#C4684A', msgUser:'#D97757', msgAssistant:'#F3F0E8', borderRadius:'24px', msgMaxWidth:'70%', codeBg:'rgba(0,0,0,0.04)' },
-  claudeDark:     { bg:'#1a1915', sidebar:'#1a1915', cardBorder:'rgba(255,255,255,0.08)', textPrimary:'#e8e4db', textSecondary:'rgba(232,228,219,0.5)', accent:'#D97757', accentHover:'#C4684A', msgUser:'#D97757', msgAssistant:'#2b2a27', borderRadius:'24px', msgMaxWidth:'70%', codeBg:'rgba(0,0,0,0.3)' }
+  claude:         { bg:'#FAF9F5', sidebar:'#EBE7DF', cardBorder:'rgba(0,0,0,0.08)', textPrimary:'#1a1915', textSecondary:'#65645f', accent:'#91533d', accentHover:'#93513a', msgUser:'#D97757', msgAssistant:'#F3F0E8', borderRadius:'24px', msgMaxWidth:'70%', codeBg:'rgba(0,0,0,0.04)' },
+  claudeDark:     { bg:'#1a1915', sidebar:'#1a1915', cardBorder:'rgba(255,255,255,0.08)', textPrimary:'#e8e4db', textSecondary:'#989690', accent:'#D97757', accentHover:'#ce846b', msgUser:'#D97757', msgAssistant:'#2b2a27', borderRadius:'24px', msgMaxWidth:'70%', codeBg:'rgba(0,0,0,0.3)' }
 };
 
 const themeOrder = ['dark','light','nord','catppuccin','dracula','gruvbox','tokyonight','solarized','onedark','rosepine','monochrome','pewter','deepSea','gunmetal','clearSky','cobalt','nightshade','plumWine','neonDusk','lavenderHaze','jadeMist','mossStone','emeraldForest','winterBreeze','neonNoir','hotPink','roseQuartz','ember','moltenCore','orchidTeal','acidGlow','fjord','oxide','blueprint','paperInk','moss','claude','claudeDark'];
@@ -1317,11 +1441,12 @@ function applyTheme(name) {
   s.setProperty('--msg-font-size', t.msgFontSize || '0.95em');
   s.setProperty('--code-bg', t.codeBg || (bgLight ? 'rgba(0,0,0,0.06)' : 'rgba(0,0,0,0.3)'));
   s.setProperty('--card-bg', bgLight ? 'rgba(0, 0, 0, 0.06)' : 'rgba(255, 255, 255, 0.08)');
-  const danger = bgLight ? '#dc2626' : '#ef4444';
-  const dangerHover = bgLight ? '#b91c1c' : '#dc2626';
-  const success = '#22c55e';
-  const warning = '#eab308';
-  s.setProperty('--error-color', bgLight ? '#dc2626' : '#ff7777');
+  const forest = t === themePresets.dark;
+  const danger = t.danger || (bgLight ? '#b91c1c' : forest ? '#ef4444' : '#ffb4b4');
+  const dangerHover = bgLight ? '#991b1b' : forest ? '#f87171' : danger;
+  const success = t.success || (bgLight ? '#166534' : forest ? '#22c55e' : '#4ade80');
+  const warning = t.warning || (bgLight ? '#785c0c' : '#eab308');
+  s.setProperty('--error-color', forest ? '#ff7777' : danger);
   s.setProperty('--danger-color', danger);
   s.setProperty('--danger-hover', dangerHover);
   s.setProperty('--danger-text', getContrastText(danger));
@@ -1693,26 +1818,29 @@ function normalizeModelMetadata(data) {
   }).filter(Boolean);
 }
 
-async function fetchAvailableModelMetadata(baseUrl, apiKey, providerName = inferProviderKey({ llmProxyUrl: baseUrl }), apiFormat = '') {
+async function fetchAvailableModelMetadata(baseUrl, apiKey, providerName = inferRequestProvider({ llmProxyUrl: baseUrl }), apiFormat = '') {
   const provider = getProviderPreset(providerName);
   const normalizedBase = String(baseUrl || '').replace(/\/+$/, '');
   const url = providerName === 'ollama' && /\/v1$/i.test(normalizedBase)
     ? normalizedBase.replace(/\/v1$/i, '') + '/api/tags'
     : normalizedBase + '/models';
-  const resp = await fetchApiWithHttpSupport(url, {
-    headers: buildProviderHeaders(providerName === 'anthropic' || apiFormat === 'anthropic' ? 'anthropic' : provider.apiFormat, apiKey)
-  }, baseUrl);
-  if (!resp.ok) throw new Error('HTTP ' + resp.status);
-  const data = await resp.json();
-  return normalizeModelMetadata(data);
+  try {
+    const resp = await fetchApiWithHttpSupport(url, {
+      headers: buildProviderHeaders(providerName === 'anthropic' || apiFormat === 'anthropic' ? 'anthropic' : provider.apiFormat, apiKey)
+    }, baseUrl);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message || 'Model discovery failed.');
+    return normalizeModelMetadata(data);
+  } catch (error) {
+    throw new Error(sanitizeErrorDetail(error, [apiKey]));
+  }
 }
 
-async function fetchAvailableModels(baseUrl, apiKey) {
-  const providerName = inferProviderKey({ llmProxyUrl: baseUrl });
-  const metadata = await fetchAvailableModelMetadata(baseUrl, apiKey, providerName, localStorage.getItem('llmApiFormat') || '');
-  const map = {};
-  metadata.forEach(model => { if (model.context_length) map[model.id] = model.context_length; });
-  try { localStorage.setItem('llmModelMetadata', JSON.stringify({ ...(JSON.parse(localStorage.getItem('llmModelMetadata') || '{}')), ...map })); } catch(e) {}
+async function fetchAvailableModels(baseUrl, apiKey, providerName = inferRequestProvider({ llmProxyUrl: baseUrl }), apiFormat = getProviderPreset(providerName).apiFormat) {
+  const key = modelCacheKey(baseUrl, providerName, apiFormat);
+  const metadata = await fetchAvailableModelMetadata(baseUrl, apiKey, providerName, apiFormat);
+  try { localStorage.setItem(key, JSON.stringify(metadata)); } catch (e) {}
   return metadata.map(model => model.id);
 }
 
@@ -1720,7 +1848,7 @@ function populateModelSelect(target, models) {
   const select = document.getElementById(target === 'setup' ? 'setupModelSelect' : 'setModelSelect');
   const currentModel = localStorage.getItem('llmModel') || '';
   select.innerHTML = '<option value="">-- Select a model --</option>';
-  models.sort().forEach(m => {
+  models.slice().sort().forEach(m => {
     const opt = document.createElement('option');
     opt.value = m;
     opt.textContent = m;
@@ -1729,33 +1857,42 @@ function populateModelSelect(target, models) {
   });
 }
 
+const modelDiscoveryRequests = new Map();
+
 async function refreshModels(target, btnEl) {
-  const proxyInput = document.getElementById(target === 'setup' ? 'setupProxy' : 'setProxy');
-  const keyInput = document.getElementById(target === 'setup' ? 'setupKey' : 'setKey');
-  let baseUrl = proxyInput.value.trim().replace(/\/(chat\/completions|messages)\/?$/, '');
-  const apiKey = keyInput.value.trim();
-  const providerName = document.getElementById(target === 'setup' ? 'setupProvider' : 'setProvider')?.value || inferProviderKey({ llmProxyUrl: baseUrl });
+  const inputs = getConnectionInputs(target);
+  const baseUrl = inputs.base.value.trim().replace(/\/(chat\/completions|messages)\/?$/, '');
+  const apiKey = inputs.key.value.trim();
+  const providerName = inputs.provider?.value || inferRequestProvider({ llmProxyUrl: baseUrl });
+  const apiFormat = inputs.format?.value || getProviderPreset(providerName).apiFormat;
+  const key = modelCacheKey(baseUrl, providerName, apiFormat);
   if (!baseUrl || (providerRequiresKey({ llmProvider: providerName }) && !apiKey)) { showToast(providerRequiresKey({ llmProvider: providerName }) ? 'Enter Base URL and API Key first.' : 'Enter Base URL first.', 'error'); return; }
+  const token = {};
+  modelDiscoveryRequests.set(target, token);
+  const isCurrent = () => modelDiscoveryRequests.get(target) === token &&
+    key === modelCacheKey(inputs.base.value.trim(), inputs.provider?.value || providerName, inputs.format?.value || apiFormat) && inputs.key.value.trim() === apiKey;
   const btn = btnEl || document.activeElement;
+  modelDiscoveryRequests.set(btn, token);
   btn.classList.add('spinning');
   btn.disabled = true;
   try {
-    const models = await fetchAvailableModels(baseUrl, apiKey);
-    localStorage.setItem('llmModelList', JSON.stringify(models));
-    populateModelSelect(target, models);
+    const metadata = await fetchAvailableModelMetadata(baseUrl, apiKey, providerName, apiFormat);
+    if (!isCurrent()) return;
+    if (key === modelCacheKey()) localStorage.setItem(key, JSON.stringify(metadata));
+    populateModelSelect(target, metadata.map(model => model.id));
   } catch (e) {
-    showToast('Failed to fetch models: ' + e.message, 'error');
+    if (isCurrent()) showToast('Failed to fetch models: ' + sanitizeErrorDetail(e), 'error');
   } finally {
-    btn.classList.remove('spinning');
-    btn.disabled = false;
+    if (modelDiscoveryRequests.get(btn) === token) {
+      btn.classList.remove('spinning');
+      btn.disabled = false;
+      modelDiscoveryRequests.delete(btn);
+    }
   }
 }
 
 function loadCachedModels(target) {
-  try {
-    const cached = JSON.parse(localStorage.getItem('llmModelList') || '[]');
-    if (cached.length > 0) populateModelSelect(target, cached);
-  } catch(e) { console.warn('Cached model list parse error:', e); }
+  populateModelSelect(target, readCachedModels());
 }
 
 // ============================================
@@ -1768,7 +1905,10 @@ function parseEnabledSetting(value) {
 }
 
 function isMemoryEnabled() {
-  return parseEnabledSetting(localStorage.getItem('llmMemoryEnabled'));
+  const enabled = parseEnabledSetting(localStorage.getItem('llmMemoryEnabled'));
+  if (!enabled && memoryEnabledState) memoryEpoch++;
+  memoryEnabledState = enabled;
+  return enabled;
 }
 
 function normalizeMemoryEntry(raw, index, seedTimestamp) {
@@ -1852,15 +1992,16 @@ async function loadMemories() {
   } catch(e) { return []; }
 }
 
-async function saveMemories(memories) {
-  if (readOnlyShare) return;
+async function saveMemories(memories, valid = () => true, removals = []) {
+  if (readOnlyShare || !valid()) return;
   const normalized = syncFilterDeletedRecords(normalizeMemoryList(memories).memories, syncLoadTombstones().memories, 'createdAt');
   if (!db) {
-    localStorage.setItem('assistantMemories', JSON.stringify(normalized));
+    if (removals.length) syncRecordTombstones('memories', removals.map(memory => memory.id), Math.max(Date.now(), ...removals.map(memory => memory.createdAt)));
+    localStorage.setItem('assistantMemories', JSON.stringify(syncFilterDeletedRecords(normalized, syncLoadTombstones().memories, 'createdAt')));
     syncScheduleAutoPush();
     return;
   }
-  await idbPutAll('memories', normalized);
+  await idbPutAll('memories', normalized, valid, removals);
   syncScheduleAutoPush();
 }
 
@@ -1904,6 +2045,8 @@ function buildRequestTarget(settings = {}, options = {}) {
   const temperature = Number.parseFloat(settings.llmTemperature);
   const maxTokens = Number.parseInt(settings.llmMaxTokens, 10);
   const contextWindow = Number.parseInt(settings.llmContextWindow, 10);
+  const cacheKey = modelCacheKey(baseUrl, provider, settings.llmApiFormat || 'auto');
+  const discoveredContext = readModelMetadata(cacheKey).find(item => item.id === model)?.context_length;
   let host = baseUrl;
   try { host = new URL(baseUrl).host; } catch (error) {}
   return Object.freeze({
@@ -1914,8 +2057,17 @@ function buildRequestTarget(settings = {}, options = {}) {
     apiFormat,
     temperature: Number.isFinite(temperature) ? temperature : null,
     maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? maxTokens : null,
-    contextWindow: Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : null,
+    contextWindow: Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : discoveredContext || null,
+    modelCacheKey: cacheKey,
     corsProxy: normalizeCorsProxyUrl(settings.llmCorsProxy || ''),
+    stream: settings.llmStreaming !== 'false',
+    prefill: String(settings.llmPrefill || ''),
+    thinking: settings.llmThinking === 'true',
+    thinkingEffort: String(settings.llmThinkingEffort || ''),
+    promptCache: settings.llmPromptCache !== 'false',
+    forceSearch: settings.llmForceSearch === 'true',
+    extraParams: String(settings.llmExtraParams || ''),
+    excludeParams: String(settings.llmExcludeParams || ''),
     profileId: String(options.profileId || ''),
     profileName: String(options.profileName || ''),
     keyRequired: getProviderPreset(provider).keyRequired,
@@ -1925,10 +2077,14 @@ function buildRequestTarget(settings = {}, options = {}) {
 
 function getActiveRequestTarget(model = localStorage.getItem('llmModel') || '') {
   const settings = {};
-  ['llmProvider', 'llmProxyUrl', 'llmModel', 'llmApiFormat', 'llmTemperature', 'llmMaxTokens', 'llmContextWindow', 'llmCorsProxy']
+  ['llmProvider', 'llmProxyUrl', 'llmModel', 'llmApiFormat', 'llmTemperature', 'llmMaxTokens', 'llmContextWindow', 'llmCorsProxy',
+    'llmStreaming', 'llmPrefill', 'llmThinking', 'llmThinkingEffort', 'llmPromptCache', 'llmForceSearch', 'llmExtraParams', 'llmExcludeParams']
     .forEach(key => { settings[key] = localStorage.getItem(key) || ''; });
   const profile = getActiveProfile();
-  return buildRequestTarget(settings, { model, apiKey: getApiKey(), profileId: profile?.id, profileName: profile?.name });
+  return Object.freeze({
+    ...buildRequestTarget(settings, { model, apiKey: getApiKey({ ...settings, llmModel: model }), profileId: profile?.id, profileName: profile?.name }),
+    toolSettings: Object.freeze(getToolRequestSettings())
+  });
 }
 
 function requestAuthoritiesMatch(left, right) {
@@ -1989,6 +2145,8 @@ function prepareOpenAiMessages(apiMessages) {
 
 async function callApiNonStreaming(messages, options = {}) {
   const target = options.target || getActiveRequestTarget();
+  const signal = options.signal === undefined ? abortController?.signal : options.signal;
+  signal?.throwIfAborted();
   if (target.keyRequired && !target.apiKey) throw new Error('Enter an API key for ' + target.host + '.');
   const outputTokens = Number.isFinite(Number(options.maxTokens)) && Number(options.maxTokens) > 0 ? Number(options.maxTokens) : 512;
   let url;
@@ -2007,51 +2165,53 @@ async function callApiNonStreaming(messages, options = {}) {
     body[tokenKey] = outputTokens;
   }
   if (target.temperature !== null && !NO_SAMPLING_PARAMS_RE.test(target.model)) body.temperature = target.temperature;
+  assertProviderRequestFits(body, target);
 
   const resp = await fetchApiWithHttpSupport(url, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
-    signal: options.signal
+    signal
   }, target.baseUrl, false, target.corsProxy);
   if (!resp.ok) {
     let detail = '';
     try { detail = (await resp.text()).slice(0, 200); } catch (error) {}
-    const error = new Error('API returned ' + resp.status + (detail ? ': ' + detail : ''));
+    const error = new Error(sanitizeErrorDetail('API returned ' + resp.status + (detail ? ': ' + detail : ''), [target.apiKey]));
     error.httpStatus = resp.status;
     throw error;
   }
   const data = await resp.json();
-  const text = target.apiFormat === 'anthropic'
-    ? (data.content || []).filter(part => part.type === 'text').map(part => part.text || '').join('')
-    : (Array.isArray(data.choices?.[0]?.message?.content)
-        ? data.choices[0].message.content.filter(part => part.type === 'text').map(part => part.text || '').join('')
-        : String(data.choices?.[0]?.message?.content || ''));
-  if (!text.trim()) throw new Error('The provider returned an empty response.');
-  return text;
+  signal?.throwIfAborted();
+  if (data.error || data.type === 'error') throw new Error(sanitizeErrorDetail(data.error?.message || 'The provider returned an error.', [target.apiKey]));
+  const result = extractImages(target.apiFormat === 'anthropic' ? data : data.choices?.[0]?.message);
+  if (!result.text.trim() && !(options.returnMessage && result.images.length)) throw new Error('The provider returned an empty response.');
+  return options.returnMessage ? result : result.text;
 }
 
 function getTargetContextWindow(target) {
   if (target?.contextWindow) return target.contextWindow;
-  try {
-    const metadata = JSON.parse(localStorage.getItem('llmModelMetadata') || '{}');
-    const value = Number(metadata[target?.model]?.context_length ?? metadata[target?.model]);
-    return value > 0 ? value : null;
-  } catch (error) {
-    return null;
-  }
+  return readModelMetadata(target?.modelCacheKey || modelCacheKey(target?.baseUrl, target?.provider, target?.apiFormat))
+    .find(item => item.id === target?.model)?.context_length || null;
 }
 
 function guardTargetContextLimit(apiMessages, target, maxOutput) {
   const contextWindow = getTargetContextWindow(target);
   if (!contextWindow) return false;
-  const promptTokens = (apiMessages || []).reduce((total, message) => total + estimateTokens(
-    typeof message.content === 'string' ? message.content : JSON.stringify(message.content || '')
-  ), 0);
+  const promptTokens = (apiMessages || []).reduce((total, message) => total + estimateTokens(JSON.stringify(message)), 0);
   if (promptTokens + maxOutput <= contextWindow) return false;
   showToast(formatModelForDisplay(target.model, 30) + ' needs about ' + formatTokenCount(promptTokens + maxOutput) +
     ' tokens, above its ' + formatTokenCount(contextWindow) + ' token context window.', 'error', 7000);
   return true;
+}
+
+function assertProviderRequestFits(body, target) {
+  const context = [
+    ...(body.system ? [{ role: 'system', content: body.system }] : []),
+    ...(body.messages || []),
+    ...(body.tools?.length ? [{ role: 'system', content: body.tools }] : [])
+  ];
+  const output = Number(body.max_completion_tokens || body.max_tokens) || target.maxTokens || 8192;
+  if (guardTargetContextLimit(context, target, output)) throw new Error('The assembled request exceeds the model context window.');
 }
 
 function insertComposerText(text) {
@@ -2086,17 +2246,21 @@ async function completeDraft() {
     end: input.selectionEnd
   };
   if (!beginSendingAction()) return;
+  const messageList = messages;
+  const signal = abortController.signal;
   try {
     const target = getActiveRequestTarget();
-    const context = await buildRequestMessages(conv, { messageList: messages });
+    const context = await buildRequestMessages(conv, { messageList: messageList.slice() });
+    assertRequestOwner(conv, messageList, null, signal);
     const apiMessages = [
       { role: 'system', content: 'Complete the unfinished user draft at the cursor. Return only the exact text to insert. Do not quote, explain, or repeat text before the cursor.' },
       ...context.messages,
       { role: 'user', content: 'Text before cursor:\n' + snapshot.value.slice(0, snapshot.start) + '\n\nText after cursor:\n' + snapshot.value.slice(snapshot.end) }
     ];
     if (guardTargetContextLimit(apiMessages, target, 128)) return;
-    const completion = await callApiNonStreaming(apiMessages, { target, maxTokens: 128 });
-    if (activeConvId !== snapshot.convId || input.value !== snapshot.value ||
+    const completion = await callApiNonStreaming(apiMessages, { target, maxTokens: 128, signal });
+    assertRequestOwner(conv, messageList, null, signal);
+    if (getActiveConv() !== conv || input.value !== snapshot.value ||
         input.selectionStart !== snapshot.start || input.selectionEnd !== snapshot.end) {
       showToast('Draft changed, so the completion was not inserted.', 'info');
       return;
@@ -2106,7 +2270,7 @@ async function completeDraft() {
     input.focus();
     announce('Draft completed. Review it before sending.');
   } catch (error) {
-    showToast('Could not complete the draft: ' + sanitizeErrorDetail(error), 'error', 6000);
+    if (error.name !== 'AbortError') showToast('Could not complete the draft: ' + sanitizeErrorDetail(error), 'error', 6000);
   } finally {
     endSendingAction();
   }
@@ -2191,15 +2355,19 @@ async function suggestFollowUps(messageIndex) {
     text: getMsgText(message)
   };
   if (!beginSendingAction()) return;
+  const messageList = messages;
+  const signal = abortController.signal;
   try {
     const target = getActiveRequestTarget();
-    const context = await buildRequestMessages(conv, { messageList: messages, untilIndex: messageIndex + 1 });
+    const context = await buildRequestMessages(conv, { messageList: messageList.slice(), untilIndex: messageIndex + 1 });
+    assertRequestOwner(conv, messageList, message, signal);
     const apiMessages = [
       { role: 'system', content: 'Suggest exactly three concise messages the user could send next. Return only a JSON array of three strings. Do not include markdown or explanations.' },
       ...context.messages
     ];
     if (guardTargetContextLimit(apiMessages, target, 256)) return;
-    const suggestions = parseFollowUpSuggestions(await callApiNonStreaming(apiMessages, { target, maxTokens: 256 }));
+    const suggestions = parseFollowUpSuggestions(await callApiNonStreaming(apiMessages, { target, maxTokens: 256, signal }));
+    assertRequestOwner(conv, messageList, message, signal);
     const source = messages[snapshot.messageIndex];
     if (activeConvId !== snapshot.convId || source !== snapshot.message ||
         source?.swipeIndex !== snapshot.swipeIndex || getMsgText(source) !== snapshot.text) {
@@ -2208,7 +2376,7 @@ async function suggestFollowUps(messageIndex) {
     }
     showFollowUpSuggestions(suggestions, snapshot);
   } catch (error) {
-    showToast('Could not suggest follow-ups: ' + sanitizeErrorDetail(error), 'error', 6000);
+    if (error.name !== 'AbortError') showToast('Could not suggest follow-ups: ' + sanitizeErrorDetail(error), 'error', 6000);
   } finally {
     endSendingAction();
   }
@@ -2317,6 +2485,8 @@ function createComparisonTargetField(slot, choices, defaultId) {
 function selectAssistantSwipe(message, swipeIndex) {
   if (!message?.swipes?.length) return;
   const next = Math.max(0, Math.min(message.swipes.length - 1, swipeIndex));
+  const conv = getActiveConv();
+  if (message.swipeIndex !== next && conv?.messages.includes(message)) invalidateConversationContext(conv, conv.messages.indexOf(message));
   message.swipeIndex = next;
   message.content = message.swipes[next];
   message.images = message.swipeImages?.[next] || [];
@@ -2329,19 +2499,35 @@ function selectAssistantSwipe(message, swipeIndex) {
   if (Number.isFinite(message.swipeTokenEstimates?.[next])) message.tokenEstimate = message.swipeTokenEstimates[next];
 }
 
+function addAssistantSwipe(message, copyIndex = null) {
+  if (!message.swipes?.length) message.swipes = [String(message.content || '')];
+  message.swipeImages = message.swipeImages || [];
+  if (!message.swipeImages[message.swipeIndex || 0] && message.images?.length) {
+    message.swipeImages[message.swipeIndex || 0] = message.images.slice();
+  }
+  const index = message.swipes.length;
+  message.swipes.push(copyIndex === null ? '' : message.swipes[copyIndex]);
+  if (copyIndex !== null) {
+    ['swipeThinking', 'swipeToolUse', 'swipeImages', 'swipeSources', 'swipeLlms'].forEach(key => {
+      if (message[key]?.[copyIndex] !== undefined) message[key][index] = structuredClone(message[key][copyIndex]);
+    });
+  }
+  selectAssistantSwipe(message, index);
+  return index;
+}
+
 function applyComparisonSettledResults(assistantMsg, targets, settled) {
   const successful = [];
   settled.forEach((result, index) => {
     const request = assistantMsg.swipeRequests[index];
     if (result.status === 'fulfilled') {
-      assistantMsg.swipes[index] = String(result.value || '').trim();
+      assistantMsg.swipes[index] = String(result.value?.text ?? result.value ?? '').trim();
+      (assistantMsg.swipeImages ||= [])[index] = result.value?.images || [];
       finishRequestMetadata(request, 'complete');
       successful.push(index);
     } else {
       const stopped = result.reason?.name === 'AbortError';
-      assistantMsg.swipes[index] = stopped
-        ? 'Request stopped.'
-        : 'No response. Open request details to see what happened.';
+      assistantMsg.swipes[index] = '';
       finishRequestMetadata(request, stopped ? 'stopped' : 'failed', result.reason, result.reason?.httpStatus);
     }
     selectAssistantSwipe(assistantMsg, index);
@@ -2376,7 +2562,7 @@ function showComparisonResults(conv, assistantMsg, targets) {
     const meta = document.createElement('small');
     meta.textContent = target.destination;
     const response = document.createElement('pre');
-    response.textContent = assistantMsg.swipes[index] || 'No response.';
+    response.textContent = assistantMsg.swipes[index] || (assistantMsg.swipeImages?.[index]?.length ? 'Image response (shown in chat).' : 'No response.');
     const request = assistantMsg.swipeRequests[index];
     const use = document.createElement('button');
     use.type = 'button';
@@ -2412,6 +2598,7 @@ async function runModelComparison(selectedTargets) {
   if (readOnlyShare || pendingAttachmentReads > 0 || !beginSendingAction()) return;
   const input = document.getElementById('chatInput');
   const conv = getActiveConv();
+  const messageList = messages;
   const originalText = input?.value || '';
   const attachments = cloneDraftAttachments(pendingAttachments);
   const attachmentSnapshot = JSON.stringify(attachments);
@@ -2427,14 +2614,15 @@ async function runModelComparison(selectedTargets) {
     profileName: target.profileName,
     destination: formatRequestTargetDestination(target)
   }));
-  let controller = null;
+  const controller = abortController;
   try {
-    const built = await buildRequestMessages(conv, { messageList: messages, draftMessage });
+    const built = await buildRequestMessages(conv, { messageList: messageList.slice(), draftMessage });
+    assertRequestOwner(conv, messageList, null, controller.signal);
     if (activeConvId !== conv.id || input.value !== originalText || JSON.stringify(cloneDraftAttachments(pendingAttachments)) !== attachmentSnapshot) {
       showToast('The draft changed, so comparison was cancelled.', 'info');
       return;
     }
-    const outputLimits = targets.map(target => target.maxTokens || resolveMaxTokens());
+    const outputLimits = targets.map(target => target.maxTokens || 8192);
     if (targets.some((target, index) => guardTargetContextLimit(built.messages, target, outputLimits[index]))) return;
 
     const addedDocs = [];
@@ -2454,7 +2642,7 @@ async function runModelComparison(selectedTargets) {
     }
     const userMsg = { ...draftMessage, timestamp: Date.now() };
     updateMessageTokenMetadata(userMsg);
-    messages.push(userMsg);
+    messageList.push(userMsg);
     delete conv.draft;
     conv.updatedAt = Date.now();
     input.value = '';
@@ -2465,11 +2653,13 @@ async function runModelComparison(selectedTargets) {
     try {
       await saveConversationImmediately();
     } catch (error) {
-      messages.pop();
+      const index = messageList.indexOf(userMsg);
+      if (index !== -1) messageList.splice(index, 1);
       if (addedDocs.length) conv.docs = (conv.docs || []).filter(doc => !addedDocs.includes(doc));
       restoreComposerSnapshot(conv, input, originalText, attachments, '');
       throw new Error('Could not save your message before comparing: ' + sanitizeErrorDetail(error));
     }
+    assertRequestOwner(conv, messageList, userMsg, controller.signal);
     if (conv.title === 'New Chat') {
       conv.title = (originalText.trim() || 'Attachment chat').slice(0, 40);
       renderSidebar();
@@ -2493,6 +2683,7 @@ async function runModelComparison(selectedTargets) {
     targets.forEach((target, index) => {
       setAssistantLlmMetadata(assistantMsg, index, target.model, target.apiFormat, target);
       createRequestMetadata(assistantMsg, index, {
+        target,
         model: target.model,
         apiFormat: target.apiFormat,
         messageCount: built.messages.length,
@@ -2500,24 +2691,26 @@ async function runModelComparison(selectedTargets) {
         contextWindow: getTargetContextWindow(target)
       });
     });
-    messages.push(assistantMsg);
-    controller = new AbortController();
-    abortController = controller;
+    messageList.push(assistantMsg);
+    renderMessages();
     streaming = true;
     document.getElementById('sendBtn')?.classList.add('streaming');
     updateSendBtnState();
-    renderMessages();
     const lastBubble = document.querySelector('#messagesArea .msg-wrapper.assistant:last-of-type .msg-bubble');
     if (lastBubble) lastBubble.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
 
     const settled = await Promise.allSettled(targets.map((target, index) => callApiNonStreaming(built.messages, {
       target,
+      returnMessage: true,
       maxTokens: outputLimits[index],
       signal: controller.signal
     })));
+    assertRequestOwner(conv, messageList, assistantMsg, null);
     const successful = applyComparisonSettledResults(assistantMsg, targets, settled);
+    if (foregroundAction) foregroundAction.status = successful.length === targets.length ? 'complete' : controller.signal.aborted ? 'stopped' : 'failed';
     conv.updatedAt = Date.now();
     await saveConversationImmediately();
+    streaming = false;
     renderMessages({ preserveScroll: true });
     updateTokenInfo();
     if (successful.length) {
@@ -2527,9 +2720,9 @@ async function runModelComparison(selectedTargets) {
     }
     showComparisonResults(conv, assistantMsg, publicTargets);
   } catch (error) {
-    showToast('Could not compare models: ' + sanitizeErrorDetail(error), 'error', 7000);
+    if (foregroundAction) foregroundAction.status = error.name === 'AbortError' ? 'stopped' : error.requestStatus || 'failed';
+    if (error.name !== 'AbortError') showToast('Could not compare models: ' + sanitizeErrorDetail(error), 'error', 7000);
   } finally {
-    if (abortController === controller) abortController = null;
     streaming = false;
     document.getElementById('sendBtn')?.classList.remove('streaming');
     endSendingAction();
@@ -2599,14 +2792,19 @@ function openCompareModels() {
   };
 }
 
-async function extractMemories(conversationMessages, conv = getActiveConv()) {
-  if (!isMemoryEnabled() || isTemporaryConversation(conv)) return;
+async function extractMemories(conversationMessages, conv = getActiveConv(), target = null) {
+  if (!conv || !isMemoryEnabled() || isTemporaryConversation(conv) || localDataOperationsInFlight || _syncPullInFlight) return;
+  const sourceValid = captureContextSource(conv);
+  const epoch = memoryEpoch;
+  const valid = () => isMemoryEnabled() && epoch === memoryEpoch && sourceValid() && !localDataOperationsInFlight && !_syncPullInFlight;
+  try {
+    target = target || getActiveRequestTarget();
+    const existing = await loadMemories();
+    if (!valid()) return;
+    const existingText = existing.map(m => '- ' + m.text).join('\n') || '(none yet)';
 
-  const existing = await loadMemories();
-  const existingText = existing.map(m => '- ' + m.text).join('\n') || '(none yet)';
-
-  const extractPrompt = [
-    { role: 'system', content: `You are a memory extraction system. Given a conversation, identify important facts about the user worth remembering for future conversations (preferences, personal details, projects, interests, opinions).
+    const extractPrompt = [
+      { role: 'system', content: `You are a memory extraction system. Given a conversation, identify important facts about the user worth remembering for future conversations (preferences, personal details, projects, interests, opinions).
 
 Current memories:
 ${existingText}
@@ -2614,33 +2812,39 @@ ${existingText}
 Respond ONLY with a JSON array of new memory strings to add. If there's nothing new worth remembering, respond with []. Do not repeat existing memories. Keep each memory concise (1 sentence). Maximum 3 new memories per extraction.
 
 Example response: ["User prefers TypeScript over JavaScript", "User is building a music app"]` },
-    ...conversationMessages.filter(m => m.role !== 'system').slice(-10)
-  ];
+      ...conversationMessages.filter(m => m.role !== 'system').slice(-10)
+    ];
 
-  try {
-    const response = await callApiNonStreaming(extractPrompt);
+    const response = await callApiNonStreaming(extractPrompt, { target, signal: null });
     const newMemories = JSON.parse(response);
     if (Array.isArray(newMemories) && newMemories.length > 0) {
       const memories = await loadMemories();
-      newMemories.forEach(text => {
-        if (typeof text === 'string' && text.trim()) {
+      if (!valid() || existing.some(old => !memories.some(current => current.id === old.id && current.text === old.text && current.createdAt === old.createdAt))) return;
+      newMemories.slice(0, 3).forEach(text => {
+        if (typeof text === 'string' && text.trim() && !memories.some(memory => memory.text === text.trim())) {
           memories.push({ id: 'mem_' + Date.now() + '_' + Math.random().toString(36).slice(2,5), text: text.trim(), createdAt: Date.now() });
         }
       });
-      await saveMemories(memories);
-      cleanupMemories(); // fire-and-forget, has its own cooldown
+      await saveMemories(memories, valid);
+      if (valid()) cleanupMemories(conv, target, valid);
     }
-  } catch(e) { /* silent fail — memory is best-effort */ }
+  } catch(e) { /* Memory is best-effort. */ }
 }
 
 let _lastCleanup = 0;
-async function cleanupMemories() {
-  if (Date.now() - _lastCleanup < 300000) return; // 5-min cooldown
-  const memories = await loadMemories();
-  if (memories.length < 5) return;
+let memoryCleanupRunning = false;
+async function cleanupMemories(conv = getActiveConv(), target = null, sourceValid = captureContextSource(conv)) {
+  if (!conv || !isMemoryEnabled() || isTemporaryConversation(conv) || memoryCleanupRunning || Date.now() - _lastCleanup < 300000) return;
+  const epoch = memoryEpoch;
+  const valid = () => isMemoryEnabled() && epoch === memoryEpoch && sourceValid() && !localDataOperationsInFlight && !_syncPullInFlight;
+  memoryCleanupRunning = true;
+  try {
+    target = target || getActiveRequestTarget();
+    const memories = await loadMemories();
+    if (!valid() || memories.length < 5) return;
 
-  const prompt = [
-    { role: 'system', content: `You are a memory cleanup system. Given a list of user memories (each with an ID), identify contradictions and duplicates.
+    const prompt = [
+      { role: 'system', content: `You are a memory cleanup system. Given a list of user memories (each with an ID), identify contradictions and duplicates.
 
 Rules:
 - If two memories contradict, keep the NEWER one (higher ID number = newer). Mark the older for removal.
@@ -2649,19 +2853,22 @@ Rules:
 
 Respond ONLY with a JSON object: {"remove": ["id1", "id2"]}
 If no changes needed: {"remove": []}` },
-    { role: 'user', content: memories.map(m => '[' + m.id + '] ' + m.text).join('\n') }
-  ];
+      { role: 'user', content: memories.map(m => '[' + m.id + '] ' + m.text).join('\n') }
+    ];
 
-  try {
-    const response = await callApiNonStreaming(prompt);
+    const response = await callApiNonStreaming(prompt, { target, signal: null });
     const result = JSON.parse(response);
-    if (result.remove && result.remove.length > 0) {
-      syncRecordTombstones('memories', result.remove);
-      const cleaned = memories.filter(m => !result.remove.includes(m.id));
-      await saveMemories(cleaned);
+    const current = await loadMemories();
+    if (!valid() || memories.some(old => !current.some(memory => memory.id === old.id && memory.text === old.text && memory.createdAt === old.createdAt))) return;
+    if (Array.isArray(result?.remove) && result.remove.length > 0) {
+      const selected = memories.filter(memory => result.remove.includes(memory.id));
+      const removed = new Set(selected.map(memory => memory.id));
+      const cleaned = current.filter(m => !removed.has(m.id));
+      await saveMemories(cleaned, valid, selected);
     }
     _lastCleanup = Date.now();
   } catch(e) { /* silent fail */ }
+  finally { memoryCleanupRunning = false; }
 }
 
 function openManageMemories() {
@@ -2730,8 +2937,8 @@ function openSearchTest() {
   const resultsEl = popup.querySelector('#searchTestResults');
   popup.setAttribute('aria-labelledby', 'searchTestTitle');
   const close = openTransientDialog(overlay, popup, input);
-
-  closeBtn.onclick = close;
+  let controller = null;
+  closeBtn.onclick = () => { controller?.abort(); close(); };
 
   const esc = (s) => String(s || '')
     .replace(/&/g, '&amp;')
@@ -2758,14 +2965,21 @@ function openSearchTest() {
   };
 
   const runSearch = async () => {
+    if (controller) { controller.abort(); return; }
     const q = input.value.trim();
     if (!q) { statusEl.textContent = 'Enter a query to test.'; resultsEl.innerHTML = ''; return; }
+    if (!beginSendingAction()) return;
+    controller = abortController;
+    const conv = getActiveConv();
+    const messageList = messages;
+    const authorization = { confirmed: null, policy: getToolPolicy(conv), settings: getToolRequestSettings() };
     statusEl.textContent = 'Searching...';
     resultsEl.innerHTML = '';
-    runBtn.disabled = true;
+    runBtn.textContent = 'Stop';
     try {
-      if (!canUseTool('web_search', getActiveConv())) throw new Error('Web search is disabled for this conversation.');
-      const { results, error } = await executeAuthorizedTool('web_search', { query: q }, getActiveConv(), null, { confirmed: null });
+      if (!authorization.policy.webSearch) throw new Error('Web search is disabled for this conversation.');
+      const { results, error } = await executeAuthorizedTool('web_search', { query: q }, conv, controller.signal, authorization);
+      assertRequestOwner(conv, messageList, null, controller.signal);
       if (error) {
         statusEl.textContent = 'Error: ' + error;
       } else {
@@ -2773,9 +2987,11 @@ function openSearchTest() {
       }
       renderResults(results);
     } catch (e) {
-      statusEl.textContent = 'Error: ' + (e.message || 'Unknown error');
+      statusEl.textContent = e.name === 'AbortError' ? 'Search stopped.' : 'Error: ' + sanitizeErrorDetail(e);
     } finally {
-      runBtn.disabled = false;
+      controller = null;
+      runBtn.textContent = 'Run';
+      endSendingAction();
     }
   };
 
@@ -2949,15 +3165,60 @@ function openSummaryModal() {
   openContextSection('summarySection');
 }
 
+function captureContextSource(conv, checkSummary = false) {
+  const list = conv?.messages;
+  const length = list?.length || 0;
+  const revision = contextRevisions.get(conv);
+  const content = () => JSON.stringify(list?.slice(0, length).map(message => [
+    message.role, message.content, message.includeInContext !== false, message.autoCompacted === true,
+    message.swipeIndex || 0, getSwipeRequest(message)?.status, message.images
+  ]));
+  const summary = () => JSON.stringify([conv?.summary, conv?.summaryUpdatedAt, conv?.summaryCoverage, contextDrafts.get(conv)?.summary]);
+  const before = content();
+  const previousSummary = summary();
+  return () => Boolean(conv && conversations.includes(conv) && conv.messages === list &&
+    contextRevisions.get(conv) === revision && content() === before && (!checkSummary || summary() === previousSummary));
+}
+
+function invalidateConversationContext(conv, fromIndex = 0) {
+  if (!conv) return;
+  contextRevisions.set(conv, (contextRevisions.get(conv) || 0) + 1);
+  const coverage = conv.summaryCoverage;
+  if (conv.summary && coverage?.version === 1 && Number.isInteger(coverage.through) && coverage.through >= 0 && coverage.through <= fromIndex) return;
+  // Legacy summaries have no coverage: discard on any earlier-history change, but
+  // never guess which legacy exclusions were automatic. Only marked turns return.
+  conv.summary = '';
+  conv.summaryUpdatedAt = null;
+  delete conv.summaryCoverage;
+  conv.messages.forEach(message => {
+    if (message.autoCompacted === true) {
+      message.includeInContext = true;
+      delete message.autoCompacted;
+    }
+  });
+}
+
+function summaryCoverageThrough(conv, selected) {
+  // A retained legacy note remains unbounded; do not invent coverage for it.
+  if (conv.summary && (conv.summaryCoverage?.version !== 1 || !Number.isInteger(conv.summaryCoverage.through))) return null;
+  return { version: 1, through: Math.max(conv.summaryCoverage?.through || 0, ...selected.map(item => item.index + 1), 0) };
+}
+
 function saveConversationSummary() {
   const conv = getActiveConv();
   const input = document.getElementById('summaryText');
   if (!conv || !input || readOnlyShare) return;
-  conv.summary = input.value.trim();
+  const next = input.value.trim();
+  if (!next) invalidateConversationContext(conv);
+  else conv.summaryCoverage = { version: 1, through: conv.messages.length };
+  conv.summary = next;
+  delete (contextDrafts.get(conv) || {}).summary;
+  contextRevisions.set(conv, (contextRevisions.get(conv) || 0) + 1);
   conv.summaryUpdatedAt = Date.now();
   conv.updatedAt = conv.summaryUpdatedAt;
   saveConversations();
-  renderContextPanel();
+  if (streaming) renderContextPanel();
+  else renderMessages({ preserveScroll: true });
   updateTokenInfo();
   showToast('Summary saved.', 'success');
 }
@@ -2965,42 +3226,47 @@ function saveConversationSummary() {
 function clearConversationSummary() {
   const conv = getActiveConv();
   if (!conv || readOnlyShare) return;
-  conv.summary = '';
-  conv.summaryUpdatedAt = null;
+  invalidateConversationContext(conv);
+  delete (contextDrafts.get(conv) || {}).summary;
   conv.updatedAt = Date.now();
   saveConversations();
-  renderContextPanel();
+  if (streaming) renderContextPanel();
+  else renderMessages({ preserveScroll: true });
   updateTokenInfo();
   showToast('Summary cleared.', 'info');
 }
 
 async function generateConversationSummary() {
   const conv = getActiveConv();
-  const genBtn = document.getElementById('summaryGen');
-  if (!conv || !genBtn || readOnlyShare) return;
-  const baseUrl = (localStorage.getItem('llmProxyUrl') || '').trim();
-  const apiKey = getApiKey();
-  if (!baseUrl || (providerRequiresKey() && !apiKey)) { showToast('Set up a provider first.', 'error'); return; }
-  const conversationId = conv.id;
-  genBtn.disabled = true;
-  genBtn.textContent = 'Generating...';
+  if (!conv || readOnlyShare || summaryJobs.has(conv.id)) return;
+  const jobId = conv.id;
+  if (contextDrafts.get(conv)?.summary !== undefined) { showToast('Save or discard your summary draft first.', 'info'); return; }
+  const valid = captureContextSource(conv, true);
+  const selected = filterRequestHistory(conv.messages).included.slice(-40);
+  const coverage = summaryCoverageThrough(conv, selected);
+  summaryJobs.add(jobId);
+  renderContextPanel();
   try {
+    const target = getActiveRequestTarget();
     const summary = await callApiNonStreaming([
-      { role: 'system', content: 'Summarize the conversation into a concise, structured note the assistant can use for context. Focus on facts, preferences, and open tasks. Keep it under 200 words.' },
-      { role: 'user', content: buildConversationTranscript(40, conv.messages) }
-    ]);
+      { role: 'system', content: 'Summarize the conversation into a concise, structured note the assistant can use for context. Retain the facts, preferences, decisions and open tasks from the prior summary as well as these turns. Do not invent details. Aim for 200 words without losing prior knowledge.' },
+      { role: 'user', content: (conv.summary ? 'Prior summary:\n' + conv.summary + '\n\n' : '') + buildConversationTranscript(40, selected.map(item => item.message)) }
+    ], { target, signal: null });
+    if (!valid()) return;
     const cleaned = (summary || '').trim();
+    if (!cleaned) throw new Error('The provider returned an empty summary.');
     conv.summary = cleaned;
+    conv.summaryCoverage = coverage;
     conv.summaryUpdatedAt = Date.now();
     conv.updatedAt = conv.summaryUpdatedAt;
-    saveConversations();
-    if (activeConvId === conversationId) renderContextPanel();
+    await saveConversations();
+    if (getActiveConv() === conv) { renderContextPanel(); updateTokenInfo(); }
     showToast('Summary updated.', 'success');
   } catch (e) {
-    showToast('Summary failed: ' + (e.message || 'Unknown error'), 'error');
+    showToast('Summary failed: ' + sanitizeErrorDetail(e), 'error');
   } finally {
-    genBtn.disabled = false;
-    genBtn.textContent = 'Generate';
+    summaryJobs.delete(jobId);
+    renderContextPanel();
   }
 }
 
@@ -3014,6 +3280,7 @@ function openStatusPanel() {
   popup.setAttribute('aria-labelledby', 'statusDialogTitle');
 
   const close = openTransientDialog(overlay, popup);
+  let controller = null;
 
   const render = () => {
     const baseUrl = localStorage.getItem('llmProxyUrl') || '(not set)';
@@ -3040,19 +3307,27 @@ function openStatusPanel() {
 
     const closeBtn = popup.querySelector('#statusCloseBtn');
     const testBtn = popup.querySelector('#statusTestBtn');
-    closeBtn.onclick = close;
+    closeBtn.onclick = () => { controller?.abort(); close(); };
     testBtn.onclick = async () => {
-      testBtn.disabled = true;
-      testBtn.textContent = 'Testing...';
+      if (controller) { controller.abort(); return; }
+      if (!beginSendingAction()) return;
+      controller = abortController;
+      const conv = getActiveConv();
+      const messageList = messages;
+      const authorization = { confirmed: null, policy: getToolPolicy(conv), settings: getToolRequestSettings() };
+      testBtn.textContent = 'Stop';
       try {
-        if (!canUseTool('web_search', getActiveConv())) throw new Error('Web search is disabled for this conversation.');
-        await executeAuthorizedTool('web_search', { query: 'test' }, getActiveConv(), null, { confirmed: null });
+        if (!authorization.policy.webSearch) throw new Error('Web search is disabled for this conversation.');
+        const result = await executeAuthorizedTool('web_search', { query: 'test' }, conv, controller.signal, authorization);
+        assertRequestOwner(conv, messageList, null, controller.signal);
+        if (result.error) throw new Error(result.error);
       } catch(e) {
         lastSearchStatus = { ok: false, error: sanitizeErrorDetail(e), at: Date.now(), query: 'test' };
+      } finally {
+        controller = null;
+        endSendingAction();
+        if (popup.isConnected) render();
       }
-      testBtn.disabled = false;
-      testBtn.textContent = 'Test Search';
-      render();
     };
   };
 
@@ -3157,9 +3432,17 @@ async function handleCommand(cmd, conv) {
   }
 }
 
-async function handleManualSearch(query, conv) {
+async function handleManualSearch(query, conv = getActiveConv()) {
+  if (readOnlyShare || streaming) return;
+  const ownsAction = !sending;
+  if (ownsAction && !beginSendingAction()) return;
+  const action = foregroundAction;
+  const messageList = action.messageList;
+  const signal = action.controller.signal;
+  const authorization = { confirmed: null, policy: getToolPolicy(conv), settings: getToolRequestSettings() };
+  if (conv !== action.conv) { if (ownsAction) endSendingAction(); return; }
   const ts = Date.now();
-  messages.push({ role: 'user', content: '/search ' + query, timestamp: ts });
+  messageList.push({ role: 'user', content: '/search ' + query, timestamp: ts });
   const assistantMsg = {
     role: 'assistant',
     content: '',
@@ -3168,20 +3451,24 @@ async function handleManualSearch(query, conv) {
     timestamp: Date.now(),
     swipeToolUse: [[{ query, results: [], searching: true }]]
   };
-  messages.push(assistantMsg);
+  messageList.push(assistantMsg);
   const request = createRequestMetadata(assistantMsg, 0);
   request.status = 'streaming';
-  await saveConversationImmediately().catch(() => {});
   renderMessages();
 
   try {
-    const response = await executeAuthorizedTool('web_search', { query }, conv, null, { confirmed: null });
+    await saveConversationImmediately();
+    assertRequestOwner(conv, messageList, assistantMsg, signal);
+    streaming = true;
+    updateSendBtnState();
+    const response = await executeAuthorizedTool('web_search', { query }, conv, signal, authorization);
+    assertRequestOwner(conv, messageList, assistantMsg, signal);
     const { results, error } = response;
     const tb = assistantMsg.swipeToolUse[0][0];
     tb.results = results;
     tb.searching = false;
     if (error) tb.error = error;
-    assistantMsg.content = error ? ('Search error: ' + error) : ('Search results for "' + query + '".');
+    assistantMsg.content = error ? '' : ('Search results for "' + query + '".');
     assistantMsg.swipes[0] = assistantMsg.content;
     const registry = sourceRegistryFor(assistantMsg, 0);
     registerSources(registry, results).forEach((result, index) => { results[index].sourceNumber = result.sourceNumber; });
@@ -3190,16 +3477,20 @@ async function handleManualSearch(query, conv) {
   } catch (e) {
     const tb = assistantMsg.swipeToolUse[0][0];
     tb.searching = false;
-    tb.error = e.message || 'Search failed';
-    assistantMsg.content = 'Search error: ' + (e.message || 'Unknown error');
-    assistantMsg.swipes[0] = assistantMsg.content;
-    finishRequestMetadata(request, 'failed', e.message || 'Search failed', null);
+    tb.error = sanitizeErrorDetail(e);
+    finishRequestMetadata(request, e.name === 'AbortError' ? 'stopped' : e.requestStatus || 'failed', e, null);
+  } finally {
+    action.status = request.status;
+    streaming = false;
+    if (getActiveConv() === conv && messages === messageList) {
+      conv.updatedAt = Date.now();
+      debouncedSave();
+      renderMessages({ preserveScroll: true });
+      updateTokenInfo();
+    }
+    if (ownsAction) endSendingAction();
   }
-
-  if (conv) conv.updatedAt = Date.now();
-  debouncedSave();
-  renderMessages({ preserveScroll: true });
-  updateTokenInfo();
+  return request.status;
 }
 
 async function handleFileSearch(query, conv) {
@@ -3348,8 +3639,8 @@ function setAssistantLlmMetadata(assistantMsg, swipeIdx, model, format, requestT
   const baseUrl = requestTarget?.baseUrl || localStorage.getItem('llmProxyUrl') || '';
   const providerKey = requestTarget?.provider || '';
   const symbols = { openai: 'O', anthropic: 'C', openrouter: 'R', ollama: 'L', lmstudio: 'L' };
-  const provider = symbols[providerKey]
-    ? { symbol: symbols[providerKey], name: getProviderPreset(providerKey).label }
+  const provider = requestTarget
+    ? { symbol: symbols[providerKey] || 'O', name: getProviderPreset(providerKey).label }
     : getLlmProviderInfo(model, format, baseUrl);
   const activeProfile = requestTarget ? null : getActiveProfile();
   const metadata = {
@@ -3378,11 +3669,6 @@ const NO_TRAILING_ASSISTANT_RE = /opus-5|sonnet-5|opus-4-[678]|sonnet-4-6|fable-
 function resolveMaxTokens() {
   const n = parseInt(localStorage.getItem('llmMaxTokens'), 10);
   return Number.isFinite(n) && n > 0 ? n : 8192;
-}
-
-function resolveConfiguredMaxTokens() {
-  const n = parseInt(localStorage.getItem('llmMaxTokens'), 10);
-  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 function prepareAnthropicMessages(apiMessages) {
@@ -3547,6 +3833,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     'cBorderRadius', 'cMsgMaxWidth', 'cMsgFontSize'].forEach(id => {
     document.getElementById(id)?.addEventListener('change', scheduleAppearanceSettingsAutosave);
   });
+  ['input', 'change'].forEach(type => {
+    document.getElementById('settingsModal')?.addEventListener(type, event => {
+      const tab = event.target.closest('.settings-tab-content')?.id.replace('settingsTab-', '');
+      if (!['api', 'tools'].includes(tab)) return;
+      dirtySettingsTabs.add(tab);
+      updateProviderOptions();
+      updateSettingsFooter();
+    });
+  });
+  document.getElementById('setupProvider')?.addEventListener('change', updateProviderOptions);
   renderLocalUpdateStatus();
   checkLocalUpdateStatus(false);
 
@@ -3571,8 +3867,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Show setup modal if no API key. A visitor reading a shared link has no reason to
   // be asked for one.
-  if (!readOnlyShare && (!localStorage.getItem('llmProxyUrl') || (providerRequiresKey() && !getApiKey()))) {
+  const savedCredential = getStoredApiCredential();
+  if (!readOnlyShare && (!localStorage.getItem('llmProxyUrl') || (providerRequiresKey() && !getApiKey()) || (savedCredential.value && !savedCredential.destination))) {
     applyProviderPreset('setup', document.getElementById('setupProvider')?.value || 'openai');
+    if (savedCredential.value && !savedCredential.destination) {
+      document.getElementById('setupProvider').value = inferProviderKey();
+      document.getElementById('setupProxy').value = localStorage.getItem('llmProxyUrl') || '';
+      document.getElementById('setupApiFormat').value = localStorage.getItem('llmApiFormat') || 'auto';
+      document.getElementById('setupModelManual').value = localStorage.getItem('llmModel') || '';
+      document.getElementById('setupKey').value = savedCredential.value;
+      renderSetupError('Review the provider and base URL, then save to confirm this older saved key.');
+    }
     setKeyStorageInputs(getKeyStorageMode());
     openModal('setupModal', '#setupProxy');
   }
@@ -3581,6 +3886,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (!(window.SpeechRecognition || window.webkitSpeechRecognition)) {
     document.getElementById('voiceBtn').style.display = 'none';
   }
+  window.addEventListener('pagehide', stopVoiceInput);
 
 
   // Auto-resize textarea + character count + @model mentions
@@ -3605,6 +3911,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Send on Enter (with mention dropdown handling)
   ta.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
     if (commandActive) {
       handleCommandKeydown(e, ta);
       if (e.defaultPrevented) return;
@@ -3627,6 +3934,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Global keyboard shortcuts
   document.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
     const commandKey = e.ctrlKey || e.metaKey;
     const key = e.key.toLowerCase();
     if (readOnlyShare && ((commandKey && key === 'n') ||
@@ -3816,50 +4124,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     if ((localStorage.getItem('assistantTheme') || 'dark') === 'system') applyTheme('system');
   });
 
-  // Mobile swipe gestures for assistant message alternatives
-  let _touchStartX = 0, _touchStartY = 0, _touchLastX = 0, _touchMsgIdx = null, _swiping = false, _touchDecided = false;
-  msgsArea.addEventListener('touchstart', e => {
-    const wrapper = e.target.closest('.msg-wrapper.assistant');
-    if (!wrapper || _selectMode) { _touchMsgIdx = null; return; }
-    _touchMsgIdx = parseInt(wrapper.dataset.msgIdx);
-    _touchStartX = _touchLastX = e.touches[0].clientX;
-    _touchStartY = e.touches[0].clientY;
-    _swiping = false;
-    _touchDecided = false;
-  }, { passive: true });
-  msgsArea.addEventListener('touchmove', e => {
-    if (_touchMsgIdx === null || isNaN(_touchMsgIdx)) return;
-    _touchLastX = e.touches[0].clientX;
-    if (_touchDecided) { if (_swiping) e.preventDefault(); return; }
-    const dx = Math.abs(_touchLastX - _touchStartX);
-    const dy = Math.abs(e.touches[0].clientY - _touchStartY);
-    if (dx > 10 || dy > 10) {
-      _touchDecided = true;
-      _swiping = dx > dy;
-    }
-    if (_swiping) e.preventDefault();
-  }, { passive: false });
-  msgsArea.addEventListener('touchend', e => {
-    if (!_swiping || _touchMsgIdx === null || isNaN(_touchMsgIdx)) {
-      _touchMsgIdx = null;
-      _swiping = false;
-      _touchDecided = false;
-      return;
-    }
-    const dx = _touchLastX - _touchStartX;
-    if (Math.abs(dx) > 30) {
-      const msg = messages[_touchMsgIdx];
-      if (msg && dx < 0 && _touchMsgIdx === messages.length - 1 && (!msg.swipes || msg.swipeIndex >= msg.swipes.length - 1)) {
-        regenerate();
-      } else if (msg && msg.swipes && msg.swipes.length > 1) {
-        swipeMsg(_touchMsgIdx, dx < 0 ? 1 : -1);
-      }
-    }
-    _touchMsgIdx = null;
-    _swiping = false;
-    _touchDecided = false;
-  }, { passive: true });
-
   // Select mode: click to toggle message selection (capture phase)
   msgsArea.addEventListener('click', e => {
     if (!_selectMode) return;
@@ -3968,15 +4232,16 @@ function buildApiContent(msg) {
 }
 
 function extractImages(msg) {
+  if (!msg || typeof msg !== 'object') return { text: '', images: [] };
   const images = [];
   // 1. message.images[] array (some proxies put images here)
-  if (msg.images?.length) {
+  if (Array.isArray(msg.images)) {
     for (const img of msg.images) {
-      if (img.image_url?.url) images.push(img.image_url.url);
-      else if (img.url) images.push(img.url);
-      else if (img.b64_json) images.push('data:image/png;base64,' + img.b64_json);
-      else if (typeof img === 'string' && img.length > 100)
-        images.push(img.startsWith('data:') ? img : 'data:image/png;base64,' + img);
+      if (img?.image_url?.url) images.push(img.image_url.url);
+      else if (img?.url) images.push(img.url);
+      else if (img?.b64_json) images.push('data:image/png;base64,' + img.b64_json);
+      else if (typeof img === 'string' && safeMediaUrl(img)) images.push(img);
+      else if (typeof img === 'string' && /^[A-Za-z0-9+/]{100,}={0,2}$/.test(img)) images.push('data:image/png;base64,' + img);
     }
   }
   // 2. message.content as array
@@ -3984,21 +4249,24 @@ function extractImages(msg) {
   let text = '';
   if (Array.isArray(content)) {
     for (const item of content) {
-      if (item.type === 'text') { text += item.text; continue; }
+      if (!item) continue;
+      if (item.type === 'text') { text += item.text || ''; continue; }
       if (item.type === 'image_url' && item.image_url?.url) { images.push(item.image_url.url); continue; }
       if (item.type === 'image' && item.source?.data) {
         images.push('data:' + (item.source.media_type || 'image/png') + ';base64,' + item.source.data);
         continue;
       }
+      if (item.type === 'image' && item.source?.url) { images.push(item.source.url); continue; }
       if (item.image_url?.url) { images.push(item.image_url.url); continue; }
       if (typeof item === 'string' && item.startsWith('data:image')) { images.push(item); continue; }
     }
   } else {
-    text = content || '';
+    text = typeof content === 'string' ? content : '';
   }
   // 3. message.parts[] (Gemini inline_data)
-  if (msg.parts) {
+  if (Array.isArray(msg.parts)) {
     for (const part of msg.parts) {
+      if (!part) continue;
       if (part.inline_data?.data) {
         images.push('data:' + (part.inline_data.mime_type || 'image/png') + ';base64,' + part.inline_data.data);
       }
@@ -4007,7 +4275,7 @@ function extractImages(msg) {
   }
   // 4. Extract images from text string (data URIs, URLs, raw base64)
   if (typeof text === 'string' && text && !images.length) {
-    const dataUriMatch = text.match(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/);
+    const dataUriMatch = text.trim().match(/^data:image\/[^;]+;base64,[A-Za-z0-9+/=]+$/);
     if (dataUriMatch) {
       images.push(dataUriMatch[0]);
       text = text.replace(dataUriMatch[0], '').trim();
@@ -4017,25 +4285,18 @@ function extractImages(msg) {
       if (urlMatch) { images.push(text.trim()); text = ''; }
     }
     if (!images.length) {
-      const embeddedMatch = text.match(/(https?:\/\/[^\s]+\.(png|jpg|jpeg|webp|gif)(\?[^\s]*)?)/i);
-      if (embeddedMatch) {
-        images.push(embeddedMatch[1]);
-        text = text.replace(embeddedMatch[1], '').trim();
-      }
-    }
-    if (!images.length) {
       const rawB64 = text.match(/^[A-Za-z0-9+/]{100,}[=]{0,2}$/);
       if (rawB64) { images.push('data:image/png;base64,' + rawB64[0]); text = ''; }
     }
   }
-  return { text, images };
+  return { text, images: [...new Set(images.map(safeMediaUrl).filter(Boolean))] };
 }
 
 function renderMarkdown(text) {
   if (!text) return '';
 
-  // Normalize line endings early so markdown regexes behave consistently.
-  text = String(text).replace(/\r\n?/g, '\n');
+  // NUL is reserved for internal tokens, never for model-supplied content.
+  text = String(text).replace(/\x00/g, '').replace(/\r\n?/g, '\n');
 
   function decodeBasicEntities(input) {
     // Decode up to a few passes to handle doubly-encoded model output like &amp;lt;strong&amp;gt;
@@ -4083,28 +4344,39 @@ function renderMarkdown(text) {
 
   const protectedBlocks = [];
   // Block-level protections get a 'B' marker so newlines around them can be
-  // swallowed before the \n -> <br> pass; inline code ('I') keeps text flow.
+  // swallowed before the \n -> <br> pass; inline tokens keep text flow.
   const protectBlock = (block) => {
     const idx = protectedBlocks.length;
     protectedBlocks.push(block);
-    return '\x00' + (block.type === 'inline-code' ? 'I' : 'B') + idx + '\x00';
+    return '\x00' + (block.type.startsWith('inline-') ? 'I' : 'B') + idx + '\x00';
   };
+  // Attributes and math source get original text, never HTML from another token.
+  const literalSource = input => String(input || '').replace(/\x00[BI](\d+)\x00/g,
+    (_, idx) => literalSource(protectedBlocks[Number(idx)]?.source));
   const restoreProtectedBlock = (_, idx) => {
     const block = protectedBlocks[parseInt(idx, 10)];
     if (!block) return '';
-    if (block.type === 'html') return block.html;
+    if (block.type === 'html' || block.type === 'inline-html') return block.html;
+    if (block.type === 'math' || block.type === 'inline-math') {
+      if (typeof katex !== 'undefined') {
+        try {
+          return katex.renderToString(literalSource(block.math), { displayMode: block.type === 'math', throwOnError: false, trust: false });
+        } catch (e) { console.warn('KaTeX render error:', e); }
+      }
+      return escapeHTML(literalSource(block.source));
+    }
     if (block.type === 'mermaid') {
-      return '<div class="mermaid-container"><pre class="mermaid">' + renderLiteralCode(block.code) + '</pre></div>';
+      return '<div class="mermaid-container"><pre class="mermaid">' + renderLiteralCode(literalSource(block.code)) + '</pre></div>';
     }
     if (block.type === 'inline-code') {
-      return '<code>' + renderLiteralCode(block.code) + '</code>';
+      return '<code>' + renderLiteralCode(literalSource(block.code)) + '</code>';
     }
     const langAttr = block.lang ? ' class="language-' + block.lang + '"' : '';
-    return '<pre><code' + langAttr + '>' + renderLiteralCode(block.code) + '</code></pre>';
+    return '<pre><code' + langAttr + '>' + renderLiteralCode(literalSource(block.code)) + '</code></pre>';
   };
+  const restoreBlocks = input => input.replace(/\x00[BI](\d+)\x00/g, restoreProtectedBlock);
 
   // Extract KaTeX math before HTML escaping
-  const mathPlaceholders = [];
   const looksLikeInlineMath = (math) => {
     const t = String(math || '').trim();
     if (!t) return false;
@@ -4124,46 +4396,65 @@ function renderMarkdown(text) {
   };
   let s = text;
   // Protect literal code/mermaid content before markdown regexes run.
-  s = s.replace(/```mermaid(?:[ \t]*\n|[ \t]+)?([\s\S]*?)```/gi, (_, code) =>
-    protectBlock({ type: 'mermaid', code: code.trimEnd() })
+  s = s.replace(/```mermaid(?:[ \t]*\n|[ \t]+)?([\s\S]*?)```/gi, (source, code) =>
+    protectBlock({ type: 'mermaid', source, code: code.trimEnd() })
   );
-  s = s.replace(/```([A-Za-z0-9_#+.-]*)(?:[ \t]*\n|[ \t]+)?([\s\S]*?)```/g, (_, lang, code) =>
-    protectBlock({ type: 'fence', lang, code: code.trimEnd() })
+  s = s.replace(/```([A-Za-z0-9_#+.-]*)(?:[ \t]*\n|[ \t]+)?([\s\S]*?)```/g, (source, lang, code) =>
+    protectBlock({ type: 'fence', source, lang, code: code.trimEnd() })
   );
-  s = s.replace(/(?<!`)`([^`\n]+)`(?!`)/g, (_, code) =>
-    protectBlock({ type: 'inline-code', code })
+  s = s.replace(/(?<!`)`([^`\n]+)`(?!`)/g, (source, code) =>
+    protectBlock({ type: 'inline-code', source, code })
   );
-  // Block math $$...$$ ('MB' marker: block-level for newline swallowing)
-  s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, math) => {
-    const idx = mathPlaceholders.length;
-    mathPlaceholders.push({ math, display: true });
-    return '\x00MB' + idx + '\x00';
-  });
-  // Inline math $...$
-  s = s.replace(/\$([^\$\n]+?)\$/g, (_, math) => {
-    if (!looksLikeInlineMath(math)) return '$' + math + '$';
-    const idx = mathPlaceholders.length;
-    mathPlaceholders.push({ math, display: false });
-    return '\x00MI' + idx + '\x00';
-  });
+  s = s.replace(/\$\$([\s\S]+?)\$\$/g, (source, math) => protectBlock({ type: 'math', source, math }));
+  s = s.replace(/\$([^\$\n]+?)\$/g, (source, math) =>
+    looksLikeInlineMath(math) ? protectBlock({ type: 'inline-math', source, math }) : source
+  );
 
-  // Decode HTML entities that models sometimes output before escaping
-  s = decodeBasicEntities(s);
-  s = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  s = restoreAllowedInlineHtml(s);
-  // Spoiler tags >!hidden text!<
-  s = s.replace(/&gt;!([\s\S]*?)!&lt;/g, '<details class="spoiler"><summary><span class="spoiler-reveal">Reveal spoiler</span><span class="spoiler-hide">Hide spoiler</span></summary><span class="spoiler-content">$1</span></details>');
+  function renderInline(input) {
+    let out = input.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (source, alt, url) => {
+      const safeUrl = safeMediaUrl(decodeBasicEntities(literalSource(url)));
+      const safeAlt = escapeHTML(literalSource(alt));
+      const html = safeUrl ? '<img src="' + escapeHTML(safeUrl) + '" alt="' + safeAlt + '" class="chat-inline-img chat-gen-img" loading="lazy" referrerpolicy="no-referrer">' : safeAlt;
+      return protectBlock({ type: 'inline-html', source, html });
+    });
+    out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (source, label, url) => {
+      const safeUrl = safeHttpUrl(decodeBasicEntities(literalSource(url)));
+      const content = restoreBlocks(renderInline(label));
+      const html = safeUrl ? '<a href="' + escapeHTML(safeUrl) + '" target="_blank" rel="noopener noreferrer">' + content + '</a>' : content;
+      return protectBlock({ type: 'inline-html', source, html });
+    });
+    out = restoreAllowedInlineHtml(escapeHTML(decodeBasicEntities(out)));
+    out = out.replace(/&gt;!([\s\S]*?)!&lt;/g, '<details class="spoiler"><summary><span class="spoiler-reveal">Reveal spoiler</span><span class="spoiler-hide">Hide spoiler</span></summary><span class="spoiler-content">$1</span></details>');
+    out = out.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+    out = out.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    out = out.replace(/__(.+?)__/g, '<strong>$1</strong>');
+    out = out.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
+    out = out.replace(/(^|[^\w])_([^_\n]+)_([^\w]|$)/g, '$1<em>$2</em>$3');
+    out = out.replace(/~~(.+?)~~/g, '<del>$1</del>');
+    return out.replace(/==(.+?)==/g, '<mark>$1</mark>');
+  }
+
+  // Parse raw table cells before formatting, so links and code are rendered once.
+  s = s.replace(/(^\|.+\|$\n?)+/gm, source => {
+    const rows = source.trim().split('\n').filter(r => r.trim());
+    if (rows.length < 2) return source;
+    const parseRow = r => r.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+    const isSep = r => /^\|[\s\-:|]+\|$/.test(r.trim());
+    const renderTableCell = c => restoreBlocks(renderInline(c));
+    const headerRow = parseRow(rows[0]);
+    const bodyStart = isSep(rows[1]) ? 2 : 1;
+    let html = '<table><thead><tr>' + headerRow.map(c => `<th>${renderTableCell(c)}</th>`).join('') + '</tr></thead><tbody>';
+    for (let i = bodyStart; i < rows.length; i++) {
+      if (isSep(rows[i])) continue;
+      html += '<tr>' + parseRow(rows[i]).map(c => `<td>${renderTableCell(c)}</td>`).join('') + '</tr>';
+    }
+    return protectBlock({ type: 'html', source, html: html + '</tbody></table>' });
+  });
+  s = renderInline(s);
   s = s.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
   s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
   s = s.replace(/^## (.+)$/gm, '<h2>$1</h2>');
   s = s.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-  s = s.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
-  s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  s = s.replace(/__(.+?)__/g, '<strong>$1</strong>');
-  s = s.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
-  s = s.replace(/(^|[^\w])_([^_\n]+)_([^\w]|$)/g, '$1<em>$2</em>$3');
-  s = s.replace(/~~(.+?)~~/g, '<del>$1</del>');
-  s = s.replace(/==(.+?)==/g, '<mark>$1</mark>');
   s = s.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
   s = s.replace(/^[ \t]*[\-\*] (.+)$/gm, '<li class="ul-li">$1</li>');
   s = s.replace(/((?:<li class="ul-li">.*<\/li>(?:\n[ \t]*)*)+)/g, function(m) {
@@ -4179,59 +4470,18 @@ function renderMarkdown(text) {
       .replace(/\n[ \t]*/g, '');
     return '<ol>' + items + '</ol>';
   });
-  s = s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, url) => {
-    const safeUrl = safeMediaUrl(decodeBasicEntities(url));
-    const safeAlt = escapeHTML(decodeBasicEntities(alt));
-    return safeUrl ? '<img src="' + escapeHTML(safeUrl) + '" alt="' + safeAlt + '" class="chat-inline-img chat-gen-img" loading="lazy" referrerpolicy="no-referrer">' : safeAlt;
-  });
-  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => {
-    const safeUrl = safeHttpUrl(decodeBasicEntities(url));
-    return safeUrl ? '<a href="' + escapeHTML(safeUrl) + '" target="_blank" rel="noopener">' + label + '</a>' : label;
-  });
   s = s.replace(/^---$/gm, '<hr>');
-  // Markdown tables
-  s = s.replace(/(^\|.+\|$\n?)+/gm, match => {
-    const rows = match.trim().split('\n').filter(r => r.trim());
-    if (rows.length < 2) return match;
-    const parseRow = r => r.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
-    const isSep = r => /^\|[\s\-:|]+\|$/.test(r.trim());
-    const renderTableCell = c => restoreAllowedInlineHtml(escapeHTML(decodeBasicEntities(c)));
-    let headerRow = parseRow(rows[0]);
-    let bodyStart = 1;
-    if (isSep(rows[1])) bodyStart = 2;
-    let html = '<table><thead><tr>' + headerRow.map(c => `<th>${renderTableCell(c)}</th>`).join('') + '</tr></thead><tbody>';
-    for (let i = bodyStart; i < rows.length; i++) {
-      if (isSep(rows[i])) continue;
-      const cells = parseRow(rows[i]);
-      html += '<tr>' + cells.map(c => `<td>${renderTableCell(c)}</td>`).join('') + '</tr>';
-    }
-    html += '</tbody></table>';
-    return protectBlock({ type: 'html', html });
-  });
   // Block elements carry their own margins; newlines around them must not
   // also become <br>s or headings/lists/code/tables get double-spaced gaps.
   s = s.replace(/<\/blockquote>\n<blockquote>/g, '<br>');
-  s = s.replace(/\n+(\x00(?:B|MB)\d+\x00)/g, '$1');
-  s = s.replace(/(\x00(?:B|MB)\d+\x00)\n+/g, '$1');
+  s = s.replace(/\n+(\x00B\d+\x00)/g, '$1');
+  s = s.replace(/(\x00B\d+\x00)\n+/g, '$1');
   s = s.replace(/\n+(?=<(?:h[1-4]|ul|ol|blockquote|hr|table)\b)/g, '');
   s = s.replace(/(<\/(?:h[1-4]|ul|ol|blockquote|table)>|<hr>)\n+/g, '$1');
   s = s.replace(/\n/g, '<br>');
 
-  // Restore KaTeX math placeholders
-  s = s.replace(/\x00M[BI](\d+)\x00/g, (_, idx) => {
-    const ph = mathPlaceholders[parseInt(idx)];
-    if (typeof katex !== 'undefined') {
-      try { return katex.renderToString(ph.math, { displayMode: ph.display, throwOnError: false }); } catch(e) { console.warn('KaTeX render error:', e); }
-    }
-    return (ph.display ? '$$' : '$') + ph.math.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + (ph.display ? '$$' : '$');
-  });
-  // Loop: restored blocks (e.g. tables) can contain inline-code placeholders
-  // from their cells, so keep restoring until none remain.
-  for (let pass = 0; pass < 5 && /\x00[BI]\d+\x00/.test(s); pass++) {
-    s = s.replace(/\x00[BI](\d+)\x00/g, restoreProtectedBlock);
-  }
-
-  return s;
+  // Each generated block is complete. Never run formatting over its HTML again.
+  return restoreBlocks(s);
 }
 
 // ============================================
@@ -4477,24 +4727,25 @@ function toSpeechText(text) {
   return holder.textContent.replace(/\s+/g, ' ').trim();
 }
 
-function speakMessage(msg, btn) {
+function stopReadAloud() {
+  spokenMessage = null;
+  if (speechUtterance) {
+    speechUtterance.onend = null;
+    speechUtterance.onerror = null;
+    speechUtterance = null;
+    window.speechSynthesis?.cancel();
+  }
+  document.querySelectorAll('[data-action="read-aloud"]').forEach(button => { button.textContent = 'Read aloud'; });
+}
+
+function speakMessage(msg) {
   const synth = window.speechSynthesis;
   if (!synth) {
     showToast('Read aloud is not supported in this browser.', 'error');
     return;
   }
-  const control = btn || { dataset: {}, textContent: '' };
-  const stopping = control.dataset.speaking === 'true';
-  // Always stop whatever is playing first, then clear every live button's state. This
-  // self-heals across re-renders: stale buttons are gone from the DOM, so the query
-  // only ever finds current ones.
-  // ponytail: speech orphaned by a re-render keeps playing until the next click or the
-  // end of the utterance. Hook renderMessages if that ever actually bites.
-  synth.cancel();
-  document.querySelectorAll('.msg-action-btn[data-speaking="true"]').forEach(b => {
-    b.dataset.speaking = 'false';
-    b.textContent = 'Speak';
-  });
+  const stopping = spokenMessage === msg;
+  stopVoiceInput();
   if (stopping) return;
 
   const text = toSpeechText(stripThinkTags(getMsgText(msg)).content);
@@ -4504,14 +4755,17 @@ function speakMessage(msg, btn) {
   }
   const utterance = new SpeechSynthesisUtterance(text);
   const reset = () => {
-    control.dataset.speaking = 'false';
-    control.textContent = 'Speak';
+    if (speechUtterance === utterance) stopReadAloud();
   };
   utterance.onend = reset;
   utterance.onerror = reset;
-  control.dataset.speaking = 'true';
-  control.textContent = 'Stop';
-  synth.speak(utterance);
+  spokenMessage = msg;
+  speechUtterance = utterance;
+  try { synth.speak(utterance); }
+  catch (error) {
+    reset();
+    showToast('Could not read this message aloud.', 'error');
+  }
 }
 
 function formatTokenCount(tokens) {
@@ -4677,28 +4931,43 @@ async function retryRequest(idx) {
       return;
     }
     const conv = getActiveConv();
-    const swipeIdx = Number.isInteger(msg.swipeIndex) ? msg.swipeIndex : 0;
-    const requestContext = await buildRequestMessages(conv, { messageList: messages, untilIndex: idx });
-    if (guardContextLimit(requestContext)) return;
-    msg.swipes = Array.isArray(msg.swipes) ? msg.swipes : [''];
-    msg.swipes[swipeIdx] = '';
-    msg.content = '';
-    if (msg.swipeThinking) msg.swipeThinking[swipeIdx] = '';
-    if (msg.swipeToolUse) msg.swipeToolUse[swipeIdx] = [];
-    if (msg.swipeImages) msg.swipeImages[swipeIdx] = [];
-    if (msg.swipeSources) msg.swipeSources[swipeIdx] = [];
+    const messageList = messages;
+    const original = getSwipeRequest(msg);
+    let target = requestTargets.get(original);
+    if (!target) {
+      const saved = original?.connection;
+      if (!saved?.baseUrl) throw new Error('The original connection was not recorded. Use Regenerate to choose the current provider.');
+      target = buildRequestTarget({
+        llmProvider: saved.provider, llmProxyUrl: saved.baseUrl, llmApiFormat: saved.apiFormat, llmModel: saved.model,
+        llmTemperature: saved.temperature, llmMaxTokens: saved.maxTokens, llmContextWindow: saved.contextWindow, llmCorsProxy: saved.corsProxy
+      }, { profileId: saved.profileId, profileName: saved.profileName });
+      let active = null;
+      try { active = getActiveRequestTarget(); } catch (error) {}
+      target = Object.freeze({ ...target, apiKey: resolveRequestTargetKey(target, active) });
+    }
+    if (target.keyRequired && !target.apiKey) throw new Error('Reconnect to ' + target.host + ' before retrying this request.');
+    const toolPolicy = getToolPolicy(conv);
+    const requestContext = await buildRequestMessages(conv, { messageList: messageList.slice(), untilIndex: idx });
+    assertRequestOwner(conv, messageList, msg);
+    if (guardTargetContextLimit(requestContext.messages, target, target.maxTokens || 8192)) return;
+    const swipeIdx = addAssistantSwipe(msg);
     renderMessages();
     const wrapper = document.querySelector('.msg-wrapper[data-msg-idx="' + idx + '"]');
     const bubble = wrapper?.querySelector('.msg-bubble');
     if (!bubble) return;
     bubble.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
     announce('Retrying the failed request.');
-    await streamResponse(requestContext.messages, msg, swipeIdx, bubble, null, null, { conv });
+    const status = await streamResponse(requestContext.messages, msg, swipeIdx, bubble, target.model, null, { conv, messageList, target, toolPolicy });
+    assertRequestOwner(conv, messageList, msg, null);
     if (conv) conv.updatedAt = Date.now();
-    if (getSwipeRequest(msg, swipeIdx)?.status === 'complete') extractMemories(requestContext.messages, conv);
+    if (status === 'complete') extractMemories(requestContext.messages, conv, target);
     await saveConversationImmediately();
     renderMessages({ preserveScroll: true });
     updateTokenInfo();
+    return status;
+  } catch (error) {
+    if (foregroundAction) foregroundAction.status = error.name === 'AbortError' ? 'stopped' : error.requestStatus || 'failed';
+    if (error.name !== 'AbortError') showToast(sanitizeErrorDetail(error), 'error');
   } finally {
     endSendingAction();
   }
@@ -4759,13 +5028,16 @@ async function updateTokenInfo() {
 // IndexedDB Storage Layer
 // ============================================
 const DB_NAME = 'assistantDB';
-const DB_VERSION = 3;
+// Older tabs must not write records whose revision metadata they cannot maintain.
+const DB_VERSION = 4;
 let db = null;
 let conversationBaseline = new Map();
 let conversationSaveChain = Promise.resolve();
 let conversationChannel = null;
 let conversationStorageBlocked = false;
 let persistenceErrorShown = false;
+const conversationWriters = new Map();
+const notifiedConversationConflicts = new Set();
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -4812,6 +5084,7 @@ function idbPut(store, data) {
     s.put(data);
     tx.oncomplete = resolve;
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('Storage write was aborted.'));
   });
 }
 
@@ -4842,6 +5115,7 @@ function idbDelete(store, key) {
     s.delete(key);
     tx.oncomplete = resolve;
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('Storage deletion was aborted.'));
   });
 }
 
@@ -4851,102 +5125,235 @@ function idbClear(store) {
     tx.objectStore(store).clear();
     tx.oncomplete = resolve;
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('Storage deletion was aborted.'));
   });
 }
 
-function idbPutAll(store, items) {
+function idbPutAll(store, items, valid = () => true, removals = []) {
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readwrite');
+    const tx = db.transaction([store, 'meta'], 'readwrite');
     const s = tx.objectStore(store);
-    s.clear();
-    items.forEach(item => s.put(item));
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
+    const request = s.getAll();
+    const ledger = tx.objectStore('meta').get('syncTombstones');
+    let pending = 2;
+    let failure;
+    let committedTombstones;
+    const write = () => {
+      if (--pending) return;
+      try {
+        if (!valid()) return;
+        const tombstones = syncMergeTombstones(ledger.result?.value, syncLoadTombstones());
+        removals.forEach(memory => {
+          tombstones.memories[memory.id] = Math.max(Number(tombstones.memories[memory.id]) || 0, Date.now(), memory.createdAt);
+        });
+        // All memory removals have deletion records; an omitted ID may be another tab's addition.
+        const records = store === 'memories' ? syncMergeMemoryLists(request.result, items, tombstones.memories) : items;
+        const ids = new Set(records.map(record => record.id));
+        request.result.forEach(record => { if (!ids.has(record.id)) s.delete(record.id); });
+        records.forEach(record => s.put(record));
+        tx.objectStore('meta').put({ key: 'syncTombstones', value: tombstones });
+        committedTombstones = tombstones;
+      } catch (error) { failure = error; tx.abort(); }
+    };
+    request.onsuccess = ledger.onsuccess = write;
+    tx.oncomplete = () => {
+      if (committedTombstones) {
+        try { syncSaveTombstones(syncMergeTombstones(syncLoadTombstones(), committedTombstones)); }
+        catch (error) { console.warn('Deletion records remain in the database:', error); }
+        broadcastPersistenceChange();
+      }
+      resolve();
+    };
+    tx.onerror = tx.onabort = () => reject(failure || tx.error || new Error('Storage write was aborted.'));
   });
 }
 
 function serializeConversation(conv) {
-  return JSON.stringify(conv);
+  return JSON.stringify(conv, (key, value) => {
+    if (key === '_editing') return undefined;
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]])) : value;
+  });
+}
+
+function serializeConversationRecord(conv) {
+  return serializeConversation(normalizeConversationRecord(conv));
 }
 
 function setConversationBaseline(items) {
-  conversationBaseline = new Map((items || []).filter(conv => !isTemporaryConversation(conv)).map(conv => [conv.id, serializeConversation(conv)]));
+  conversationWriters.clear();
+  conversationBaseline = new Map((items || []).filter(conv => !isTemporaryConversation(conv)).map(conv => [conv.id, serializeConversationRecord(conv)]));
 }
 
 function getConversationChanges() {
   const current = new Map();
   const changed = [];
   getPersistentConversations().forEach(record => {
-    const json = serializeConversation(record);
+    if (!conversationBaseline.has(record.id) && record.conflictOf && !record.id.startsWith('conflict_')) {
+      // Duplicating or forking a conflict copy creates an independent chat.
+      delete record.conflictOf;
+      delete record.conflictTitle;
+      delete record.syncVersion;
+    }
+    const json = serializeConversationRecord(record);
     current.set(record.id, json);
     const baseline = conversationBaseline.get(record.id);
     if (baseline !== json) changed.push({ record: JSON.parse(json), json, baseline });
   });
   const deletedIds = [...conversationBaseline.keys()].filter(id => !current.has(id));
-  return { changed, deletedIds };
+  return { changed, deletedIds, current };
 }
 
-function compareConversationRecords(left, right) {
-  const updatedDiff = (Number(left?.updatedAt) || 0) - (Number(right?.updatedAt) || 0);
-  if (updatedDiff) return updatedDiff;
-  const leftJson = serializeConversation(left);
-  const rightJson = serializeConversation(right);
-  return leftJson === rightJson ? 0 : (leftJson > rightJson ? 1 : -1);
+function conversationContent(conv) {
+  const record = normalizeConversationRecord(conv);
+  if (record.conflictTitle && record.title === record.conflictTitle + ' (conflict copy)') record.title = record.conflictTitle;
+  ['id', 'createdAt', 'updatedAt', 'syncVersion', 'conflictOf', 'conflictTitle', 'shareGistId', 'shareUrl', 'shareId'].forEach(key => delete record[key]);
+  delete record.draft.updatedAt;
+  return serializeConversation(record);
+}
+
+function compareConversationVersions(left, right) {
+  const a = left?.syncVersion || {};
+  const b = right?.syncVersion || {};
+  if (!Object.keys(a).length || !Object.keys(b).length) return null;
+  let ahead = false;
+  let behind = false;
+  new Set([...Object.keys(a), ...Object.keys(b)]).forEach(key => {
+    if ((a[key] || 0) > (b[key] || 0)) ahead = true;
+    if ((a[key] || 0) < (b[key] || 0)) behind = true;
+  });
+  return ahead && behind ? null : ahead ? 1 : behind ? -1 : 0;
+}
+
+function normalizeConversationVersion(value) {
+  return Object.fromEntries(Object.entries(value && typeof value === 'object' && !Array.isArray(value) ? value : {}).filter(([key, count]) =>
+    /^[A-Za-z0-9._:-]{1,160}$/.test(key) && Number.isSafeInteger(count) && count > 0));
 }
 
 function chooseConversationWinner(local, existing, baseline) {
-  if (!existing || serializeConversation(existing) === baseline) return local;
-  return compareConversationRecords(local, existing) >= 0 ? local : existing;
+  if (!existing || serializeConversation(existing) === baseline || serializeConversationRecord(existing) === baseline) return local;
+  if (conversationContent(local) === conversationContent(existing)) return existing;
+  if (baseline && conversationContent(local) === conversationContent(JSON.parse(baseline))) return existing;
+  if (serializeConversation(local) === baseline) return existing;
+  const order = compareConversationVersions(local, existing);
+  return order === 1 ? local : order === -1 ? existing : null;
 }
 
-function idbApplyConversationChanges(changed, deletions, tombstones) {
+function makeConversationConflict(record, id) {
+  const copy = JSON.parse(serializeConversation(record));
+  copy.id = id;
+  copy.conflictOf = record.conflictOf || record.id;
+  copy.conflictTitle = record.conflictTitle && record.title === record.conflictTitle + ' (conflict copy)' ? record.conflictTitle : record.title;
+  copy.title = (copy.conflictTitle || 'Chat') + ' (conflict copy)';
+  delete copy.shareGistId;
+  delete copy.shareUrl;
+  delete copy.shareId;
+  return copy;
+}
+
+async function conversationConflictId(record) {
+  const content = (record.conflictOf || record.id) + ':' + conversationContent(record);
+  return 'conflict_' + (window.crypto?.subtle ? await syncSha256Hex(content) : genId());
+}
+
+function reconcileConversationRecord(byId, incoming, conflictId, baseline, deleted = false, localIds = null) {
+  const exact = byId.get(incoming.id);
+  if (!deleted && exact && serializeConversationRecord(exact) === baseline) {
+    byId.set(incoming.id, incoming);
+    return incoming;
+  }
+  const root = incoming.conflictOf || incoming.id;
+  // ponytail: scan loaded records for related branches; index by conflictOf if large histories need it.
+  const family = [...byId.values()].filter(record => (record.id === root || record.conflictOf === root || record.id === incoming.id) &&
+    (record.id === incoming.id || !localIds?.has(record.id)));
+  for (const current of family) {
+    const winner = chooseConversationWinner(incoming, current, current.id === incoming.id ? baseline : undefined);
+    if (winner === current) {
+      if (conversationContent(incoming) === conversationContent(current)) {
+        const version = { ...current.syncVersion };
+        Object.entries(incoming.syncVersion || {}).forEach(([key, value]) => { version[key] = Math.max(version[key] || 0, value); });
+        const same = { ...current, syncVersion: version, updatedAt: Math.max(current.updatedAt || 0, incoming.updatedAt || 0) };
+        byId.set(current.id, same);
+        return same;
+      }
+      return current;
+    }
+    if (winner === incoming) {
+      const next = current.conflictOf || current.id !== incoming.id ? makeConversationConflict(incoming, current.id) : incoming;
+      byId.set(next.id, next);
+      return next;
+    }
+  }
+  if (!exact && !deleted) {
+    byId.set(incoming.id, incoming);
+    return incoming;
+  }
+  const prefix = conflictId;
+  let suffix = 0;
+  while (byId.has(conflictId)) conflictId = prefix + '_' + (++suffix);
+  const copy = makeConversationConflict(incoming, conflictId);
+  byId.set(copy.id, copy);
+  return copy;
+}
+
+function broadcastPersistenceChange() {
+  try { conversationChannel?.postMessage({ refresh: true }); }
+  catch (error) { console.warn('Could not notify other tabs:', error); }
+}
+
+function idbApplyConversationChanges(changed, deletions, tombstones, localIds) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(['conversations', 'meta'], 'readwrite');
     const store = tx.objectStore('conversations');
-    const records = new Map();
-    const writtenRecords = new Map();
-    const deletedIds = new Set();
-
-    changed.forEach(({ record, baseline }) => {
-      const request = store.get(record.id);
-      request.onsuccess = () => {
-        const existing = request.result;
-        let winner = chooseConversationWinner(record, existing, baseline);
-        const deletedAt = Number(tombstones?.[record.id]) || 0;
-        if (deletedAt && (Number(winner.updatedAt) || 0) <= deletedAt) {
-          if (existing) store.delete(record.id);
-          deletedIds.add(record.id);
-          return;
-        }
-        records.set(record.id, winner);
-        if (!existing || serializeConversation(existing) !== serializeConversation(winner)) {
-          if (winner === record) {
-            store.put(record);
-            writtenRecords.set(record.id, record);
+    const request = store.getAll();
+    const ledger = tx.objectStore('meta').get('syncTombstones');
+    let pending = 2;
+    let result;
+    let failure;
+    const write = () => {
+      if (--pending) return;
+      try {
+        const before = new Map(request.result.map(record => [record.id, record]));
+        const records = new Map(before);
+        const mergedTombstones = syncMergeTombstones(ledger.result?.value, tombstones);
+        const applied = [];
+        const conflicts = [];
+        changed.forEach(({ record, baseline, conflictId }) => {
+          const deleted = !records.has(record.id) && (baseline !== undefined || Number(mergedTombstones.conversations[record.id]) >= Number(record.updatedAt));
+          const saved = reconcileConversationRecord(records, record, conflictId, baseline, deleted, localIds);
+          localIds?.add(saved.id);
+          applied.push({ fromId: record.id, record: saved });
+          if (saved.id !== record.id && saved.conflictOf) conflicts.push(saved.id);
+        });
+        deletions.forEach(({ id, deletedAt, baseline }) => {
+          const existing = records.get(id);
+          const base = JSON.parse(baseline || 'null');
+          const diverged = existing && conversationContent(existing) !== conversationContent(base);
+          if (diverged) {
+            const copy = makeConversationConflict(existing, 'conflict_' + (window.crypto?.randomUUID?.() || genId()));
+            records.set(copy.id, copy);
+            conflicts.push(copy.id);
           }
-        }
-      };
-    });
-    deletions.forEach(({ id, deletedAt }) => {
-      const request = store.get(id);
-      request.onsuccess = () => {
-        const existing = request.result;
-        if (!existing || (Number(existing.updatedAt) || 0) <= deletedAt) {
-          if (existing) store.delete(id);
-          deletedIds.add(id);
-        } else {
-          records.set(id, existing);
-        }
-      };
-    });
-    tx.objectStore('meta').put({ key: 'activeConvId', value: getPersistentActiveConvId() });
-    tx.oncomplete = () => resolve({
-      records: [...records.values()],
-      writtenRecords: [...writtenRecords.values()],
-      deletedIds: [...deletedIds]
-    });
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error || new Error('Conversation save was aborted.'));
+          records.delete(id);
+          mergedTombstones.conversations[id] = Math.max(Number(mergedTombstones.conversations[id]) || 0, deletedAt, Number(existing?.updatedAt) || 0, Number(base?.updatedAt) || 0);
+          const seen = normalizeConversationVersion((diverged ? base : existing || base)?.syncVersion);
+          const previous = mergedTombstones.conversationVersions[id] || {};
+          Object.entries(seen).forEach(([writer, count]) => { previous[writer] = Math.max(Number(previous[writer]) || 0, count); });
+          mergedTombstones.conversationVersions[id] = previous;
+          mergedTombstones.conversationRoots[id] = (base || existing)?.conflictOf || id;
+        });
+        const writtenRecords = [...records.values()].filter(record => serializeConversation(record) !== serializeConversation(before.get(record.id)));
+        const deletedIds = [...before.keys()].filter(id => !records.has(id));
+        writtenRecords.forEach(record => store.put(record));
+        deletedIds.forEach(id => store.delete(id));
+        tx.objectStore('meta').put({ key: 'syncTombstones', value: mergedTombstones });
+        tx.objectStore('meta').put({ key: 'activeConvId', value: getPersistentActiveConvId() });
+        result = { records: [...records.values()], writtenRecords, deletedIds, applied, conflicts, tombstones: mergedTombstones };
+      } catch (error) { failure = error; tx.abort(); }
+    };
+    request.onsuccess = ledger.onsuccess = write;
+    tx.oncomplete = () => resolve(result);
+    tx.onerror = tx.onabort = () => reject(failure || tx.error || new Error('Conversation save was aborted.'));
   });
 }
 
@@ -4957,64 +5364,137 @@ function reportPersistenceError(error) {
   showToast('Changes could not be saved. Keep this tab open and retry after freeing storage or reloading.', 'error', 0);
 }
 
-function persistConversationState() {
+function persistConversationState(refresh = false) {
   if (readOnlyShare) return Promise.resolve();
   if (conversationStorageBlocked) return Promise.reject(new Error('Conversation storage is unavailable until reload.'));
   try { localStorage.setItem('assistantActiveConvId', getPersistentActiveConvId()); } catch(e) {}
 
   const run = conversationSaveChain.then(async () => {
-    const { changed, deletedIds } = getConversationChanges();
-    if (!changed.length && !deletedIds.length) {
+    if (conversationStorageBlocked) throw new Error('Conversation storage is unavailable until reload.');
+    const { changed, deletedIds, current: captured } = getConversationChanges();
+    if (!changed.length && !deletedIds.length && !refresh) {
       if (db) await idbPut('meta', { key: 'activeConvId', value: getPersistentActiveConvId() });
       persistenceErrorShown = false;
       return;
     }
-    if (!db) {
-      const persistent = getPersistentConversations();
-      localStorage.setItem('assistantConversations', JSON.stringify(persistent));
-      setConversationBaseline(persistent);
+    const now = Date.now();
+    const tombstones = syncLoadTombstones();
+    const deletions = deletedIds.map(id => ({ id, deletedAt: Number(tombstones.conversations[id]) || now, baseline: conversationBaseline.get(id) }));
+    for (const entry of changed) {
+      const base = JSON.parse(entry.baseline || 'null') || entry.record;
+      if (!conversationWriters.has(entry.record.id)) conversationWriters.set(entry.record.id, window.crypto?.randomUUID?.() || genId());
+      const writerId = conversationWriters.get(entry.record.id);
+      entry.record.syncVersion = { ...(entry.record.syncVersion || base.syncVersion) };
+      if (entry.baseline !== undefined && !Object.keys(base.syncVersion || {}).length) entry.record.syncVersion['legacy:' + await conversationConflictId(base)] = 1;
+      entry.record.syncVersion[writerId] = (entry.record.syncVersion[writerId] || 0) + 1;
+      entry.record.updatedAt = Math.max(now, Number(entry.record.updatedAt) || 0, Number(JSON.parse(entry.baseline || 'null')?.updatedAt || 0) + 1);
+      entry.conflictId = 'conflict_' + (window.crypto?.randomUUID?.() || genId());
+    }
+    if (conversationStorageBlocked) throw new Error('Conversation storage is unavailable until reload.');
+    let result;
+    const localIds = new Set(captured.keys());
+    if (db) result = await idbApplyConversationChanges(changed, deletions, tombstones, localIds);
+    else {
+      const records = new Map(syncFilterDeletedRecords(normalizeLoadedConversations(JSON.parse(localStorage.getItem('assistantConversations') || '[]')).conversations, tombstones.conversations, 'updatedAt').map(record => [record.id, record]));
+      const applied = changed.map(({ record, baseline, conflictId }) => {
+        const saved = reconcileConversationRecord(records, record, conflictId, baseline, !records.has(record.id) && baseline !== undefined, localIds);
+        localIds.add(saved.id);
+        return { fromId: record.id, record: saved };
+      });
+      deletions.forEach(({ id, deletedAt, baseline }) => {
+        const existing = records.get(id);
+        if (existing && conversationContent(existing) !== conversationContent(JSON.parse(baseline || 'null'))) {
+          const copy = makeConversationConflict(existing, 'conflict_' + (window.crypto?.randomUUID?.() || genId()));
+          records.set(copy.id, copy);
+        }
+        records.delete(id);
+        tombstones.conversations[id] = Math.max(deletedAt, Number(existing?.updatedAt) || 0);
+      });
+      result = { records: [...records.values()], applied, writtenRecords: changed, deletedIds, tombstones, conflicts: applied.filter(item => item.record.id !== item.fromId).map(item => item.record.id) };
+      localStorage.setItem('assistantConversations', JSON.stringify(result.records));
+    }
+    const removedDuringSave = new Set([...captured.keys()].filter(id => !conversations.some(conv => conv.id === id)));
+    let reconciled = false;
+    const deferredIds = new Set();
+    const committedLocalIds = new Set();
+    // ponytail: file reads are counted globally, so keep loaded chats stable until they finish.
+    const hasPendingWork = id => pendingAttachmentReads > 0 || (id === activeConvId && (sending || streaming || queueingFollowUp));
+    const appliedIds = new Set(result.applied.map(item => item.record.id));
+    result.applied.forEach(({ fromId, record }) => {
+      const keptLocalContent = conversationContent(record) === conversationContent(JSON.parse(captured.get(fromId)));
+      if (keptLocalContent) {
+        committedLocalIds.add(record.id);
+        if (removedDuringSave.has(fromId)) removedDuringSave.add(record.id);
+      }
+      const local = conversations.find(conv => conv.id === fromId && !isTemporaryConversation(conv));
+      if (!local) return;
+      if (!keptLocalContent) {
+        if (serializeConversationRecord(local) !== captured.get(fromId) || hasPendingWork(fromId)) {
+          deferredIds.add(fromId);
+          return;
+        }
+        conversations = conversations.filter(conv => conv !== local);
+        if (activeConvId === fromId) activeConvId = record.id;
+        reconciled = true;
+        return;
+      }
+      if (record.id !== fromId) {
+        // A fork keeps its writer; editing the other branch must use a different writer.
+        const writerId = conversationWriters.get(fromId);
+        conversationWriters.delete(fromId);
+        if (writerId) conversationWriters.set(record.id, writerId);
+        if (local.title === JSON.parse(captured.get(fromId)).title) local.title = record.title;
+        local.id = record.id;
+        local.conflictOf = record.conflictOf;
+        local.conflictTitle = record.conflictTitle;
+        delete local.shareGistId;
+        delete local.shareUrl;
+        delete local.shareId;
+        if (activeConvId === fromId) activeConvId = record.id;
+        reconciled = true;
+      }
+      local.syncVersion = record.syncVersion;
+      local.updatedAt = Math.max(Number(local.updatedAt) || 0, Number(record.updatedAt) || 0);
+    });
+    const storedIds = new Set(result.records.map(record => record.id));
+    result.records.forEach(record => {
+      let json;
+      try { json = serializeConversationRecord(record); }
+      catch (error) { console.warn('Unreadable chat left in storage:', record.id, error); return; }
+      const index = conversations.findIndex(conv => conv.id === record.id && !isTemporaryConversation(conv));
+      if (removedDuringSave.has(record.id)) {
+        if (committedLocalIds.has(record.id)) conversationBaseline.set(record.id, json);
+        return;
+      }
+      if (deferredIds.has(record.id)) return;
+      if (index !== -1 && hasPendingWork(record.id) && !appliedIds.has(record.id)) return;
+      if (index !== -1 && captured.has(record.id) && serializeConversationRecord(conversations[index]) !== captured.get(record.id) && !appliedIds.has(record.id)) return;
+      if (index === -1 && !removedDuringSave.has(record.id)) {
+        try { conversations.unshift(normalizeConversationRecord(record)); }
+        catch (error) { console.warn('Unreadable chat left in storage:', record.id, error); return; }
+        reconciled = true;
+      } else if (index !== -1 && captured.get(record.id) === serializeConversationRecord(conversations[index]) && json !== captured.get(record.id)) {
+        conversations[index] = normalizeConversationRecord(record);
+        reconciled = true;
+      }
+      conversationBaseline.set(record.id, json);
+    });
+    for (const id of conversationBaseline.keys()) {
+      if (storedIds.has(id)) continue;
+      const local = conversations.find(conv => conv.id === id && !isTemporaryConversation(conv));
+      if (local && (hasPendingWork(id) || deferredIds.has(id) || serializeConversationRecord(local) !== captured.get(id))) continue;
+      conversations = conversations.filter(conv => conv !== local);
+      conversationBaseline.delete(id);
+      conversationWriters.delete(id);
+      if (local) reconciled = true;
+    }
+    try { syncSaveTombstones(syncMergeTombstones(syncLoadTombstones(), result.tombstones)); }
+    catch (error) { console.warn('Could not mirror deletion records:', error); }
+    if (reconciled) refreshConversationStateAfterExternalChange();
+    notifyConversationConflicts(getPersistentConversations().filter(record => record.conflictOf).map(record => record.id));
+    if (result.writtenRecords.length || result.deletedIds.length) {
+      broadcastPersistenceChange();
       syncScheduleAutoPush();
-    } else {
-      const now = Date.now();
-      const tombstones = syncLoadTombstones();
-      const missingTombstones = deletedIds.filter(id => !tombstones.conversations[id]);
-      if (missingTombstones.length) {
-        missingTombstones.forEach(id => { tombstones.conversations[id] = now; });
-        syncSaveTombstones(tombstones);
-      }
-      const deletions = deletedIds.map(id => ({ id, deletedAt: Number(tombstones.conversations[id]) || now }));
-      const result = await idbApplyConversationChanges(changed, deletions, tombstones.conversations);
-      const captured = new Map(changed.map(entry => [entry.record.id, entry.json]));
-      let reconciled = false;
-
-      result.records.forEach(record => {
-        const json = serializeConversation(record);
-        conversationBaseline.set(record.id, json);
-        const index = conversations.findIndex(conv => conv.id === record.id && !isTemporaryConversation(conv));
-        if (index === -1) {
-          conversations.unshift(normalizeConversationRecord(record));
-          reconciled = true;
-        } else if (captured.has(record.id) && serializeConversation(conversations[index]) === captured.get(record.id) && captured.get(record.id) !== json) {
-          conversations[index] = normalizeConversationRecord(record);
-          reconciled = true;
-        }
-      });
-      result.deletedIds.forEach(id => {
-        conversationBaseline.delete(id);
-        const index = conversations.findIndex(conv => conv.id === id && !isTemporaryConversation(conv));
-        if (index !== -1 && captured.has(id) && serializeConversation(conversations[index]) === captured.get(id)) {
-          conversations.splice(index, 1);
-          reconciled = true;
-        }
-      });
-      if (reconciled) refreshConversationStateAfterExternalChange();
-      if ((result.writtenRecords.length || result.deletedIds.length) && conversationChannel) {
-        conversationChannel.postMessage({
-          changed: result.writtenRecords,
-          deleted: result.deletedIds.map(id => ({ id, deletedAt: Number(tombstones.conversations[id]) || now }))
-        });
-      }
-      if (result.writtenRecords.length || result.deletedIds.length) syncScheduleAutoPush();
     }
     persistenceErrorShown = false;
   });
@@ -5025,40 +5505,47 @@ function persistConversationState() {
 function initConversationChannel() {
   if (!db || typeof BroadcastChannel === 'undefined' || conversationChannel) return;
   conversationChannel = new BroadcastChannel('synapse-conversations');
-  conversationChannel.onmessage = event => {
-    const payload = event.data && typeof event.data === 'object' ? event.data : {};
-    const incoming = Array.isArray(payload.changed) ? payload.changed : [];
-    const deletions = Array.isArray(payload.deleted)
-      ? payload.deleted.filter(item => item && item.id).map(item => ({ id: item.id, deletedAt: Number(item.deletedAt) || 0 }))
-      : (Array.isArray(payload.deletedIds) ? payload.deletedIds.map(id => ({ id, deletedAt: 0 })) : []);
-    const localChanges = getConversationChanges();
-    const dirtyIds = new Set(localChanges.changed.map(({ record }) => record.id).concat(localChanges.deletedIds));
-    let changed = false;
-
-    incoming.forEach(raw => {
-      let record;
-      try { record = normalizeConversationRecord(raw); } catch (e) { return; }
-      if (!record || dirtyIds.has(record.id)) return;
-      if (conversations.some(conv => conv.id === record.id && isTemporaryConversation(conv))) return;
-      const index = conversations.findIndex(conv => conv.id === record.id);
-      if (index !== -1 && compareConversationRecords(conversations[index], record) > 0) return;
-      if (index === -1) conversations.unshift(record);
-      else conversations[index] = record;
-      conversationBaseline.set(record.id, serializeConversation(record));
-      changed = true;
-    });
-    deletions.forEach(({ id, deletedAt }) => {
-      if (dirtyIds.has(id)) return;
-      const current = conversations.find(conv => conv.id === id);
-      if (isTemporaryConversation(current)) return;
-      if (current && deletedAt && Number(current.updatedAt) > deletedAt) return;
-      const before = conversations.length;
-      conversations = conversations.filter(conv => conv.id !== id);
-      conversationBaseline.delete(id);
-      changed = changed || conversations.length !== before;
-    });
-    if (changed) refreshConversationStateAfterExternalChange();
+  conversationChannel.onmessage = () => {
+    // Read the committed database, not an out-of-order broadcast. Dirty chats use the same arbitration as saves.
+    persistDraftFromUI();
+    persistConversationState(true).then(() => saveProjects(true)).catch(reportPersistenceError);
   };
+}
+
+function notifyConversationConflicts(ids) {
+  const fresh = (ids || []).filter(id => !notifiedConversationConflicts.has(id));
+  if (!fresh.length) return;
+  fresh.forEach(id => notifiedConversationConflicts.add(id));
+  showToast('Conflicting edits were kept as separate chats. Which would you like to continue?', 'info', 0, {
+    label: 'Choose chat',
+    onClick: () => {
+      const roots = new Set(fresh.map(id => conversations.find(conv => conv.id === id)?.conflictOf));
+      const choices = conversations.filter(conv => fresh.includes(conv.id) || roots.has(conv.id) || roots.has(conv.conflictOf));
+      const overlay = document.createElement('div');
+      overlay.className = 'char-info-overlay';
+      const popup = document.createElement('div');
+      popup.className = 'char-info-popup';
+      popup.setAttribute('aria-label', 'Choose which saved chat to continue');
+      const heading = document.createElement('h3');
+      heading.textContent = 'Choose a chat to continue';
+      popup.appendChild(heading);
+      let close;
+      choices.forEach(conv => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn btn-secondary';
+        button.textContent = conv.title + ' (' + conv.messages.length + ' messages' + (conv.draft?.text ? ', draft saved' : '') + ')';
+        button.onclick = () => {
+          if (sending || streaming || _syncPullInFlight) { showToast('Finish the current operation before switching chats.', 'info'); return; }
+          close();
+          setConversationView(conv.archivedAt ? 'archived' : 'active');
+          switchConversation(conv.id);
+        };
+        popup.appendChild(button);
+      });
+      close = openTransientDialog(overlay, popup, popup.querySelector('button'));
+    }
+  });
 }
 
 function refreshConversationStateAfterExternalChange() {
@@ -5070,6 +5557,7 @@ function refreshConversationStateAfterExternalChange() {
   if (!conversations.some(conv => conv.id === activeConvId)) activeConvId = conversations[0].id;
   messages = getActiveConv().messages;
   renderSidebar();
+  if (sending || streaming || queueingFollowUp || pendingAttachmentReads > 0) return;
   renderMessages({ preserveScroll: true });
   updateCharacterUI();
   restoreActiveDraft();
@@ -5194,11 +5682,18 @@ function migrateLegacyBranches(convs, usedIds) {
 function normalizeLoadedConversations(list) {
   const source = Array.isArray(list) ? list : [];
   const used = new Set();
-  const normalized = source.map(raw => {
-    const conv = normalizeConversationRecord(raw);
-    if (used.has(conv.id)) conv.id = genId();
-    used.add(conv.id);
-    return conv;
+  const normalized = [];
+  source.forEach(raw => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+    try {
+      let conv = normalizeConversationRecord(raw);
+      if (used.has(conv.id)) {
+        if (normalized.some(record => record.id === conv.id && conversationContent(record) === conversationContent(conv))) return;
+        conv = makeConversationConflict(conv, 'conflict_' + (window.crypto?.randomUUID?.() || genId()));
+      }
+      used.add(conv.id);
+      normalized.push(conv);
+    } catch (error) { console.warn('Unreadable chat left in its source:', raw.id, error); }
   });
   const migrated = migrateLegacyBranches(normalized, used);
   const recovered = recoverInterruptedRequests(migrated.conversations);
@@ -5210,10 +5705,10 @@ function normalizeLoadedConversations(list) {
 
 function cloneDraftAttachments(attachments) {
   return (Array.isArray(attachments) ? attachments : []).filter(att => att && typeof att === 'object').map(att => ({
-    type: att.type,
-    name: att.name || 'file',
-    mime: att.mime || '',
-    dataUrl: att.type === 'image' ? safeMediaUrl(att.dataUrl) : safeFileUrl(att.dataUrl),
+    type: att.type === 'image' ? 'image' : 'file',
+    name: typeof att.name === 'string' ? att.name : 'file',
+    mime: typeof att.mime === 'string' ? att.mime : '',
+    dataUrl: typeof att.dataUrl === 'string' ? (att.type === 'image' ? safeMediaUrl(att.dataUrl) : safeFileUrl(att.dataUrl)) : '',
     textContent: typeof att.textContent === 'string' ? att.textContent : '',
     binary: att.binary === true,
     truncated: att.truncated === true
@@ -5301,23 +5796,13 @@ function finishConversationLoad(preferredActiveId) {
 }
 
 async function loadConversations() {
-  // Try IndexedDB first
+  let stored = [];
+  let preferredActiveId = localStorage.getItem('assistantActiveConvId');
   if (db) {
     try {
-      const convs = await idbGetAll('conversations');
-      if (convs.length > 0) {
-        const rawBaseline = new Map(convs.map(conv => [conv.id, serializeConversation(conv)]));
-        const visibleConversations = syncFilterDeletedRecords(convs, syncLoadTombstones().conversations, 'updatedAt');
-        const normalized = normalizeLoadedConversations(visibleConversations);
-        conversations = normalized.conversations;
-        conversationBaseline = rawBaseline;
-        const meta = await idbGet('meta', 'activeConvId');
-        migratePersonaField(conversations);
-        finishConversationLoad(meta?.value || conversations[0]?.id || null);
-        saveConversations();
-        return;
-      }
-      conversationBaseline.clear();
+      await conversationSaveChain;
+      stored = await idbGetAll('conversations');
+      preferredActiveId = (await idbGet('meta', 'activeConvId'))?.value || preferredActiveId;
     } catch(e) {
       console.error('IDB load error:', e);
       conversationStorageBlocked = true;
@@ -5327,60 +5812,70 @@ async function loadConversations() {
       return;
     }
   }
-
-  // Migrate from localStorage
+  const normalizedStored = normalizeLoadedConversations(stored).conversations;
+  conversationWriters.clear();
+  const readableIds = new Set(normalizedStored.map(conv => conv.id));
+  conversationBaseline = new Map(stored.filter(conv => readableIds.has(conv.id)).map(conv => [conv.id, serializeConversationRecord(conv)]));
+  const fallback = [];
   const saved = localStorage.getItem('assistantConversations');
+  let fallbackReadable = true;
   if (saved) {
-    try { conversations = JSON.parse(saved); }
-    catch (e) { console.error('Failed to parse conversations, resetting:', e); conversations = []; }
-  }
-
-  // Migrate legacy
-  const legacy = localStorage.getItem('assistantChatHistory');
-  if (legacy && conversations.length === 0) {
     try {
-      conversations.push({ id: genId(), title: 'Chat', messages: JSON.parse(legacy), createdAt: Date.now(), updatedAt: Date.now() });
-      localStorage.removeItem('assistantChatHistory');
+      const parsed = JSON.parse(saved);
+      if (!Array.isArray(parsed)) throw new Error('Conversation backup is not a list.');
+      if (!db) setConversationBaseline(parsed.filter(record => record && typeof record === 'object' && !Array.isArray(record)));
+      fallback.push(...normalizeLoadedConversations(parsed).conversations);
+    } catch (error) {
+      fallbackReadable = false;
+      console.error('Conversation fallback was retained:', error);
+      showToast('A local conversation backup could not be read. It has not been removed.', 'error', 0);
+    }
+  }
+  const legacy = localStorage.getItem('assistantChatHistory');
+  let legacyReadable = false;
+  if (legacy) {
+    try {
+      const history = JSON.parse(legacy);
+      if (!Array.isArray(history)) throw new Error('Legacy history is not a list.');
+      const id = 'legacy_' + (window.crypto?.subtle ? await syncSha256Hex(legacy) : 'chat_history');
+      fallback.push(normalizeConversationRecord({ id, title: 'Chat', messages: history, createdAt: 1, updatedAt: 1 }));
+      legacyReadable = true;
     } catch (e) { console.error('Failed to parse legacy chat:', e); }
   }
-
-  if (conversations.length === 0) {
-    conversations.push({ id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() });
-  }
-
-  // Normalize legacy records without changing their IDs or message history.
-  conversations = syncFilterDeletedRecords(
-    normalizeLoadedConversations(conversations).conversations,
-    syncLoadTombstones().conversations,
-    'updatedAt'
-  );
-  if (conversations.length === 0) {
-    conversations.push({ id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() });
-  }
-
-  // Migrate characterSystemPrompt → persona
+  // Fallback JSON may contain edits written before an IDB save completed, with an old version still attached.
+  if (db) fallback.forEach(record => delete record.syncVersion);
+  const tombstones = syncLoadTombstones();
+  const recoveredFallback = (await syncMergeConversationLists([], fallback, tombstones.conversations, tombstones.conversationVersions, tombstones.conversationRoots)).conversations;
+  const merged = await syncMergeConversationLists(normalizedStored, recoveredFallback);
+  conversations = merged.conversations;
   migratePersonaField(conversations);
-
-  const savedActive = localStorage.getItem('assistantActiveConvId');
-  activeConvId = (savedActive && conversations.find(c => c.id === savedActive)) ? savedActive : conversations[0].id;
-  messages = getActiveConv().messages;
-
-  finishConversationLoad(savedActive);
-
-  // Write migrated data to IndexedDB and clean localStorage
+  finishConversationLoad(preferredActiveId);
+  if (!db && !fallbackReadable) { conversationStorageBlocked = true; return; }
+  // Source copies are removed only after the destination commits, and only if no other tab changed them.
   try {
     await persistConversationState();
-    if (db) localStorage.removeItem('assistantConversations');
+    if (db && fallbackReadable && localStorage.getItem('assistantConversations') === saved) localStorage.removeItem('assistantConversations');
+    if (legacyReadable && localStorage.getItem('assistantChatHistory') === legacy) localStorage.removeItem('assistantChatHistory');
+    notifyConversationConflicts(conversations.filter(conv => conv.conflictOf).map(conv => conv.id));
   } catch(e) { reportPersistenceError(e); }
 }
 
 function getActiveConv() { return conversations.find(c => c.id === activeConvId); }
 
-function createConversation(projectId) {
-  if (readOnlyShare) return;
-  if (_syncPullInFlight) { showToast('Wait for sync pull to finish.', 'info'); return; }
-  if (sending || streaming) { showToast('Stop the current response before creating another chat.', 'info'); return; }
+function prepareConversationTransition() {
+  if (readOnlyShare) return false;
+  if (_syncPullInFlight) { showToast('Wait for sync pull to finish.', 'info'); return false; }
+  if (sending || streaming || queueingFollowUp) {
+    showToast('Stop the current request before changing chats.', 'info');
+    return false;
+  }
+  stopVoiceInput();
   persistDraftFromUI();
+  return true;
+}
+
+function createConversation(projectId) {
+  if (!prepareConversationTransition()) return;
   const conv = { id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
   // Only ever set from the per-project "+" in the sidebar; index.html calls this with
   // no argument, and a click event must not be mistaken for a project id.
@@ -5401,10 +5896,7 @@ function createConversation(projectId) {
 }
 
 function createTemporaryConversation() {
-  if (readOnlyShare) return;
-  if (_syncPullInFlight) { showToast('Wait for sync pull to finish.', 'info'); return; }
-  if (sending || streaming) { showToast('Stop the current response before creating another chat.', 'info'); return; }
-  persistDraftFromUI();
+  if (!prepareConversationTransition()) return;
   const conv = { id: genId(), title: 'Temporary chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
   temporaryConversations.add(conv);
   conversations.unshift(conv);
@@ -5424,11 +5916,9 @@ function createTemporaryConversation() {
 }
 
 function switchConversation(id) {
-  if (_syncPullInFlight) { showToast('Wait for sync pull to finish.', 'info'); return; }
-  if (sending || streaming) { showToast('Stop the current response before switching chats.', 'info'); return; }
   const conv = conversations.find(c => c.id === id);
   if (!conv) return;
-  persistDraftFromUI();
+  if (!prepareConversationTransition()) return;
   activeConvId = id;
   messages = conv.messages;
   userScrolledAway = false;
@@ -5457,7 +5947,7 @@ function clearAllConversations() {
 // Projects
 // ============================================
 // Stored as a single record in the existing `meta` store rather than a new object store.
-// A synchronous localStorage copy protects edits until the IndexedDB write completes.
+// Save only this tab's changes, against the current record in a read/write transaction.
 
 const PROJECT_DOC_CHAR_LIMIT = 20000;
 const COLLAPSED_PROJECTS_KEY = 'assistantCollapsedProjectIds';
@@ -5465,6 +5955,7 @@ let _projectEditId = null;
 let _projectAutosaveTimer = null;
 let _projectSaveRevision = 0;
 let _projectSaveChain = Promise.resolve();
+let projectBaseline = new Map();
 
 function getCollapsedProjectIds() {
   try {
@@ -5515,8 +6006,9 @@ function normalizeProjectList(raw) {
 }
 
 async function loadProjects() {
-  let fallbackProjects = null;
+  let fallbackProjects = [];
   const fallbackRaw = localStorage.getItem('assistantProjects');
+  let fallbackReadable = true;
   if (fallbackRaw !== null) {
     try {
       const parsed = JSON.parse(fallbackRaw);
@@ -5524,57 +6016,143 @@ async function loadProjects() {
       fallbackProjects = syncFilterDeletedRecords(normalizeProjectList(parsed), syncLoadTombstones().projects, 'updatedAt');
     } catch (error) {
       console.error('Project fallback parse error:', error);
-      localStorage.removeItem('assistantProjects');
+      fallbackReadable = false;
     }
   }
   if (!db) {
-    projects = fallbackProjects || [];
-    return;
-  }
-  if (fallbackProjects) {
     projects = fallbackProjects;
-    try {
-      await idbPut('meta', { key: 'projects', value: projects });
-      localStorage.removeItem('assistantProjects');
-    } catch (error) {
-      console.error('Project fallback migration error:', error);
-    }
+    projectBaseline = new Map(projects.map(project => [project.id, serializeConversation(project)]));
     return;
   }
   try {
     const record = await idbGet('meta', 'projects');
     const raw = (record && record.value) || [];
-    projects = syncFilterDeletedRecords(normalizeProjectList(raw), syncLoadTombstones().projects, 'updatedAt');
-    if (JSON.stringify(raw) !== JSON.stringify(projects)) await idbPut('meta', { key: 'projects', value: projects });
+    projects = normalizeProjectList(raw);
+    projectBaseline = new Map((Array.isArray(raw) ? raw : []).filter(project => project?.id).map(project => [project.id, serializeConversation(project)]));
+    for (const project of fallbackProjects) {
+      const current = projects.find(item => item.id === project.id);
+      if (current && serializeConversation({ ...current, updatedAt: 0 }) === serializeConversation({ ...project, updatedAt: 0 })) continue;
+      if (current) {
+        project.id = 'proj_conflict_' + (window.crypto?.subtle ? await syncSha256Hex(project) : genId());
+        project.name += ' (conflict copy)';
+      }
+      if (!projects.some(item => item.id === project.id)) projects.push(project);
+    }
+    if (await saveProjects() && fallbackReadable && localStorage.getItem('assistantProjects') === fallbackRaw) localStorage.removeItem('assistantProjects');
   } catch (e) {
     console.error('IDB projects load error:', e);
-    projects = [];
+    showToast('Projects could not be read safely. Keep this tab open and reload before saving projects.', 'error', 0);
   }
 }
 
-function saveProjects() {
-  const records = syncFilterDeletedRecords(normalizeProjectList(projects), syncLoadTombstones().projects, 'updatedAt');
-  const serialized = JSON.stringify(records);
-  const revision = ++_projectSaveRevision;
-  let fallbackSaved = false;
-  try {
-    localStorage.setItem('assistantProjects', serialized);
-    fallbackSaved = true;
-    syncScheduleAutoPush();
-  } catch (error) {
-    console.error('Project fallback save error:', error);
-  }
-  if (!db) return Promise.resolve(fallbackSaved);
-  const run = _projectSaveChain.then(() => idbPut('meta', { key: 'projects', value: records }))
-    .then(() => {
-      if (revision === _projectSaveRevision) localStorage.removeItem('assistantProjects');
-      if (!fallbackSaved) syncScheduleAutoPush();
-      return true;
-    })
-    .catch(error => {
-      console.error('IDB projects save error:', error);
-      return fallbackSaved;
+function saveProjects(refresh = false) {
+  if (readOnlyShare || conversationStorageBlocked) return Promise.resolve(false);
+  ++_projectSaveRevision;
+  const run = _projectSaveChain.then(async () => {
+    if (conversationStorageBlocked) throw new Error('Project storage is unavailable until reload.');
+    const local = normalizeProjectList(projects);
+    const baselines = new Map(projectBaseline);
+    const captured = new Map(local.map(project => [project.id, serializeConversation(project)]));
+    const changed = local.filter(project => captured.get(project.id) !== baselines.get(project.id));
+    const deleted = [...baselines.keys()].filter(id => !captured.has(id));
+    if (!changed.length && !deleted.length && !refresh) return true;
+    const tombstones = syncLoadTombstones();
+    const merge = (stored, ledger) => {
+      const mergedTombstones = syncMergeTombstones(ledger, tombstones);
+      const before = syncFilterDeletedRecords(normalizeProjectList(stored), mergedTombstones.projects, 'updatedAt');
+      const rawById = new Map((Array.isArray(stored) ? stored : []).filter(project => project?.id).map(project => [project.id, project]));
+      const records = new Map(before.map(project => [project.id, project]));
+      const applied = [];
+      let conflicts = 0;
+      const keepCopy = project => {
+        const copy = { ...project, id: 'proj_conflict_' + (window.crypto?.randomUUID?.() || genId()), name: project.name + ' (conflict copy)' };
+        records.set(copy.id, copy);
+        conflicts++;
+        return copy;
+      };
+      changed.forEach(project => {
+        const current = records.get(project.id);
+        const baseline = baselines.get(project.id);
+        let saved = project;
+        if ((current && serializeConversation(rawById.get(project.id)) !== baseline && serializeConversation(current) !== serializeConversation(project)) ||
+            (!current && (baseline !== undefined || Number(mergedTombstones.projects[project.id]) >= Number(project.updatedAt)))) saved = keepCopy(project);
+        else records.set(project.id, saved);
+        saved.updatedAt = Math.max(Date.now(), Number(saved.updatedAt) || 0, Number(JSON.parse(baseline || 'null')?.updatedAt || 0) + 1);
+        applied.push({ fromId: project.id, record: saved });
+      });
+      deleted.forEach(id => {
+        const current = records.get(id);
+        if (current && serializeConversation(rawById.get(id)) !== baselines.get(id)) keepCopy(current);
+        records.delete(id);
+        mergedTombstones.projects[id] = Math.max(Number(mergedTombstones.projects[id]) || 0, Date.now());
+      });
+      const next = [...records.values()];
+      return { records: next, tombstones: mergedTombstones, applied, conflicts, changed: serializeConversation(stored || []) !== serializeConversation(next) };
+    };
+    let result;
+    if (!db) {
+      result = merge(JSON.parse(localStorage.getItem('assistantProjects') || '[]'), tombstones);
+      localStorage.setItem('assistantProjects', JSON.stringify(result.records));
+    } else {
+      result = await new Promise((resolve, reject) => {
+        const tx = db.transaction('meta', 'readwrite');
+        const store = tx.objectStore('meta');
+        const request = store.get('projects');
+        const ledger = store.get('syncTombstones');
+        let pending = 2;
+        let next;
+        let failure;
+        const write = () => {
+          if (--pending) return;
+          try {
+            next = merge(request.result?.value || [], ledger.result?.value);
+            if (next.changed) store.put({ key: 'projects', value: next.records });
+            store.put({ key: 'syncTombstones', value: next.tombstones });
+          } catch (error) { failure = error; tx.abort(); }
+        };
+        request.onsuccess = ledger.onsuccess = write;
+        tx.oncomplete = () => resolve(next);
+        tx.onerror = tx.onabort = () => reject(failure || tx.error || new Error('Project save was aborted.'));
+      });
+    }
+    const removedDuringSave = new Set([...captured.keys()].filter(id => !projects.some(project => project.id === id)));
+    result.applied.forEach(({ fromId, record }) => {
+      if (fromId === record.id) return;
+      const current = projects.find(project => project.id === fromId);
+      if (!current) return;
+      current.id = record.id;
+      if (current.name === JSON.parse(captured.get(fromId)).name) current.name = record.name;
+      if (_projectEditId === fromId) _projectEditId = record.id;
+      captured.set(record.id, serializeConversation(record));
     });
+    const appliedIds = new Set(result.applied.map(item => item.record.id));
+    result.records.forEach(record => {
+      const index = projects.findIndex(project => project.id === record.id);
+      if (removedDuringSave.has(record.id)) return;
+      const dirty = index !== -1 && serializeConversation(normalizeProjectRecord(projects[index])) !== captured.get(record.id);
+      if (index === -1) projects.push(record);
+      else if (!dirty) projects[index] = record;
+      if (!dirty || appliedIds.has(record.id)) projectBaseline.set(record.id, serializeConversation(record));
+    });
+    const storedIds = new Set(result.records.map(record => record.id));
+    for (const id of projectBaseline.keys()) {
+      if (storedIds.has(id)) continue;
+      const current = projects.find(project => project.id === id);
+      if (current && serializeConversation(normalizeProjectRecord(current)) !== captured.get(id)) continue;
+      projects = projects.filter(project => project.id !== id);
+      projectBaseline.delete(id);
+    }
+    try { syncSaveTombstones(syncMergeTombstones(syncLoadTombstones(), result.tombstones)); }
+    catch (error) { console.warn('Could not mirror project deletion records:', error); }
+    if (result.changed) { broadcastPersistenceChange(); syncScheduleAutoPush(); }
+    if (result.conflicts) showToast('Conflicting project edits were kept as separate projects.', 'info', 0);
+    if (refresh || result.conflicts) { renderSidebar(); renderProjectEditorPreservingPendingEdits(_projectEditId); }
+    return true;
+  }).catch(error => {
+    console.error('Project save error:', error);
+    showToast('Project changes could not be saved. Keep this tab open and retry.', 'error', 0);
+    return false;
+  });
   _projectSaveChain = run.then(() => undefined);
   return run;
 }
@@ -5702,7 +6280,7 @@ function toggleActiveArchive() {
 }
 
 function duplicateConversation(id = activeConvId) {
-  if (readOnlyShare) return;
+  if (!prepareConversationTransition()) return;
   const source = conversations.find(c => c.id === id);
   if (!source) return;
   const copy = normalizeConversationRecord(JSON.parse(JSON.stringify(source)));
@@ -5726,16 +6304,18 @@ function duplicateConversation(id = activeConvId) {
   renderMessages();
   updateTokenInfo();
   restoreActiveDraft();
+  updateCharacterUI();
   announce('Conversation duplicated.');
 }
 
 function removeConversations(ids, showUndo = true) {
-  if (readOnlyShare) return;
+  if (!prepareConversationTransition()) return;
   const targets = conversations.filter(c => ids.includes(c.id));
   if (!targets.length) return;
   const publicCount = targets.filter(c => c.shareGistId || c.shareUrl || c.shareId).length;
   if (publicCount && !confirm(publicCount + ' selected conversation' + (publicCount === 1 ? ' has' : 's have') + ' public share IDs. Deleting locally does not revoke those links. Continue?')) return;
   const removed = targets.map(conv => ({ conv, index: conversations.indexOf(conv) }));
+  targets.forEach(conv => contextRevisions.set(conv, (contextRevisions.get(conv) || 0) + 1));
   ids.forEach(id => armedFollowUpConversationIds.delete(id));
   syncRecordTombstones('conversations', targets.filter(conv => !isTemporaryConversation(conv)).map(conv => conv.id));
   conversations = conversations.filter(c => !ids.includes(c.id));
@@ -5747,11 +6327,13 @@ function removeConversations(ids, showUndo = true) {
   renderMessages();
   updateTokenInfo();
   restoreActiveDraft();
+  updateCharacterUI();
   selectedConversationIds.clear();
   if (!showUndo) return;
   showToast(targets.length + ' conversation' + (targets.length === 1 ? '' : 's') + ' deleted.', 'info', 5000, {
     label: 'Undo',
     onClick: () => {
+      if (!prepareConversationTransition()) return;
       const tombstones = syncLoadTombstones().conversations;
       removed.filter(({ conv }) => !isTemporaryConversation(conv)).forEach(({ conv }) => { conv.updatedAt = Math.max(Date.now(), Number(tombstones[conv.id]) + 1 || 0); });
       syncRemoveTombstones('conversations', removed.filter(({ conv }) => !isTemporaryConversation(conv)).map(({ conv }) => conv.id));
@@ -5761,6 +6343,8 @@ function removeConversations(ids, showUndo = true) {
       saveConversations();
       renderSidebar();
       renderMessages();
+      restoreActiveDraft();
+      updateCharacterUI();
       updateTokenInfo();
       showToast('Conversation deletion undone.', 'success');
     }
@@ -6369,7 +6953,7 @@ function setTagFilter(tag) {
 // ============================================
 function filterConversations() {
   const searchEl = document.getElementById('sidebarSearch');
-  const query = searchEl ? searchEl.value.toLowerCase() : '';
+  const query = searchEl ? searchEl.value.trim().toLowerCase() : '';
   const filtering = Boolean(query || activeTagFilter);
   const collapsedProjects = getCollapsedProjectIds();
   const items = document.querySelectorAll('.conv-item');
@@ -6393,6 +6977,26 @@ function filterConversations() {
     const collapsedProject = !filtering && header.dataset.projectId && collapsedProjects.has(header.dataset.projectId);
     header.style.display = (hasVisible || collapsedProject) ? '' : 'none';
   });
+  document.getElementById('conversationFilterEmpty')?.remove();
+  if (filtering && !Array.from(items).some(item => item.style.display !== 'none')) {
+    const empty = document.createElement('div');
+    empty.id = 'conversationFilterEmpty';
+    empty.className = 'sidebar-empty';
+    const message = document.createElement('p');
+    message.setAttribute('role', 'status');
+    message.textContent = 'No conversations match these filters.';
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'btn btn-secondary';
+    clear.textContent = 'Clear filters';
+    clear.onclick = () => {
+      searchEl.value = '';
+      setTagFilter(null);
+      searchEl.focus();
+    };
+    empty.append(message, clear);
+    document.getElementById('convList')?.appendChild(empty);
+  }
 }
 
 function isConversationVisibleInSidebar(conv) {
@@ -6411,9 +7015,10 @@ function toggleSidebar(forceOpen, persist = true) {
   const sb = document.getElementById('sidebar');
   const overlay = document.getElementById('sidebarOverlay');
   const open = typeof forceOpen === 'boolean' ? forceOpen : sb.classList.contains('collapsed');
+  const wasOpen = !sb.classList.contains('collapsed');
   if (open && window.innerWidth <= 768) toggleContextPanel(false, false);
   const trigger = document.querySelector('.toolbar-toggle');
-  if (!open && sb.contains(document.activeElement)) trigger?.focus();
+  if (!open && wasOpen && (persist || sb.contains(document.activeElement))) trigger?.focus();
   sb.classList.toggle('collapsed', !open);
   sb.inert = !open;
   sb.setAttribute('aria-hidden', String(!open));
@@ -6426,6 +7031,7 @@ function toggleSidebar(forceOpen, persist = true) {
   }
   overlay.classList.toggle('open', open && window.innerWidth <= 768);
   trigger?.setAttribute('aria-expanded', String(open));
+  if (open && !wasOpen && persist && window.innerWidth <= 768) getFocusableElements(sb)[0]?.focus();
 }
 
 function toggleContextPanel(forceOpen, persist = true) {
@@ -6434,8 +7040,9 @@ function toggleContextPanel(forceOpen, persist = true) {
   const trigger = document.getElementById('contextToggle');
   if (!panel || !overlay) return;
   const open = typeof forceOpen === 'boolean' ? forceOpen : panel.classList.contains('collapsed');
+  const wasOpen = !panel.classList.contains('collapsed');
+  if (open && !panel.contains(document.activeElement)) contextPanelFocusReturn = getFocusReturnTarget(trigger);
   if (open && window.innerWidth <= 768) toggleSidebar(false, false);
-  if (open) contextPanelFocusReturn = document.activeElement;
   if (open) panel.inert = false;
   panel.classList.toggle('collapsed', !open);
   panel.setAttribute('aria-hidden', String(!open));
@@ -6451,8 +7058,11 @@ function toggleContextPanel(forceOpen, persist = true) {
   document.getElementById('contextBtn')?.setAttribute('aria-expanded', String(open));
   document.getElementById('toolsBtn')?.setAttribute('aria-expanded', String(open));
   if (persist) localStorage.setItem('assistantContextPanelOpen', String(open));
-  if (open && window.innerWidth <= 1100) panel.querySelector('.context-panel-close')?.focus();
-  if (!open && contextPanelFocusReturn && document.contains(contextPanelFocusReturn)) contextPanelFocusReturn.focus();
+  if (open && !wasOpen && persist && window.innerWidth <= 1100) getFocusableElements(panel)[0]?.focus();
+  if (!open && wasOpen && (persist || panel.contains(document.activeElement))) {
+    const target = getFocusableElements(document).includes(contextPanelFocusReturn) ? contextPanelFocusReturn : trigger;
+    target?.focus();
+  }
   if (!open) {
     contextPanelFocusReturn = null;
     panel.inert = true;
@@ -6560,9 +7170,10 @@ function openActionMenu(anchor, items, label = 'Actions') {
     button.type = 'button';
     button.setAttribute('role', 'menuitem');
     button.textContent = item.label;
+    if (item.id) button.dataset.action = item.id;
     if (item.danger) button.classList.add('danger');
     button.onclick = () => {
-      close(false);
+      close();
       item.action();
     };
     menu.appendChild(button);
@@ -6584,7 +7195,10 @@ function openActionMenu(anchor, items, label = 'Actions') {
     anchor.setAttribute('aria-expanded', 'false');
     document.removeEventListener('click', onDocumentClick);
     if (actionMenuClose === close) actionMenuClose = null;
-    if (restoreFocus && document.contains(anchor)) anchor.focus();
+    if (restoreFocus && document.contains(anchor)) {
+      if (!anchor.getClientRects().length) anchor.closest('.msg-wrapper')?.focus();
+      anchor.focus();
+    }
   };
   actionMenuClose = close;
   menu.addEventListener('keydown', event => handleMenuKeydown(event, menu, close));
@@ -6665,41 +7279,46 @@ function renderConnectionStatus(target, text, state = '') {
 async function testConnection(target = 'settings') {
   const inputs = getConnectionInputs(target);
   const baseUrl = inputs.base?.value.trim().replace(/\/(chat\/completions|messages)\/?$/, '') || '';
-  const providerName = inputs.provider?.value || inferProviderKey({ llmProxyUrl: baseUrl });
+  const providerName = inputs.provider?.value || inferRequestProvider({ llmProxyUrl: baseUrl });
   const key = inputs.key?.value.trim() || '';
+  const apiFormat = inputs.format?.value || getProviderPreset(providerName).apiFormat;
+  const cacheKey = modelCacheKey(baseUrl, providerName, apiFormat);
   const preset = getProviderPreset(providerName);
   if (!baseUrl || (preset.keyRequired && !key)) {
     renderConnectionStatus(target, preset.keyRequired ? 'Base URL and key required.' : 'Base URL required.', 'error');
     return;
   }
+  const token = {};
+  modelDiscoveryRequests.set(target, token);
+  const isCurrent = () => modelDiscoveryRequests.get(target) === token &&
+    cacheKey === modelCacheKey(inputs.base.value.trim(), inputs.provider?.value || providerName, inputs.format?.value || apiFormat) && inputs.key.value.trim() === key;
   const started = performance.now();
   const statusEl = document.getElementById(target === 'setup' ? 'setupConnectionStatus' : 'settingsConnectionStatus');
   const button = statusEl?.closest('.connection-test-row')?.querySelector('button');
   if (button) {
+    modelDiscoveryRequests.set(button, token);
     button.disabled = true;
     button.setAttribute('aria-busy', 'true');
   }
   renderConnectionStatus(target, 'Testing...', 'testing');
   announce('Testing ' + preset.label + ' connection.');
   try {
-    const metadata = await fetchAvailableModelMetadata(baseUrl, key, providerName, inputs.format?.value || '');
+    const metadata = await fetchAvailableModelMetadata(baseUrl, key, providerName, apiFormat);
+    if (!isCurrent()) return;
     const elapsed = Math.max(0, Math.round(performance.now() - started));
     renderConnectionStatus(target, 'Success · ' + metadata.length + ' models · ' + elapsed + ' ms', 'success');
     announce('Connection succeeded. ' + metadata.length + ' models discovered.');
-    if (metadata.length) {
-      const ids = metadata.map(model => model.id);
-      localStorage.setItem('llmModelList', JSON.stringify(ids));
-      localStorage.setItem('llmModelMetadata', JSON.stringify(Object.fromEntries(metadata.filter(m => m.context_length).map(m => [m.id, m.context_length]))));
-      populateModelSelect(target, ids);
-    }
+    populateModelSelect(target, metadata.map(model => model.id));
   } catch (err) {
+    if (!isCurrent()) return;
     const elapsed = Math.max(0, Math.round(performance.now() - started));
     renderConnectionStatus(target, 'Failed · ' + elapsed + ' ms · ' + sanitizeErrorDetail(err), 'error');
     announce('Connection failed.');
   } finally {
-    if (button) {
+    if (button && modelDiscoveryRequests.get(button) === token) {
       button.disabled = false;
       button.removeAttribute('aria-busy');
+      modelDiscoveryRequests.delete(button);
     }
   }
 }
@@ -6733,17 +7352,18 @@ function saveSetup() {
   if (!model) { renderSetupError('Choose or enter a model.'); return; }
   localStorage.setItem('llmProxyUrl', proxy);
   localStorage.setItem('llmProvider', provider);
-  setApiKey(key, getSelectedKeyStorage('setup'));
   localStorage.setItem('llmModel', model);
   localStorage.setItem('llmApiFormat', document.getElementById('setupApiFormat')?.value || getProviderPreset(provider).apiFormat);
+  setApiKey(key, getSelectedKeyStorage('setup'));
   syncScheduleAutoPush();
   closeModal('setupModal');
   renderConnectionChip();
   announce('Provider settings saved.');
   // Try to fetch models in the background
-  if (key || !providerRequiresKey({ llmProvider: provider })) fetchAvailableModels(proxy, key).then(models => {
-    localStorage.setItem('llmModelList', JSON.stringify(models));
-    loadCachedModels('settings');
+  const apiFormat = localStorage.getItem('llmApiFormat') || 'auto';
+  const cacheKey = modelCacheKey(proxy, provider, apiFormat);
+  if (key || !providerRequiresKey({ llmProvider: provider })) fetchAvailableModels(proxy, key, provider, apiFormat).then(() => {
+    if (cacheKey === modelCacheKey()) loadCachedModels('settings');
   }).catch(() => {});
 }
 
@@ -6757,7 +7377,6 @@ function continueWithoutProvider() {
 function updateSettingsFooter(tabName = activeSettingsTab) {
   activeSettingsTab = tabName;
   const button = document.getElementById('settingsSaveBtn');
-  const status = document.getElementById('settingsSaveStatus');
   const labels = {
     api: 'Save API settings',
     tools: 'Save tool settings'
@@ -6766,12 +7385,28 @@ function updateSettingsFooter(tabName = activeSettingsTab) {
     button.hidden = !labels[tabName];
     button.textContent = labels[tabName] || 'Save';
   }
-  if (status) status.textContent = ['prompts', 'appearance', 'debug'].includes(tabName) ? 'Changes save automatically.' : '';
+  document.querySelectorAll('.settings-tab').forEach(tab => {
+    const dirty = dirtySettingsTabs.has(tab.id.replace('settingsTabButton-', ''));
+    tab.classList.toggle('unsaved', dirty);
+    tab.setAttribute('aria-label', tab.textContent + (dirty ? ', unsaved changes' : ''));
+  });
+  setSettingsSaveStatus(['prompts', 'appearance', 'debug'].includes(tabName) ? 'Changes save automatically.' : '');
 }
 
 function setSettingsSaveStatus(message = '') {
   const status = document.getElementById('settingsSaveStatus');
-  if (status) status.textContent = message;
+  if (!status) return;
+  const names = Array.from(dirtySettingsTabs, tab => tab === 'api' ? 'API' : 'Tools');
+  status.classList.toggle('unsaved', names.length > 0);
+  status.textContent = [message, names.length ? 'Unsaved ' + names.join(' and ') + ' changes. Use Save in each tab.' : ''].filter(Boolean).join(' ');
+}
+
+function updateProviderOptions() {
+  if (document.getElementById('setupProvider')?.value === 'custom') document.getElementById('setupAdvanced').open = true;
+  const inputs = getConnectionInputs('settings');
+  if (inputs.provider?.value === 'custom') document.getElementById('settingsConnectionOptions').open = true;
+  const options = document.getElementById('anthropicOptions');
+  if (options) options.hidden = resolveRequestApiFormat({ llmApiFormat: inputs.format?.value }, inputs.provider?.value, getSelectedModel('settings')) !== 'anthropic';
 }
 
 function switchSettingsTab(tabName, btn) {
@@ -6787,10 +7422,12 @@ function switchSettingsTab(tabName, btn) {
     panel.hidden = !selected;
   });
   if (tabName === 'data') renderStorageSummary();
+  updateProviderOptions();
   updateSettingsFooter(tabName);
 }
 
 function openSettings() {
+  if (document.getElementById('settingsModal').classList.contains('open')) return;
   clearTimeout(_promptSettingsAutosaveTimer);
   clearTimeout(_appearanceSettingsAutosaveTimer);
   _promptSettingsAutosaveTimer = null;
@@ -6798,7 +7435,7 @@ function openSettings() {
   _promptSettingsAutosavePending = false;
   _appearanceSettingsAutosavePending = false;
   document.getElementById('setProxy').value = localStorage.getItem('llmProxyUrl') || '';
-  document.getElementById('setKey').value = getApiKey();
+  document.getElementById('setKey').value = getApiKeyForForm();
   const providerSelect = document.getElementById('setProvider');
   if (providerSelect) providerSelect.value = inferProviderKey();
   if (providerSelect) applyProviderPreset('settings', providerSelect.value);
@@ -6960,7 +7597,7 @@ function collectProfileSettingsFromInputs() {
 
 function applyProfileToInputs(settings) {
   document.getElementById('setProxy').value = settings.llmProxyUrl || '';
-  document.getElementById('setKey').value = settings.llmApiKey || getApiKey();
+  document.getElementById('setKey').value = getApiKeyForForm();
   const providerSelect = document.getElementById('setProvider');
   if (providerSelect) providerSelect.value = settings.llmProvider || inferProviderKey(settings);
   document.getElementById('setApiFormat').value = settings.llmApiFormat || 'auto';
@@ -7002,7 +7639,7 @@ function applyProfileToInputs(settings) {
 
 function applyProfile(profile) {
   if (!profile) return;
-  const settings = profile.settings || {};
+  const settings = sanitizeProfileSettings(profile.settings);
   const apiEndpointChanged = settings.llmProxyUrl && settings.llmProxyUrl !== localStorage.getItem('llmProxyUrl');
   const searchEndpointChanged = settings.llmSearchApiUrl && settings.llmSearchApiUrl !== localStorage.getItem('llmSearchApiUrl');
   if (apiEndpointChanged) setApiKey('', getKeyStorageMode());
@@ -7012,7 +7649,6 @@ function applyProfile(profile) {
     if (k === 'llmApiKey') return;
     localStorage.setItem(k, v);
   });
-  if (settings.llmApiKey) setApiKey(settings.llmApiKey, getKeyStorageMode());
   localStorage.setItem('assistantActiveProfileId', profile.id);
   applyProfileToInputs(settings);
   if (!streaming) renderMessages({ preserveScroll: true });
@@ -7121,9 +7757,9 @@ function saveApiSettings() {
   if (!selectedModel) { showToast('Choose or enter a model.', 'error'); return false; }
   localStorage.setItem('llmProxyUrl', proxy);
   localStorage.setItem('llmProvider', providerName);
-  setApiKey(keyValue, getSelectedKeyStorage('settings'));
   localStorage.setItem('llmModel', selectedModel);
   localStorage.setItem('llmApiFormat', document.getElementById('setApiFormat').value);
+  setApiKey(keyValue, getSelectedKeyStorage('settings'));
   localStorage.setItem('llmExtraParams', extraParamsVal);
   localStorage.setItem('llmExcludeParams', document.getElementById('setExcludeParams').value.trim());
   localStorage.setItem('llmPrefill', document.getElementById('setPrefill').value);
@@ -7143,9 +7779,7 @@ function saveApiSettings() {
   announce('API settings saved.');
 
   if (keyValue || !providerRequiresKey({ llmProvider: providerName })) {
-    fetchAvailableModels(proxy, keyValue).then(models => {
-      localStorage.setItem('llmModelList', JSON.stringify(models));
-    }).catch(() => {});
+    fetchAvailableModels(proxy, keyValue, providerName, localStorage.getItem('llmApiFormat') || 'auto').catch(() => {});
   }
   return true;
 }
@@ -7258,6 +7892,7 @@ function saveToolSettings() {
   localStorage.setItem('llmSearchApiKey', document.getElementById('setSearchApiKey').value.trim());
   localStorage.setItem('llmCorsProxy', normalizeCorsProxyUrl(document.getElementById('setCorsProxy').value));
   localStorage.setItem('llmMemoryEnabled', document.getElementById('setMemory').checked ? 'true' : 'false');
+  isMemoryEnabled();
   localStorage.setItem('llmHoldScreenshot', document.getElementById('setHoldScreenshot').checked ? 'true' : 'false');
   if (document.getElementById('setWebSearch').checked) {
     const fmt = localStorage.getItem('llmApiFormat') || 'auto';
@@ -7279,7 +7914,12 @@ function saveSettingsTab() {
     appearance: saveAppearanceSettings,
     tools: saveToolSettings
   };
-  return saves[activeSettingsTab]?.() || false;
+  const saved = saves[activeSettingsTab]?.() || false;
+  if (saved && dirtySettingsTabs.delete(activeSettingsTab)) {
+    updateSettingsFooter();
+    setSettingsSaveStatus(activeSettingsTab === 'api' ? 'API settings saved.' : 'Tool settings saved.');
+  }
+  return saved;
 }
 
 function saveSettings() {
@@ -7763,13 +8403,14 @@ async function buildSystemMessages(conv) {
 function isFailedAssistantMessage(message) {
   if (!message || message.role !== 'assistant') return false;
   const request = message.swipeRequests?.[message.swipeIndex || 0];
-  return ['failed', 'stopped', 'interrupted'].includes(request?.status) || /^\s*(Error:|Request failed:|Request interrupted\.)/i.test(getMsgText(message));
+  return request?.status ? ['failed', 'stopped', 'interrupted'].includes(request.status) : /^\s*(Error:|Request failed:|Request interrupted\.)/i.test(getMsgText(message));
 }
 
 function isPendingAssistantMessage(message) {
   if (!message || message.role !== 'assistant') return false;
   const request = message.swipeRequests?.[message.swipeIndex || 0];
-  return !String(getMsgText(message) || '').trim() || ['pending', 'streaming'].includes(request?.status);
+  return request?.status ? ['pending', 'streaming'].includes(request.status) :
+    !String(getMsgText(message) || '').trim() && !(message.swipeImages?.[message.swipeIndex || 0] || message.images || []).length;
 }
 
 function filterRequestHistory(source, options = {}) {
@@ -7782,7 +8423,7 @@ function filterRequestHistory(source, options = {}) {
     if (!message || !['user', 'assistant'].includes(message.role)) return;
     const isTarget = index === options.targetIndex;
     if (message.role === 'assistant' && (isPendingAssistantMessage(message) || isFailedAssistantMessage(message))) return;
-    if (message.includeInContext === false) {
+    if (message.includeInContext === false && !(includeTarget && isTarget)) {
       excluded.push({ message, index });
       return;
     }
@@ -7815,6 +8456,9 @@ function buildComposerMessage(text = document.getElementById('chatInput')?.value
 
 async function buildRequestMessages(conv = getActiveConv(), options = {}) {
   const source = Array.isArray(options.messageList) ? options.messageList : messages;
+  if (Number.isInteger(options.untilIndex) && options.untilIndex < conv?.messages.length) {
+    invalidateConversationContext(conv, options.untilIndex);
+  }
   const systemMessages = await buildSystemMessages(conv);
   const toolPolicy = getToolPolicy(conv);
   if (toolPolicy.webSearch || toolPolicy.urlFetch) {
@@ -7836,13 +8480,8 @@ async function buildRequestMessages(conv = getActiveConv(), options = {}) {
 }
 
 function getModelContextWindow(model = localStorage.getItem('llmModel') || '') {
-  const manual = Number(getActiveProfile()?.settings?.llmContextWindow || localStorage.getItem('llmContextWindow') || 0);
-  if (manual > 0) return manual;
-  try {
-    const metadata = JSON.parse(localStorage.getItem('llmModelMetadata') || '{}');
-    const value = Number(metadata[model]?.context_length ?? metadata[model]);
-    return value > 0 ? value : null;
-  } catch(e) { return null; }
+  try { return getTargetContextWindow(getActiveRequestTarget(model || undefined)); }
+  catch (e) { return null; }
 }
 
 function getRequestContextStats(requestMessages, excluded = [], model = localStorage.getItem('llmModel') || '') {
@@ -7923,6 +8562,7 @@ async function saveConversationTools() {
     urlFetch: Boolean(document.getElementById('chatToolUrlFetch')?.checked),
     confirm: Boolean(document.getElementById('chatToolConfirm')?.checked)
   };
+  delete (contextDrafts.get(conv) || {}).tools;
   conv.updatedAt = Date.now();
   await saveConversationImmediately();
   renderContextPanel();
@@ -7943,6 +8583,8 @@ function renderContextPanel() {
   const conv = getActiveConv();
   if (!conv) return;
   renderConversationHeader();
+  let draft = contextDrafts.get(conv);
+  if (!draft) { draft = {}; contextDrafts.set(conv, draft); }
   const conversationChanged = contextPanelConversationId !== conv.id;
   if (conversationChanged) {
     contextPanelConversationId = conv.id;
@@ -7955,20 +8597,48 @@ function renderContextPanel() {
   const goalStatus = document.getElementById('goalStatus');
   if (goalStatus) goalStatus.textContent = conv.goal?.trim() ? 'Active' : 'Optional';
 
-  const policy = getToolPolicy(conv);
+  const policy = draft.tools || getToolPolicy(conv);
   const web = document.getElementById('chatToolWebSearch');
   const url = document.getElementById('chatToolUrlFetch');
   const confirm = document.getElementById('chatToolConfirm');
   if (web) web.checked = policy.webSearch;
   if (url) url.checked = policy.urlFetch;
   if (confirm) confirm.checked = policy.confirm;
+  [web, url, confirm].filter(Boolean).forEach(input => {
+    input.onchange = () => {
+      draft.tools = { webSearch: web.checked, urlFetch: url.checked, confirm: confirm.checked };
+      renderContextPanel();
+    };
+  });
   const toolsStatus = document.getElementById('toolsStatus');
-  if (toolsStatus) toolsStatus.textContent = [policy.webSearch && 'Search', policy.urlFetch && 'Fetch'].filter(Boolean).join(' + ') || 'Off';
+  if (toolsStatus) toolsStatus.textContent = draft.tools ? 'Unsaved' : [policy.webSearch && 'Search', policy.urlFetch && 'Fetch'].filter(Boolean).join(' + ') || 'Off';
 
   const summary = document.getElementById('summaryText');
-  if (summary && (conversationChanged || document.activeElement !== summary)) summary.value = conv.summary || '';
+  if (summary) {
+    const value = draft.summary ?? conv.summary ?? '';
+    if (summary.value !== value) summary.value = value;
+    summary.oninput = () => { draft.summary = summary.value; renderContextPanel(); };
+  }
   const summaryStatus = document.getElementById('summaryStatus');
-  if (summaryStatus) summaryStatus.textContent = conv.summary?.trim() ? 'Saved' : 'Empty';
+  if (summaryStatus) summaryStatus.textContent = draft.summary !== undefined ? 'Unsaved' : conv.summary?.trim() ? 'Saved' : 'Empty';
+  const genBtn = document.getElementById('summaryGen');
+  if (genBtn) {
+    genBtn.disabled = summaryJobs.has(conv.id);
+    genBtn.textContent = summaryJobs.has(conv.id) ? 'Generating...' : 'Generate';
+  }
+  [['tools', 'toolsSection'], ['summary', 'summarySection']].forEach(([key, section]) => {
+    let button = document.getElementById('discardContext' + key);
+    if (!button) {
+      button = document.createElement('button');
+      button.id = 'discardContext' + key;
+      button.type = 'button';
+      button.className = 'btn btn-secondary';
+      button.textContent = 'Discard draft';
+      document.querySelector('#' + section + ' .context-panel-section-body')?.appendChild(button);
+    }
+    button.hidden = draft[key] === undefined;
+    button.onclick = () => { delete draft[key]; renderContextPanel(); };
+  });
 
   const project = isTemporaryConversation(conv) ? null : getProject(conv.projectId);
   const chatDocs = Array.isArray(conv.docs) ? conv.docs : [];
@@ -8094,27 +8764,40 @@ async function openContextPreview() {
 async function compactOlderTurns() {
   if (readOnlyShare) return;
   const conv = getActiveConv();
-  const candidates = messages.map((message, index) => ({ message, index })).filter(item => item.message.role !== 'system' && item.message.includeInContext !== false && !isFailedAssistantMessage(item.message));
+  if (!conv || summaryJobs.has(conv.id)) return;
+  const jobId = conv.id;
+  if (contextDrafts.get(conv)?.summary !== undefined) { showToast('Save or discard your summary draft first.', 'info'); return; }
+  const candidates = filterRequestHistory(conv.messages).included;
   if (candidates.length <= 8) { showToast('There are not enough older turns to compact.', 'info'); return; }
   const older = candidates.slice(0, -8);
   const transcript = older.map(item => (item.message.role === 'assistant' ? 'Assistant: ' : 'User: ') + getMsgText(item.message)).join('\n');
+  const valid = captureContextSource(conv, true);
+  const coverage = summaryCoverageThrough(conv, older);
+  summaryJobs.add(jobId);
+  renderContextPanel();
   try {
+    const target = getActiveRequestTarget();
     announce('Generating a nondestructive summary of older turns.');
     const summary = (await callApiNonStreaming([
       { role: 'system', content: 'Summarize these older conversation turns into a concise context note. Preserve facts, decisions, preferences, and unresolved tasks. Do not invent details.' },
       { role: 'user', content: transcript }
-    ])).trim();
+    ], { target, signal: null })).trim();
+    if (!valid()) return;
     if (!summary) throw new Error('The provider returned an empty summary.');
     conv.summary = conv.summary ? conv.summary + '\n\n' + summary : summary;
+    conv.summaryCoverage = coverage;
     conv.summaryUpdatedAt = Date.now();
-    older.forEach(item => { item.message.includeInContext = false; });
+    older.forEach(item => { item.message.includeInContext = false; item.message.autoCompacted = true; });
     conv.updatedAt = Date.now();
     await saveConversationImmediately();
     showToast('Older turns summarized and excluded from future requests. History remains intact.', 'success');
     announce('Older turns compacted successfully.');
-    await openContextPreview();
+    if (getActiveConv() === conv) { renderMessages({ preserveScroll: true }); await openContextPreview(); }
   } catch (err) {
     showToast('Compaction failed: ' + sanitizeErrorDetail(err), 'error');
+  } finally {
+    summaryJobs.delete(jobId);
+    renderContextPanel();
   }
 }
 
@@ -8208,6 +8891,7 @@ function renderEmptyConversation(area) {
 }
 
 function renderMessages({ preserveScroll = false } = {}) {
+  if (streaming) return;
   closeChatSearch();
   renderContextPanel();
   renderFollowUpQueue();
@@ -8341,7 +9025,7 @@ function renderMessages({ preserveScroll = false } = {}) {
       Boolean(String(getMsgText(msg) || '').trim()) && (!requestStatus || requestStatus === 'complete') &&
       !NO_TRAILING_ASSISTANT_RE.test(localStorage.getItem('llmModel') || '');
     const secondaryActions = [];
-    if (msg.role === 'assistant') secondaryActions.push({ label: 'Read aloud', action: () => speakMessage(msg) });
+    if (msg.role === 'assistant') secondaryActions.push({ id: 'read-aloud', get label() { return spokenMessage === msg ? 'Stop reading aloud' : 'Read aloud'; }, action: () => speakMessage(msg) });
     if (msg.role === 'assistant' && idx === messages.length - 1 && getMsgText(msg).trim() && (!requestStatus || requestStatus === 'complete')) {
       secondaryActions.push({ label: 'Suggest follow-ups', action: () => suggestFollowUps(idx) });
     }
@@ -8350,7 +9034,9 @@ function renderMessages({ preserveScroll = false } = {}) {
       label: msg.includeInContext === false ? 'Include in context' : 'Exclude from context',
       action: () => {
         msg.includeInContext = msg.includeInContext === false;
+        delete msg.autoCompacted;
         const conv = getActiveConv();
+        invalidateConversationContext(conv, idx);
         if (conv) conv.updatedAt = Date.now();
         saveConversations();
         renderMessages();
@@ -8365,15 +9051,15 @@ function renderMessages({ preserveScroll = false } = {}) {
         label: 'Delete this response version',
         danger: true,
         action: () => {
+          if (readOnlyShare || sending || streaming || messages[idx] !== msg) return;
           if (!confirm('Delete this response version?')) return;
+          invalidateConversationContext(getActiveConv(), idx);
           const swipeIndex = msg.swipeIndex;
           msg.swipes.splice(swipeIndex, 1);
           ['swipeThinking', 'swipeToolUse', 'swipeImages', 'swipeSources', 'swipeLlms', 'swipeRequests', 'swipeTokenEstimates'].forEach(key => {
             if (Array.isArray(msg[key])) msg[key].splice(swipeIndex, 1);
           });
-          msg.swipeIndex = Math.min(swipeIndex, msg.swipes.length - 1);
-          msg.content = msg.swipes[msg.swipeIndex];
-          if (msg.swipeImages) msg.images = msg.swipeImages[msg.swipeIndex] || [];
+          selectAssistantSwipe(msg, Math.min(swipeIndex, msg.swipes.length - 1));
           const conv = getActiveConv();
           if (conv) conv.updatedAt = Date.now();
           saveConversations();
@@ -8388,7 +9074,9 @@ function renderMessages({ preserveScroll = false } = {}) {
       label: msg.role === 'assistant' ? 'Delete response' : 'Delete message',
       danger: true,
       action: () => {
+        if (readOnlyShare || sending || streaming || messages[idx] !== msg) return;
         if (msg.role === 'assistant' && !confirm('Delete this response?')) return;
+        invalidateConversationContext(getActiveConv(), idx);
         messages.splice(idx, 1);
         const conv = getActiveConv();
         if (conv) conv.updatedAt = Date.now();
@@ -8461,7 +9149,7 @@ function renderEditMode(area, msg, idx) {
 
   const ta = document.createElement('textarea');
   ta.className = 'msg-edit-textarea';
-  ta.value = getMsgText(msg);
+  ta.value = Array.isArray(msg.content) ? msg.content.filter(part => part.type === 'text').map(part => part.text || '').join('\n') : getMsgText(msg);
   wrapper.appendChild(ta);
 
   if (Array.isArray(msg.content)) {
@@ -8503,11 +9191,18 @@ function renderEditMode(area, msg, idx) {
   saveBtn.className = 'msg-edit-save';
   saveBtn.textContent = 'Save & Resend';
   saveBtn.onclick = async () => {
+    if (readOnlyShare || sending || streaming || messages[idx] !== msg) return;
     const editedText = ta.value;
+    if (!editedText.trim() && !(Array.isArray(msg.content) && msg.content.some(part => part.type === 'file' || part.type === 'image_url'))) return;
     delete msg._editing;
+    const source = getActiveConv();
     const forked = forkBranch(idx);
     if (!forked) return;
+    contextRevisions.set(source, (contextRevisions.get(source) || 0) + 1);
+    invalidateConversationContext(forked, idx);
     const editedMessage = messages[idx];
+    editedMessage.includeInContext = true;
+    delete editedMessage.autoCompacted;
 
     if (Array.isArray(editedMessage.content)) {
       const attachments = editedMessage.content.filter(c => c.type === 'image_url' || c.type === 'file');
@@ -8534,14 +9229,21 @@ function renderEditMode(area, msg, idx) {
 
 async function resendAfterEdit() {
   if (readOnlyShare || !beginSendingAction()) return;
+  const conv = getActiveConv();
+  const messageList = messages;
+  let assistantMsg;
+  let started = false;
   try {
-    const proxyUrl = localStorage.getItem('llmProxyUrl');
-    const apiKey = getApiKey();
-    const conv = getActiveConv();
-    if (!proxyUrl || (providerRequiresKey() && !apiKey)) return;
+    const target = getActiveRequestTarget();
+    const toolPolicy = getToolPolicy(conv);
+    const targetIndex = messageList.length - 1;
+    const requestContext = await buildRequestMessages(conv, { messageList: messageList.slice(), targetIndex, includeTarget: true });
+    assertRequestOwner(conv, messageList);
+    const apiMessages = requestContext.messages;
+    if (guardTargetContextLimit(apiMessages, target, target.maxTokens || 8192)) return;
 
-    const assistantMsg = { role: 'assistant', content: '', swipes: [''], swipeIndex: 0, timestamp: Date.now() };
-    messages.push(assistantMsg);
+    assistantMsg = { role: 'assistant', content: '', swipes: [''], swipeIndex: 0, timestamp: Date.now() };
+    messageList.push(assistantMsg);
 
     const area = document.getElementById('messagesArea');
     const wrapper = document.createElement('div');
@@ -8554,24 +9256,27 @@ async function resendAfterEdit() {
     area.appendChild(wrapper);
     area.scrollTop = area.scrollHeight;
 
-    const requestContext = await buildRequestMessages(conv, { messageList: messages });
-    const apiMessages = requestContext.messages;
-    if (guardContextLimit(requestContext)) {
-      messages.pop();
-      renderMessages();
-      return;
-    }
-
     await saveConversationImmediately().catch(error => { throw new Error('Could not save the edited prompt: ' + sanitizeErrorDetail(error)); });
-    await streamResponse(apiMessages, assistantMsg, 0, bubble, null, null, { conv });
+    assertRequestOwner(conv, messageList, assistantMsg);
+    started = true;
+    const status = await streamResponse(apiMessages, assistantMsg, 0, bubble, target.model, null, { conv, messageList, target, toolPolicy });
+    assertRequestOwner(conv, messageList, assistantMsg, null);
 
-    if (getSwipeRequest(assistantMsg)?.status === 'complete') {
-      extractMemories(apiMessages, conv);
+    if (status === 'complete') {
+      extractMemories(apiMessages, conv, target);
     }
     if (conv) conv.updatedAt = Date.now();
-    saveConversations();
+    await saveConversations();
     renderMessages({ preserveScroll: true });
     updateTokenInfo();
+    return status;
+  } catch (error) {
+    if (!started && assistantMsg && messageList.includes(assistantMsg)) {
+      messageList.splice(messageList.indexOf(assistantMsg), 1);
+      if (getActiveConv() === conv) renderMessages();
+    }
+    if (foregroundAction) foregroundAction.status = error.name === 'AbortError' ? 'stopped' : error.requestStatus || 'failed';
+    if (error.name !== 'AbortError') showToast(sanitizeErrorDetail(error), 'error');
   } finally {
     endSendingAction();
   }
@@ -8581,8 +9286,10 @@ async function resendAfterEdit() {
 // Swipe
 // ============================================
 function swipeMsg(idx, dir) {
+  if (readOnlyShare || sending || streaming) return;
   const msg = messages[idx];
   if (!msg || !msg.swipes) return;
+  if (msg.swipeIndex + dir < 0 || msg.swipeIndex + dir >= msg.swipes.length) return;
   selectAssistantSwipe(msg, msg.swipeIndex + dir);
   const conv = getActiveConv();
   if (conv) conv.updatedAt = Date.now();
@@ -8592,16 +9299,15 @@ function swipeMsg(idx, dir) {
 }
 
 function forkBranch(msgIdx) {
-  if (readOnlyShare) return;
-  if (sending || streaming) { showToast('Stop the current response before forking.', 'info'); return; }
+  if (!Number.isInteger(msgIdx) || msgIdx < 0 || msgIdx >= messages.length || !prepareConversationTransition()) return;
   const conv = getActiveConv();
   if (!conv) return;
-  persistDraftFromUI();
   const now = Date.now();
   const newConv = normalizeConversationRecord(structuredClone(conv));
   newConv.id = genId();
   newConv.title = conv.title + ' (fork)';
   newConv.messages = structuredClone(messages.slice(0, msgIdx + 1));
+  invalidateConversationContext(newConv, msgIdx + 1);
   newConv.messages.forEach(message => {
     delete message._editing;
     delete message.branches;
@@ -8756,8 +9462,7 @@ const OPENAI_WEB_SEARCH_TOOL = {
   }
 };
 
-function proxiedFetch(url, options, forceSensitive = false) {
-  const proxy = getCorsProxyUrl();
+function proxiedFetch(url, options, forceSensitive = false, proxy = getCorsProxyUrl()) {
   const sensitive = requestContainsSensitiveData(url, options, forceSensitive);
   if (!canUseCorsProxy(url, options, proxy, forceSensitive)) {
     return Promise.reject(new Error('Refusing to send credentials through a public CORS proxy. Use a proxy you control.'));
@@ -8773,13 +9478,13 @@ function proxiedFetch(url, options, forceSensitive = false) {
   });
 }
 
-async function fetchWebSearchWithFallback(url, options, forceSensitive = false) {
+async function fetchWebSearchWithFallback(url, options, forceSensitive = false, proxy = getCorsProxyUrl()) {
   try {
-    return await fetchApiWithHttpSupport(url, options, url, forceSensitive);
+    return await fetchApiWithHttpSupport(url, options, url, forceSensitive, proxy);
   } catch (err) {
     if (err.name === 'AbortError') throw err;
     if (!isNetworkLikeFetchError(err)) throw err;
-    return await proxiedFetch(url, options, forceSensitive);
+    return await proxiedFetch(url, options, forceSensitive, proxy);
   }
 }
 
@@ -8807,15 +9512,22 @@ function extractWebSearchQueryFromArgs(args) {
   return '';
 }
 
-async function executeWebSearch(query, signal) {
+function getToolRequestSettings() {
+  return {
+    searchUrl: (localStorage.getItem('llmSearchApiUrl') || 'https://purasearx.duckdns.org/search?format=json').trim(),
+    searchKey: (localStorage.getItem('llmSearchApiKey') || '').trim(),
+    corsProxy: getCorsProxyUrl()
+  };
+}
+
+async function executeWebSearch(query, signal, settings = getToolRequestSettings()) {
   const normalizedQuery = String(query || '').trim();
   if (!normalizedQuery) {
     lastSearchStatus = { ok: false, error: 'Search query is empty.', at: Date.now(), query: '' };
     return { results: [], error: 'Search query is empty.' };
   }
 
-  const searchUrl = (localStorage.getItem('llmSearchApiUrl') || 'https://purasearx.duckdns.org/search?format=json').trim();
-  const searchKey = (localStorage.getItem('llmSearchApiKey') || '').trim();
+  const { searchUrl, searchKey } = settings;
   if (!searchUrl) {
     lastSearchStatus = { ok: false, error: 'No search API URL configured.', at: Date.now(), query: normalizedQuery };
     return { results: [], error: 'No search API URL configured. Set one in Settings > Tools.' };
@@ -8860,7 +9572,7 @@ async function executeWebSearch(query, signal) {
     }
     if (!fetchHeaders['Accept']) fetchHeaders['Accept'] = 'application/json';
 
-    const resp = await fetchWebSearchWithFallback(fetchUrl, { headers: fetchHeaders, signal }, Boolean(searchKey));
+    const resp = await fetchWebSearchWithFallback(fetchUrl, { headers: fetchHeaders, signal }, Boolean(searchKey), settings.corsProxy);
     if (!resp.ok) throw new Error(resp.status + ' ' + (resp.statusText || 'Error'));
     const ct = resp.headers.get('content-type') || '';
     if (!ct.includes('json')) throw new Error('Expected JSON but got ' + (ct.split(';')[0] || 'unknown content type'));
@@ -8967,54 +9679,26 @@ const ANTHROPIC_WEB_SEARCH_TOOL = {
 const HANDLED_TOOLS = new Set(['web_search', 'url_fetch']);
 const TOOL_FINAL_ANSWER_NUDGE = 'You have already used tools and received their results above. Do not call any more tools. Produce the final assistant answer now in plain text, using the tool results to address the user\'s original question.';
 
-// Parse tool calls that models output as text instead of using the proper API mechanism
-// Matches: <tool_call>{"name":"web_search",...}</tool_call>, ```json\n{"name":...}\n```, etc.
+// Text tools must be standalone explicit invocations, never quoted JSON examples.
 function parseTextToolCalls(text) {
   const calls = [];
-  // Pattern 1: <tool_call>...</tool_call>
   const tagPattern = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
-  let m;
-  while ((m = tagPattern.exec(text)) !== null) {
+  const source = String(text || '').trim();
+  if (source.replace(tagPattern, '').trim()) return calls;
+  for (const match of source.matchAll(tagPattern)) {
     try {
-      const parsed = JSON.parse(m[1]);
-      if (parsed.name && HANDLED_TOOLS.has(parsed.name)) {
-        calls.push({ id: 'text_tc_' + calls.length, name: parsed.name, arguments: JSON.stringify(parsed.arguments || {}) });
-      }
-    } catch(e) {}
-  }
-  // Pattern 2: ```json\n{"name":"web_search",...}\n``` or ```\n{"name":...}\n```
-  if (calls.length === 0) {
-    const codePattern = /```(?:json)?\s*\n?\s*(\{[\s\S]*?\})\s*\n?\s*```/gi;
-    while ((m = codePattern.exec(text)) !== null) {
-      try {
-        const parsed = JSON.parse(m[1]);
-        if (parsed.name && HANDLED_TOOLS.has(parsed.name)) {
-          calls.push({ id: 'text_tc_' + calls.length, name: parsed.name, arguments: JSON.stringify(parsed.arguments || {}) });
-        }
-      } catch(e) {}
-    }
-  }
-  // Pattern 3: {"name": "web_search", "arguments": {...}} as bare JSON in text
-  if (calls.length === 0) {
-    const jsonPattern = /\{\s*"name"\s*:\s*"(web_search|url_fetch)"[\s\S]*?"arguments"\s*:\s*(\{[^}]*\})\s*\}/gi;
-    while ((m = jsonPattern.exec(text)) !== null) {
-      try {
-        const args = JSON.parse(m[2]);
-        if (HANDLED_TOOLS.has(m[1])) {
-          calls.push({ id: 'text_tc_' + calls.length, name: m[1], arguments: JSON.stringify(args) });
-        }
-      } catch(e) {}
-    }
+      const parsed = JSON.parse(match[1]);
+      if (!HANDLED_TOOLS.has(parsed.name)) return [];
+      const args = typeof parsed.arguments === 'string' ? JSON.parse(parsed.arguments) : parsed.arguments;
+      if (!args || typeof args !== 'object' || Array.isArray(args)) return [];
+      calls.push({ id: 'text_tc_' + calls.length, name: parsed.name, arguments: JSON.stringify(args) });
+    } catch (e) { return []; }
   }
   return calls;
 }
 
 function stripTextToolCalls(text) {
-  return text
-    .replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/gi, '')
-    .replace(/```(?:json)?\s*\n?\s*\{\s*"name"\s*:\s*"(?:web_search|url_fetch)"[\s\S]*?\}\s*\n?\s*```/gi, '')
-    .replace(/\{\s*"name"\s*:\s*"(?:web_search|url_fetch)"[\s\S]*?"arguments"\s*:\s*\{[^}]*\}\s*\}/gi, '')
-    .trim();
+  return parseTextToolCalls(text).length ? '' : text;
 }
 
 function normalizeExtractedText(text) {
@@ -9073,10 +9757,10 @@ function looksLikeBotOrBlockPage(text) {
 
 function buildReaderMirrorUrls(url) {
   const stripped = String(url || '').replace(/^https?:\/\//i, '');
-  return [
-    'https://r.jina.ai/http://' + url,
+  return [...new Set([
+    'https://r.jina.ai/' + url,
     'https://r.jina.ai/http://' + stripped
-  ];
+  ])];
 }
 
 function stripReaderMirrorPreamble(text) {
@@ -9091,7 +9775,7 @@ function stripReaderMirrorPreamble(text) {
   return normalizeExtractedText(out);
 }
 
-async function executeUrlFetch(url, signal) {
+async function executeUrlFetch(url, signal, settings = getToolRequestSettings()) {
   const targetUrl = safeHttpUrl(url);
   if (!targetUrl) {
     return { content: '', error: 'Invalid URL. Use a full URL starting with http:// or https://.' };
@@ -9102,7 +9786,7 @@ async function executeUrlFetch(url, signal) {
   let lastError = '';
 
   try {
-    const resp = await proxiedFetch(targetUrl, { signal });
+    const resp = await proxiedFetch(targetUrl, { signal }, false, settings.corsProxy);
     if (!resp.ok) {
       lastError = resp.status + ' ' + (resp.statusText || 'Error');
     } else {
@@ -9182,6 +9866,22 @@ function createRequestMetadata(assistantMsg, swipeIdx, metadata = {}) {
     promptTokens: Number.isFinite(metadata.promptTokens) ? metadata.promptTokens : null,
     contextWindow: Number.isFinite(metadata.contextWindow) ? metadata.contextWindow : null
   };
+  if (metadata.target) {
+    const target = metadata.target;
+    requestTargets.set(request, target);
+    request.connection = {
+      provider: target.provider,
+      baseUrl: sanitizeStoredUrl(target.baseUrl).replace(/\/+$/, ''),
+      apiFormat: target.apiFormat,
+      model: target.model,
+      profileId: target.profileId,
+      profileName: target.profileName,
+      temperature: target.temperature,
+      maxTokens: target.maxTokens,
+      contextWindow: getTargetContextWindow(target),
+      corsProxy: sanitizeStoredUrl(target.corsProxy)
+    };
+  }
   assistantMsg.swipeRequests[swipeIdx] = request;
   return request;
 }
@@ -9191,13 +9891,13 @@ function finishRequestMetadata(request, status, error = '', httpStatus = null) {
   request.status = status;
   request.completedAt = Date.now();
   request.durationMs = request.startedAt ? Math.max(0, request.completedAt - request.startedAt) : null;
-  request.httpStatus = Number.isFinite(Number(httpStatus)) ? Number(httpStatus) : request.httpStatus || null;
-  request.error = sanitizeErrorDetail(error);
+  request.httpStatus = httpStatus != null && Number.isFinite(Number(httpStatus)) ? Number(httpStatus) : request.httpStatus || null;
+  request.error = sanitizeErrorDetail(error, [requestTargets.get(request)?.apiKey]);
 }
 
 async function authorizeExternalTool(toolName, args, conv, authorization) {
-  if (!canUseTool(toolName, conv)) return false;
-  const policy = getToolPolicy(conv);
+  const policy = authorization?.policy || getToolPolicy(conv);
+  if (!(toolName === 'web_search' ? policy.webSearch : toolName === 'url_fetch' && policy.urlFetch)) return false;
   if (!policy.confirm) return true;
   if (authorization && typeof authorization.confirmed === 'boolean') return authorization.confirmed;
   const target = toolName === 'web_search' ? extractWebSearchQueryFromArgs(args) : safeHttpUrl(args?.url);
@@ -9208,11 +9908,13 @@ async function authorizeExternalTool(toolName, args, conv, authorization) {
 }
 
 async function executeAuthorizedTool(toolName, args, conv, signal, authorization) {
+  signal?.throwIfAborted();
   if (!(await authorizeExternalTool(toolName, args, conv, authorization))) {
     return { results: [], content: '', error: 'Tool call denied by user; no external request was made.', denied: true };
   }
-  if (toolName === 'web_search') return executeWebSearch(extractWebSearchQueryFromArgs(args), signal);
-  return executeUrlFetch(args?.url || '', signal);
+  signal?.throwIfAborted();
+  if (toolName === 'web_search') return executeWebSearch(extractWebSearchQueryFromArgs(args), signal, authorization?.settings);
+  return executeUrlFetch(args?.url || '', signal, authorization?.settings);
 }
 
 function sourceRegistryFor(assistantMsg, swipeIdx) {
@@ -9273,32 +9975,33 @@ function persistSwipeSources(assistantMsg, swipeIdx, registry) {
 // Streaming
 // ============================================
 async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, overrideModel, prefixText, requestOptions = {}) {
-  const baseUrl = (localStorage.getItem('llmProxyUrl') || '').replace(/\/+$/, '');
-  const apiKey = getApiKey();
-  const model = overrideModel || localStorage.getItem('llmModel') || '';
-  const format = detectApiFormat(model);
+  const target = requestOptions.target || getActiveRequestTarget(overrideModel || undefined);
+  const { baseUrl, apiKey, model, apiFormat: format } = target;
   const requestConv = requestOptions.conv || getActiveConv();
-  const toolPolicy = getToolPolicy(requestConv);
-  const authorization = { confirmed: null };
-  const contextStats = getRequestContextStats(apiMessages, [], model);
+  const messageList = requestOptions.messageList || foregroundAction?.messageList || requestConv?.messages;
+  const controller = abortController || new AbortController();
+  const action = foregroundAction;
+  assertRequestOwner(requestConv, messageList, assistantMsg, controller.signal);
+  const toolPolicy = requestOptions.toolPolicy || getToolPolicy(requestConv);
+  const authorization = { confirmed: null, policy: toolPolicy, settings: target.toolSettings || getToolRequestSettings() };
   const request = createRequestMetadata(assistantMsg, swipeIdx, {
+    target,
     model,
     apiFormat: format,
     messageCount: apiMessages?.length || 0,
-    promptTokens: contextStats.includedTokens,
-    contextWindow: contextStats.contextWindow
+    promptTokens: (apiMessages || []).reduce((total, message) => total + estimateTokens(JSON.stringify(message)), 0),
+    contextWindow: getTargetContextWindow(target)
   });
   const sourceRegistry = sourceRegistryFor(assistantMsg, swipeIdx);
   activeSourceRegistry = sourceRegistry;
-  setAssistantLlmMetadata(assistantMsg, swipeIdx, model, format);
-  saveConversationImmediately().catch(error => console.warn('Could not persist pending request:', error));
+  setAssistantLlmMetadata(assistantMsg, swipeIdx, model, format, target);
 
   // Extra params & excludes
   let extra = {};
-  try { extra = JSON.parse(localStorage.getItem('llmExtraParams') || '{}'); } catch(e) { console.warn('Extra params parse error:', e); }
-  const exclude = (localStorage.getItem('llmExcludeParams') || '').split(',').map(s => s.trim()).filter(Boolean);
+  try { extra = JSON.parse(target.extraParams || '{}'); } catch(e) { console.warn('Extra params parse error:', e); }
+  const exclude = (target.excludeParams || '').split(',').map(s => s.trim()).filter(Boolean);
 
-  abortController = new AbortController();
+  abortController = controller;
   streaming = true;
   request.status = 'streaming';
   announce('Generating response.');
@@ -9309,28 +10012,48 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
   btn.disabled = false;
 
   let fullText = prefixText || '';
-  let thinkingText = '';
+  let thinkingText = prefixText ? assistantMsg.swipeThinking?.[swipeIdx] || '' : '';
   let lastRender = 0;
-  let toolBlocks = [];
-  let currentBlockType = null;
-  let inputJsonBuf = '';
-  let toolCallBuffers = {};
-  let currentToolUseId = null;
-  let currentToolUseName = null;
-  let pendingAnthropicToolCalls = [];
+  const toolBlocks = prefixText ? structuredClone(assistantMsg.swipeToolUse?.[swipeIdx] || []) : [];
+  const responseImages = prefixText ? (assistantMsg.swipeImages?.[swipeIdx] || []).slice() : [];
   let responseStatus = null;
 
+  const renderProgress = (force = false) => {
+    assistantMsg.swipes[swipeIdx] = fullText;
+    (assistantMsg.swipeThinking ||= [])[swipeIdx] = thinkingText;
+    (assistantMsg.swipeToolUse ||= [])[swipeIdx] = toolBlocks;
+    (assistantMsg.swipeImages ||= [])[swipeIdx] = responseImages;
+    if (assistantMsg.swipeIndex === swipeIdx) selectAssistantSwipe(assistantMsg, swipeIdx);
+    if (getActiveConv() !== requestConv || messages !== messageList || assistantMsg.swipeIndex !== swipeIdx) return;
+    if (!force && Date.now() - lastRender < 80) return;
+    bubbleEl = document.querySelector('.msg-wrapper[data-msg-idx="' + messageList.indexOf(assistantMsg) + '"] .msg-bubble') || (bubbleEl?.isConnected ? bubbleEl : null);
+    if (!bubbleEl) return;
+    const area = document.getElementById('messagesArea');
+    const savedScroll = userScrolledAway ? area.scrollTop : null;
+    const openTools = Array.from(bubbleEl.querySelectorAll('details.tool-use-block')).map(block => block.open);
+    const stripped = stripThinkTags(fullText);
+    _suppressScrollFlag = true;
+    setBubbleHTML(bubbleEl, thinkingText + stripped.thinking, renderToolBlocksHTML(toolBlocks) + renderMarkdown(stripped.content) + renderGenImages(responseImages));
+    bubbleEl.querySelectorAll('details.tool-use-block').forEach((block, index) => { block.open = openTools[index] === true; });
+    area.scrollTop = savedScroll === null ? area.scrollHeight : savedScroll;
+    _suppressScrollFlag = false;
+    lastRender = Date.now();
+  };
+
   try {
+    if (target.keyRequired && !apiKey) throw new Error('Enter an API key for ' + target.host + '.');
+    await saveConversationImmediately();
+    assertRequestOwner(requestConv, messageList, assistantMsg, controller.signal);
     let url, headers, body;
-    const useStream = localStorage.getItem('llmStreaming') !== 'false';
+    const useStream = target.stream !== false;
 
     // Assistant prefill. A trailing assistant turn is rejected with a 400 by Claude 4.6
     // and later, so skip it there rather than failing every request; the settings field
     // carries a matching note.
     const prefillBlocked = NO_TRAILING_ASSISTANT_RE.test(model);
-    const prefill = prefillBlocked ? '' : (localStorage.getItem('llmPrefill') || '');
+    const prefill = prefillBlocked ? '' : (target.prefill || '');
     if (prefill && !prefixText) {
-      apiMessages.push({ role: 'assistant', content: prefill });
+      apiMessages = apiMessages.concat({ role: 'assistant', content: prefill });
       fullText = prefill;
     }
 
@@ -9338,26 +10061,26 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       url = baseUrl + '/messages';
       headers = buildProviderHeaders('anthropic', apiKey);
       const prepared = prepareAnthropicMessages(apiMessages);
-      const thinkingOn = localStorage.getItem('llmThinking') === 'true';
-      const thinkingEffort = localStorage.getItem('llmThinkingEffort') || '';
+      const thinkingOn = target.thinking;
+      const thinkingEffort = target.thinkingEffort;
       body = {
+        ...extra,
         model,
         system: prepared.system,
         messages: prepared.messages,
-        max_tokens: resolveMaxTokens(),
+        max_tokens: target.maxTokens || 8192,
         stream: useStream,
         // Adaptive thinking only. budget_tokens is rejected by Opus 4.7+ / Sonnet 5 /
         // Fable 5; display defaults to "omitted" there, which renders an empty pane.
         ...(thinkingOn ? { thinking: { type: 'adaptive', display: 'summarized' } } : {}),
-        ...(thinkingEffort ? { output_config: { effort: thinkingEffort } } : {}),
-        ...extra
+        ...(thinkingEffort ? { output_config: { effort: thinkingEffort } } : {})
       };
       if (toolPolicy.webSearch || toolPolicy.urlFetch) {
         body.tools = (body.tools || []).concat([
           ...(toolPolicy.webSearch ? [toolPolicy.confirm ? ANTHROPIC_WEB_SEARCH_TOOL : { type: 'web_search_20250305', name: 'web_search', max_uses: 20 }] : []),
           ...(toolPolicy.urlFetch ? [ANTHROPIC_URL_FETCH_TOOL] : [])
         ]);
-        if (toolPolicy.webSearch && localStorage.getItem('llmForceSearch') === 'true') {
+        if (toolPolicy.webSearch && target.forceSearch) {
           body.tool_choice = { type: 'any' };
           body.system = (body.system || '') + '\n\nIMPORTANT: You MUST call the web_search tool to look up information before answering. Do NOT answer from memory or training data. Always search first, then synthesize your answer from the results.';
         }
@@ -9366,44 +10089,16 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       // body.system as a string. Breakpoint goes on the system block only: `system`
       // survives the { ...body } spreads into tool follow-up requests, whereas a
       // breakpoint on the last message would go stale as soon as `messages` is replaced.
-      if (typeof body.system === 'string' && body.system && localStorage.getItem('llmPromptCache') !== 'false') {
+      if (typeof body.system === 'string' && body.system && target.promptCache !== false) {
         body.system = [{ type: 'text', text: body.system, cache_control: { type: 'ephemeral' } }];
       }
     } else {
       url = baseUrl + '/chat/completions';
       headers = buildProviderHeaders('openai', apiKey);
-      const processedMessages = apiMessages.map(m => {
-        if (!Array.isArray(m.content)) return m;
-        // Strip image parts from assistant messages — most APIs don't accept them
-        if (m.role === 'assistant') {
-          const textParts = m.content.filter(p => p.type === 'text');
-          const hadImages = m.content.some(p => p.type === 'image_url');
-          if (hadImages) textParts.push({ type: 'text', text: '[Generated image]' });
-          const joined = textParts.map(p => p.text).join('');
-          return { ...m, content: joined || '[Generated image]' };
-        }
-        return {
-          ...m,
-          content: m.content.map(part => {
-            if (part.type === 'image_url' && part.image_url) {
-              return { type: 'image_url', image_url: { url: part.image_url.url } };
-            }
-            if (part.type === 'file') {
-              const name = part.file?.name || 'file';
-              const text = part.file?.textContent;
-              if (typeof text === 'string') {
-                return { type: 'text', text: `--- ${name} ---\n${text}\n--- end ${name} ---` };
-              }
-              return { type: 'text', text: `[Attached file: ${name}]` };
-            }
-            return part;
-          })
-        };
-      });
-      body = { model, messages: processedMessages, stream: useStream, ...extra };
-      const configuredMaxTokens = resolveConfiguredMaxTokens();
+      body = { ...extra, model, messages: prepareOpenAiMessages(apiMessages), stream: useStream };
+      const configuredMaxTokens = target.maxTokens;
       if (configuredMaxTokens && !('max_tokens' in body) && !('max_completion_tokens' in body)) {
-        const provider = localStorage.getItem('llmProvider') || inferProviderKey({ llmProxyUrl: baseUrl, llmApiFormat: format });
+        const provider = target.provider;
         const tokenKey = provider === 'openai' && /^(?:o\d|gpt-5)/i.test(model) ? 'max_completion_tokens' : 'max_tokens';
         body[tokenKey] = configuredMaxTokens;
       }
@@ -9413,7 +10108,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
           ...(toolPolicy.webSearch ? [OPENAI_WEB_SEARCH_TOOL] : []),
           ...(toolPolicy.urlFetch ? [OPENAI_URL_FETCH_TOOL] : [])
         ]);
-        if (toolPolicy.webSearch && localStorage.getItem('llmForceSearch') === 'true') {
+        if (toolPolicy.webSearch && target.forceSearch) {
           body.tool_choice = 'required';
           // Reinforce via system prompt — some providers (e.g. Gemini) ignore tool_choice
           body.messages = body.messages.concat([{
@@ -9424,8 +10119,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       }
     }
     if (!('temperature' in body)) {
-      const temp = parseFloat(localStorage.getItem('llmTemperature'));
-      if (!isNaN(temp)) body.temperature = temp;
+      if (target.temperature !== null) body.temperature = target.temperature;
     }
     // Sampling params are rejected with a 400 by current Claude models. This block runs
     // for both API formats, so without the strip a saved temperature breaks every
@@ -9434,1127 +10128,264 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       delete body.temperature; delete body.top_p; delete body.top_k;
     }
     exclude.forEach(k => delete body[k]);
-    debugLogPayload('API request', body, { url, format, model });
+    body.model = model;
+    const fetchResponse = async () => {
+      assertRequestOwner(requestConv, messageList, assistantMsg, controller.signal);
+      assertProviderRequestFits(body, target);
+      debugLogPayload('API request', body, { url, format, model });
+      const response = await fetchApiWithHttpSupport(url, {
+        method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal
+      }, baseUrl, false, target.corsProxy);
+      responseStatus = response.status;
+      return response;
+    };
 
-    let resp = await fetchApiWithHttpSupport(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: abortController.signal
-    }, baseUrl);
-    responseStatus = resp.status;
-
-    // If tool_choice caused a 400 (e.g. Gemini doesn't support "required"), retry without it
-    if (!resp.ok && resp.status === 400 && body.tool_choice) {
-      const saved = body.tool_choice;
-      delete body.tool_choice;
-      console.warn('Retrying without tool_choice (was:', saved, ')');
-      resp = await fetchApiWithHttpSupport(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: abortController.signal
-      }, baseUrl);
-      responseStatus = resp.status;
-    }
-
-    if (!resp.ok) {
-      let errText = '';
-      try { errText = await resp.text(); } catch(e) { console.warn('Error reading response text:', e); }
-      throw new Error('API returned ' + resp.status + (errText ? ': ' + errText.slice(0, 200) : ''));
-    }
-
-    const ct = resp.headers.get('content-type') || '';
-
-    if (ct.includes('application/json')) {
-      const data = await resp.json();
-      if (format === 'anthropic') {
-        fullText = (data.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
-        // Extract thinking blocks from non-streaming response
-        thinkingText = (data.content || []).filter(c => c.type === 'thinking').map(c => c.thinking).join('');
-        // Extract tool blocks from non-streaming response
-        for (const block of (data.content || [])) {
-          if (block.type === 'server_tool_use' && block.name === 'web_search') {
-            toolBlocks.push({ query: extractWebSearchQueryFromArgs(block.input), results: [], searching: false });
-          } else if (block.type === 'web_search_tool_result') {
-            const tb = toolBlocks[toolBlocks.length - 1] || { query: '', results: [], searching: false };
-            if (!toolBlocks.length) toolBlocks.push(tb);
-            tb.results = (block.content || []).filter(r => r.type === 'web_search_result').map(r => ({
-              title: r.title,
-              url: r.url,
-              snippet: r.snippet || r.content || r.description || r.summary || ''
-            }));
-            tb.searching = false;
-          } else if (block.type === 'tool_use' && HANDLED_TOOLS.has(block.name)) {
-            if (block.name === 'url_fetch') {
-              toolBlocks.push({ type: 'url_fetch', url: block.input?.url || '', content: '', searching: true });
-            } else {
-              toolBlocks.push({ query: extractWebSearchQueryFromArgs(block.input), results: [], searching: true });
-            }
-            pendingAnthropicToolCalls.push({ id: block.id, name: block.name, input: block.input || {}, toolBlockIndex: toolBlocks.length - 1 });
-          }
+    // Each transport uses the same history, tool budget and completion rules.
+    for (let toolRound = 0; toolRound <= 20; toolRound++) {
+      let resp = await fetchResponse();
+      if (!resp.ok && resp.status === 400 && body.tool_choice) {
+        delete body.tool_choice;
+        resp = await fetchResponse();
+      }
+      if (!resp.ok) {
+        const detail = (await resp.text()).slice(0, 200);
+        throw new Error('API returned ' + resp.status + (detail ? ': ' + detail : ''));
+      }
+      const textBeforeRound = fullText + (toolRound && fullText ? '\n\n' : '');
+      const thinkingBeforeRound = thinkingText;
+      let reply = { role: 'assistant', content: format === 'anthropic' ? [] : '' };
+      let roundText = '';
+      let roundThinking = '';
+      let hasRoundImages = false;
+      let stopReason = null;
+      const addImages = images => {
+        for (const image of images.map(safeMediaUrl).filter(Boolean)) {
+          hasRoundImages = true;
+          if (!responseImages.includes(image)) responseImages.push(image);
         }
-        // Execute pending Anthropic custom tool calls (non-streaming)
-        if (pendingAnthropicToolCalls.length > 0) {
-          const toolUseContentBlocks = [];
-          const toolResultBlocks = [];
-          for (const call of pendingAnthropicToolCalls) {
-            toolUseContentBlocks.push({ type: 'tool_use', id: call.id, name: call.name, input: call.input });
-            if (call.name === 'url_fetch') {
-              const tb = toolBlocks[call.toolBlockIndex];
-              const fetchUrl = call.input?.url || '';
-              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-              const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
-              if (tb) { tb.content = content; tb.searching = false; if (error) tb.error = error; }
-              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-              toolResultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: formatUrlFetchResultForModel(content, error, fetchUrl) });
-            } else if (call.name === 'web_search') {
-              const tb = toolBlocks[call.toolBlockIndex];
-              const query = extractWebSearchQueryFromArgs(call.input);
-              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-              const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
-              if (tb) { tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet })); tb.searching = false; if (error) tb.error = error; }
-              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-              toolResultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: formatSearchResultsForModel(results, error) });
-            }
-          }
-          // Follow-up non-streaming request
-          const prepared = prepareAnthropicMessages(apiMessages);
-          const followUpMessages = [
-            ...prepared.messages,
-            { role: 'assistant', content: [
-              ...(fullText && fullText !== 'No response.' ? [{ type: 'text', text: fullText }] : []),
-              ...toolUseContentBlocks
-            ]},
-            { role: 'user', content: toolResultBlocks }
-          ];
-          const followUpBody = { ...body, messages: followUpMessages, stream: false };
-          delete followUpBody.tools;
-          delete followUpBody.tool_choice;
-          exclude.forEach(k => delete followUpBody[k]);
-          debugLogPayload('API follow-up request', followUpBody, { url, format, model, stage: 'anthropic-tools' });
-          const followUpResp = await fetchApiWithHttpSupport(url, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(followUpBody),
-            signal: abortController.signal
-          }, baseUrl);
-          if (!followUpResp.ok) {
-            let errText = '';
-            try { errText = await followUpResp.text(); } catch(e) {}
-            throw new Error('Follow-up API returned ' + followUpResp.status + (errText ? ': ' + errText.slice(0, 200) : ''));
-          }
-          const followUpData = await followUpResp.json();
-          if (followUpData.type === 'error' || followUpData.error) {
-            console.warn('Follow-up API error:', followUpData.error?.message || JSON.stringify(followUpData.error));
-          }
-          const followUpText = (followUpData.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
-          if (followUpText) fullText = followUpText;
-          const followThink = (followUpData.content || []).filter(c => c.type === 'thinking').map(c => c.thinking).join('');
-          if (followThink) thinkingText += followThink;
-          pendingAnthropicToolCalls = [];
-        }
+      };
+      const readMessage = message => {
+        if (!message || typeof message !== 'object') throw new Error('The provider returned no assistant message.');
+        reply = { ...message, role: 'assistant' };
+        const extracted = extractImages(reply);
+        roundText = extracted.text;
+        addImages(extracted.images);
+        roundThinking = format === 'anthropic'
+          ? (reply.content || []).filter(block => block.type === 'thinking').map(block => block.thinking || '').join('')
+          : reply.reasoning_content || reply.reasoning || (reply.reasoning_details || []).filter(block => block.type === 'reasoning.text').map(block => block.text || '').join('');
+        fullText = textBeforeRound + roundText;
+        thinkingText = thinkingBeforeRound + roundThinking;
+        renderProgress();
+      };
+      if ((resp.headers.get('content-type') || '').includes('application/json')) {
+        const data = await resp.json();
+        if (data.error || data.type === 'error') throw new Error(data.error?.message || 'The provider returned an error.');
+        stopReason = data.stop_reason || data.choices?.[0]?.finish_reason;
+        readMessage(format === 'anthropic' ? { role: 'assistant', content: data.content } : data.choices?.[0]?.message);
       } else {
-        const extracted = extractImages(data.choices?.[0]?.message || data);
-        fullText = extracted.text || '';
-        if (extracted.images.length) {
-          assistantMsg.swipeImages = assistantMsg.swipeImages || [];
-          assistantMsg.swipeImages[swipeIdx] = extracted.images;
-          assistantMsg.images = extracted.images;
-        }
-        thinkingText = data.choices?.[0]?.message?.reasoning_content
-          || data.choices?.[0]?.message?.reasoning || '';
-        // Handle OpenAI tool calls (non-streaming)
-        const msgToolCalls = (data.choices?.[0]?.message?.tool_calls || []).filter(tc => HANDLED_TOOLS.has(tc.function?.name));
-        // Fallback: parse text-based tool calls (separate path — uses user message follow-up)
-        let textBasedToolCalls = [];
-        if (msgToolCalls.length === 0 && fullText) {
-          const textCalls = parseTextToolCalls(fullText);
-          if (textCalls.length > 0) textBasedToolCalls = textCalls;
-        }
-        if (msgToolCalls.length > 0) {
-          const assistantToolMsg = {
-            role: 'assistant',
-            content: fullText || null,
-            tool_calls: msgToolCalls.map(tc => ({
-              id: tc.id,
-              type: 'function',
-              function: { name: tc.function.name, arguments: tc.function.arguments }
-            }))
-          };
-          const toolResultMsgs = [];
-          for (const tc of msgToolCalls) {
-            const toolName = tc.function?.name;
-            let args = {};
-            try { args = JSON.parse(tc.function.arguments); } catch(e) {}
-            if (toolName === 'url_fetch') {
-              const fetchUrl = args.url || '';
-              toolBlocks.push({ type: 'url_fetch', url: fetchUrl, content: '', searching: true });
-              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-              const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
-              const tb = toolBlocks[toolBlocks.length - 1];
-              tb.content = content;
-              tb.searching = false;
-              if (error) tb.error = error;
-              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-              toolResultMsgs.push({ role: 'tool', tool_call_id: tc.id, content: formatUrlFetchResultForModel(content, error, fetchUrl) });
-            } else {
-              const query = extractWebSearchQueryFromArgs(args);
-              toolBlocks.push({ query, results: [], searching: true });
-              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-              const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
-              const tb = toolBlocks[toolBlocks.length - 1];
-              tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
-              tb.searching = false;
-              if (error) tb.error = error;
-              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-              toolResultMsgs.push({ role: 'tool', tool_call_id: tc.id, content: formatSearchResultsForModel(results, error) });
-            }
-          }
-          // Follow-up non-streaming request
-          const followUpMessages = [...body.messages, assistantToolMsg, ...toolResultMsgs];
-          const followUpBody = { ...body, messages: followUpMessages, stream: false };
-          delete followUpBody.tools;
-          delete followUpBody.tool_choice;
-          exclude.forEach(k => delete followUpBody[k]);
-          debugLogPayload('API follow-up request', followUpBody, { url, format, model, stage: 'openai-tools' });
-          const followUpResp = await fetchApiWithHttpSupport(url, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(followUpBody),
-            signal: abortController.signal
-          }, baseUrl);
-          if (!followUpResp.ok) {
-            let errText = '';
-            try { errText = await followUpResp.text(); } catch(e) {}
-            throw new Error('Follow-up API returned ' + followUpResp.status + (errText ? ': ' + errText.slice(0, 200) : ''));
-          }
-          const followUpData = await followUpResp.json();
-          if (followUpData.error) {
-            console.warn('Follow-up API error:', followUpData.error?.message || JSON.stringify(followUpData.error));
-          }
-          const followExtracted = extractImages(followUpData.choices?.[0]?.message || followUpData);
-          if (followExtracted.text) fullText = followExtracted.text;
-          if (followExtracted.images.length) {
-            assistantMsg.swipeImages = assistantMsg.swipeImages || [];
-            assistantMsg.swipeImages[swipeIdx] = followExtracted.images;
-            assistantMsg.images = followExtracted.images;
-          }
-          const followThinking = followUpData.choices?.[0]?.message?.reasoning_content
-            || followUpData.choices?.[0]?.message?.reasoning || '';
-          if (followThinking) thinkingText += followThinking;
-        }
-        // Handle text-based tool calls (separate from API tool calls — uses user message follow-up)
-        if (textBasedToolCalls.length > 0 && msgToolCalls.length === 0) {
-          const savedText = fullText;
-          fullText = stripTextToolCalls(fullText);
-          const textToolResults = [];
-          for (const tc of textBasedToolCalls) {
-            let args = {};
-            try { args = JSON.parse(tc.arguments); } catch(e) {}
-            if (tc.name === 'url_fetch') {
-              const fetchUrl = args.url || '';
-              toolBlocks.push({ type: 'url_fetch', url: fetchUrl, content: '', searching: true });
-              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-              const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
-              const tb = toolBlocks[toolBlocks.length - 1];
-              tb.content = content; tb.searching = false;
-              if (error) tb.error = error;
-              textToolResults.push('URL Fetch (' + fetchUrl + '):\n' + formatUrlFetchResultForModel(content, error, fetchUrl));
-            } else {
-              const query = extractWebSearchQueryFromArgs(args);
-              toolBlocks.push({ query, results: [], searching: true });
-              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-              const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
-              const tb = toolBlocks[toolBlocks.length - 1];
-              tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
-              tb.searching = false;
-              if (error) tb.error = error;
-              textToolResults.push('Web Search (' + query + '):\n' + formatSearchResultsForModel(results, error));
-            }
-            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-          }
-          const followUpMessages = [...body.messages,
-            { role: 'assistant', content: savedText },
-            { role: 'user', content: 'Here are the tool results:\n\n' + textToolResults.join('\n\n') + '\n\nPlease synthesize a response using these results.' }
-          ];
-          const followUpBody = { ...body, messages: followUpMessages, stream: false };
-          delete followUpBody.tools;
-          delete followUpBody.tool_choice;
-          exclude.forEach(k => delete followUpBody[k]);
-          debugLogPayload('API follow-up request', followUpBody, { url, format, model, stage: 'text-tools' });
-          try {
-            const followUpResp = await fetchApiWithHttpSupport(url, { method: 'POST', headers, body: JSON.stringify(followUpBody), signal: abortController.signal }, baseUrl);
-            if (followUpResp.ok) {
-              const followUpData = await followUpResp.json();
-              const followText = followUpData.choices?.[0]?.message?.content || '';
-              if (followText) fullText = followText;
-            }
-          } catch(e) { console.warn('Text tool call follow-up failed:', e); }
-          if (!fullText) fullText = savedText;
-        }
-        if (!fullText && !toolBlocks.some(block => block.content || (block.results || []).length)) {
-          fullText = 'No response received. Retry to try again.';
-          finishRequestMetadata(request, 'failed', 'Provider returned an empty response.', responseStatus);
-        }
-      }
-      const stripped = stripThinkTags(fullText);
-      if (stripped.thinking) thinkingText += stripped.thinking;
-      fullText = stripped.content;
-      assistantMsg.swipes[swipeIdx] = fullText;
-      assistantMsg.content = fullText;
-      if (thinkingText) {
-        assistantMsg.swipeThinking = assistantMsg.swipeThinking || [];
-        assistantMsg.swipeThinking[swipeIdx] = thinkingText;
-      }
-      if (toolBlocks.length > 0) {
-        assistantMsg.swipeToolUse = assistantMsg.swipeToolUse || [];
-        assistantMsg.swipeToolUse[swipeIdx] = toolBlocks;
-      }
-      setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-      postRenderProcessing(bubbleEl);
-    } else {
-      // SSE streaming
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      const streamImages = [];
-
-      const renderStreamProgress = () => {
-        assistantMsg.swipes[swipeIdx] = fullText;
-        assistantMsg.content = fullText;
-        const now = Date.now();
-        if (now - lastRender > 80) {
-          const msgsArea = document.getElementById('messagesArea');
-          const savedScrollTop = userScrolledAway ? msgsArea.scrollTop : null;
-          _suppressScrollFlag = true;
-          const stripped = stripThinkTags(fullText);
-          const displayThinking = stripped.thinking ? thinkingText + stripped.thinking : thinkingText;
-          setBubbleHTML(bubbleEl, displayThinking, renderToolBlocksHTML(toolBlocks) + renderMarkdown(stripped.content) + renderGenImages(streamImages));
-          if (savedScrollTop !== null) msgsArea.scrollTop = savedScrollTop;
-          else msgsArea.scrollTop = msgsArea.scrollHeight;
-          _suppressScrollFlag = false;
-          lastRender = now;
-        }
-      };
-
-      const readOpenAiTextStream = async (streamResp) => {
-        const ct = streamResp.headers.get('content-type') || '';
-        if (ct.includes('application/json')) {
-          const data = await streamResp.json();
-          if (data.error) console.warn('Recovery API error:', data.error?.message || JSON.stringify(data.error));
-          const extracted = extractImages(data.choices?.[0]?.message || data);
-          if (extracted.text) fullText += extracted.text;
-          if (extracted.images.length) streamImages.push(...extracted.images);
-          const reasoning = data.choices?.[0]?.message?.reasoning_content
-            || data.choices?.[0]?.message?.reasoning || '';
-          if (reasoning) thinkingText += reasoning;
-          renderStreamProgress();
-          return;
-        }
-
-        const reader = streamResp.body?.getReader();
-        if (!reader) return;
+        const reader = resp.body?.getReader();
+        if (!reader) throw new Error('The provider returned no response body.');
         const decoder = new TextDecoder();
-        let streamBuffer = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          streamBuffer += decoder.decode(value, { stream: true });
-          const lines = streamBuffer.split('\n');
-          streamBuffer = lines.pop() || '';
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data:')) continue;
-            const payload = trimmed.slice(5).trim();
-            if (payload === '[DONE]') continue;
-            try {
-              const json = JSON.parse(payload);
-              if (json.error) console.warn('Recovery stream error:', json.error?.message || JSON.stringify(json.error));
-              const delta = json.choices?.[0]?.delta?.content;
-              if (typeof delta === 'string') {
-                fullText += delta;
-              } else if (Array.isArray(delta)) {
-                for (const part of delta) {
-                  if (part.type === 'text') fullText += part.text;
-                  else {
-                    const extracted = extractImages({ content: [part] });
-                    if (extracted.images.length) streamImages.push(...extracted.images);
-                  }
-                }
-              }
-              const finishMsg = json.choices?.[0]?.message;
-              if (finishMsg) {
-                const extracted = extractImages(finishMsg);
-                if (extracted.images.length) streamImages.push(...extracted.images);
-                if (extracted.text && !fullText) fullText = extracted.text;
-              }
-              const reasoning = json.choices?.[0]?.delta?.reasoning_content
-                || json.choices?.[0]?.delta?.reasoning;
-              if (reasoning) thinkingText += reasoning;
-              const reasoningDetails = json.choices?.[0]?.delta?.reasoning_details;
-              if (Array.isArray(reasoningDetails)) {
-                for (const rd of reasoningDetails) {
-                  if (rd.type === 'reasoning.text' && rd.text) thinkingText += rd.text;
-                }
-              }
-            } catch(e) {}
-          }
-          renderStreamProgress();
-        }
-      };
-
-      const readAnthropicTextStream = async (streamResp) => {
-        const ct = streamResp.headers.get('content-type') || '';
-        if (ct.includes('application/json')) {
-          const data = await streamResp.json();
-          if (data.type === 'error' || data.error) console.warn('Recovery API error:', data.error?.message || JSON.stringify(data.error));
-          fullText += (data.content || []).filter(c => c.type === 'text').map(c => c.text).join('') || '';
-          const thinking = (data.content || []).filter(c => c.type === 'thinking').map(c => c.thinking).join('');
-          if (thinking) thinkingText += thinking;
-          renderStreamProgress();
-          return;
-        }
-
-        const reader = streamResp.body?.getReader();
-        if (!reader) return;
-        const decoder = new TextDecoder();
-        let streamBuffer = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          streamBuffer += decoder.decode(value, { stream: true });
-          const lines = streamBuffer.split('\n');
-          streamBuffer = lines.pop() || '';
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data:')) continue;
-            const payload = trimmed.slice(5).trim();
-            if (!payload) continue;
-            try {
-              const json = JSON.parse(payload);
-              if (json.type === 'error') {
-                console.warn('Recovery stream error:', json.error?.message || JSON.stringify(json.error));
-              } else if (json.type === 'content_block_delta') {
-                if (json.delta?.type === 'text_delta' && json.delta?.text) fullText += json.delta.text;
-                else if (json.delta?.type === 'thinking_delta' && json.delta?.thinking) thinkingText += json.delta.thinking;
-              }
-            } catch(e) {}
-          }
-          renderStreamProgress();
-        }
-      };
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-
+        const inputJson = {};
+        let buffer = '';
+        let eventData = [];
+        let complete = false;
+        const acceptEvent = payload => {
+          if (!payload || complete) return;
+          if (payload === '[DONE]') { complete = true; return; }
+          const data = JSON.parse(payload);
+          if (data.error || data.type === 'error') throw new Error(data.error?.message || 'The provider returned an error.');
           if (format === 'anthropic') {
-            if (!trimmed.startsWith('data:')) continue;
-            const payload = trimmed.slice(5).trim();
-            if (!payload) continue;
-            try {
-              const json = JSON.parse(payload);
-              if (json.type === 'content_block_start') {
-                const cb = json.content_block;
-                if (cb && cb.type === 'server_tool_use') {
-                  currentBlockType = 'server_tool_use';
-                  inputJsonBuf = '';
-                  toolBlocks.push({ query: '', results: [], searching: true });
-                } else if (cb && cb.type === 'tool_use' && HANDLED_TOOLS.has(cb.name)) {
-                  currentBlockType = 'tool_use';
-                  currentToolUseId = cb.id || '';
-                  currentToolUseName = cb.name;
-                  inputJsonBuf = '';
-                  if (cb.name === 'url_fetch') {
-                    toolBlocks.push({ type: 'url_fetch', url: '', content: '', searching: true });
-                  } else {
-                    toolBlocks.push({ query: '', results: [], searching: true });
-                  }
-                } else if (cb && cb.type === 'web_search_tool_result') {
-                  currentBlockType = 'web_search_tool_result';
-                  const tb = toolBlocks[toolBlocks.length - 1];
-                  if (tb) {
-                    tb.results = (cb.content || []).filter(r => r.type === 'web_search_result').map(r => ({
-                      title: r.title,
-                      url: r.url,
-                      snippet: r.snippet || r.content || r.description || r.summary || ''
-                    }));
-                    tb.searching = false;
-                  }
-                } else if (cb && cb.type === 'text') {
-                  currentBlockType = 'text';
-                } else if (cb && cb.type === 'thinking') {
-                  currentBlockType = 'thinking';
-                }
-              } else if (json.type === 'content_block_delta') {
-                if (json.delta?.type === 'text_delta' && json.delta?.text) {
-                  fullText += json.delta.text;
-                } else if (json.delta?.type === 'thinking_delta' && json.delta?.thinking) {
-                  thinkingText += json.delta.thinking;
-                } else if (json.delta?.type === 'input_json_delta' && json.delta?.partial_json) {
-                  inputJsonBuf += json.delta.partial_json;
-                }
-              } else if (json.type === 'content_block_stop') {
-                if (currentBlockType === 'server_tool_use' && inputJsonBuf) {
-                  try {
-                    const parsed = JSON.parse(inputJsonBuf);
-                    const tb = toolBlocks[toolBlocks.length - 1];
-                    if (tb && parsed.query) tb.query = parsed.query;
-                  } catch(e) {}
-                  inputJsonBuf = '';
-                } else if (currentBlockType === 'tool_use' && currentToolUseName && inputJsonBuf) {
-                  try {
-                    const parsed = JSON.parse(inputJsonBuf);
-                    const tb = toolBlocks[toolBlocks.length - 1];
-                    if (currentToolUseName === 'url_fetch') {
-                      if (tb) tb.url = parsed.url || '';
-                    } else if (tb && parsed.query) {
-                      tb.query = parsed.query;
-                    }
-                    pendingAnthropicToolCalls.push({ id: currentToolUseId, name: currentToolUseName, input: parsed, toolBlockIndex: toolBlocks.length - 1 });
-                  } catch(e) {}
-                  inputJsonBuf = '';
-                  currentToolUseId = null;
-                  currentToolUseName = null;
-                }
-                currentBlockType = null;
-              } else if (json.type === 'message_stop') {
-                // done
-              } else if (json.type === 'error') {
-                throw new Error(json.error?.message || 'Anthropic API error');
-              }
-            } catch(e) { if (e.message && !e.message.startsWith('Unexpected')) throw e; }
+            const index = data.index ?? 0;
+            if (data.type === 'content_block_start') {
+              const block = structuredClone(data.content_block);
+              reply.content[index] = block;
+              if (block.type === 'text') roundText += block.text || '';
+              if (block.type === 'thinking') roundThinking += block.thinking || '';
+              addImages(extractImages({ content: [block] }).images);
+            } else if (data.type === 'content_block_delta') {
+              const block = reply.content[index];
+              const delta = data.delta || {};
+              if (!block) throw new Error('The provider sent a delta without its content block.');
+              if (delta.type === 'text_delta') { block.text = (block.text || '') + (delta.text || ''); roundText += delta.text || ''; }
+              else if (delta.type === 'thinking_delta') { block.thinking = (block.thinking || '') + (delta.thinking || ''); roundThinking += delta.thinking || ''; }
+              else if (delta.type === 'signature_delta') block.signature = (block.signature || '') + (delta.signature || '');
+              else if (delta.type === 'input_json_delta') inputJson[index] = (inputJson[index] || '') + (delta.partial_json || '');
+              else if (delta.type === 'citations_delta') (block.citations ||= []).push(delta.citation);
+            } else if (data.type === 'content_block_stop' && inputJson[index]) {
+              reply.content[index].input = JSON.parse(inputJson[index]);
+            } else if (data.type === 'message_delta') stopReason = data.delta?.stop_reason || stopReason;
+            else if (data.type === 'message_stop') complete = true;
           } else {
-            // OpenAI format
-            if (!trimmed.startsWith('data:')) continue;
-            const payload = trimmed.slice(5).trim();
-            if (payload === '[DONE]') continue;
-            try {
-              const json = JSON.parse(payload);
-              if (json.error) throw new Error(json.error?.message || 'OpenAI API error');
-              const delta = json.choices?.[0]?.delta?.content;
-              if (typeof delta === 'string') {
-                fullText += delta;
-              } else if (Array.isArray(delta)) {
-                for (const part of delta) {
-                  if (part.type === 'text') fullText += part.text;
-                  else {
-                    const ex = extractImages({ content: [part] });
-                    if (ex.images.length) streamImages.push(...ex.images);
-                  }
-                }
+            const choice = data.choices?.[0];
+            const delta = choice?.delta || {};
+            if (choice?.message) readMessage(choice.message);
+            else {
+              for (const [key, value] of Object.entries(delta)) {
+                if (!['content', 'images', 'tool_calls', 'reasoning_content', 'reasoning', 'reasoning_details'].includes(key)) reply[key] = value;
               }
-              // Some proxies deliver images in the final chunk's message field
-              const finishMsg = json.choices?.[0]?.message;
-              if (finishMsg) {
-                const ex = extractImages(finishMsg);
-                if (ex.images.length) streamImages.push(...ex.images);
-                if (ex.text && !fullText) fullText = ex.text;
+              if (typeof delta.content === 'string') {
+                roundText += delta.content;
+                if (Array.isArray(reply.content)) reply.content.push({ type: 'text', text: delta.content });
+                else reply.content = (reply.content || '') + delta.content;
+              } else if (Array.isArray(delta.content)) {
+                if (!Array.isArray(reply.content)) reply.content = reply.content ? [{ type: 'text', text: reply.content }] : [];
+                reply.content.push(...delta.content);
+                const extracted = extractImages({ content: delta.content });
+                roundText += extracted.text;
+                addImages(extracted.images);
               }
-              const reasoning = json.choices?.[0]?.delta?.reasoning_content
-                || json.choices?.[0]?.delta?.reasoning;
-              if (reasoning) thinkingText += reasoning;
-              const reasoningDetails = json.choices?.[0]?.delta?.reasoning_details;
-              if (Array.isArray(reasoningDetails)) {
-                for (const rd of reasoningDetails) {
-                  if (rd.type === 'reasoning.text' && rd.text) thinkingText += rd.text;
-                }
+              if (delta.images) { (reply.images ||= []).push(...delta.images); addImages(extractImages({ images: delta.images }).images); }
+              for (const key of ['reasoning_content', 'reasoning']) {
+                if (typeof delta[key] === 'string') { reply[key] = (reply[key] || '') + delta[key]; roundThinking += delta[key]; }
               }
-              // Accumulate tool call fragments
-              const deltaToolCalls = json.choices?.[0]?.delta?.tool_calls;
-              if (deltaToolCalls) {
-                for (const tc of deltaToolCalls) {
-                  const idx = tc.index ?? 0;
-                  if (!toolCallBuffers[idx]) toolCallBuffers[idx] = { id: '', name: '', arguments: '' };
-                  if (tc.id) toolCallBuffers[idx].id = tc.id;
-                  if (tc.function?.name) toolCallBuffers[idx].name = tc.function.name;
-                  if (tc.function?.arguments) toolCallBuffers[idx].arguments += tc.function.arguments;
-                }
+              for (const detail of delta.reasoning_details || []) {
+                const details = reply.reasoning_details ||= [];
+                const previous = Number.isInteger(detail.index) ? details.find(item => item.index === detail.index) : null;
+                if (previous) {
+                  for (const [key, value] of Object.entries(detail)) previous[key] = ['text', 'data', 'summary'].includes(key) ? (previous[key] || '') + value : value;
+                } else details.push({ ...detail });
+                if (detail.type === 'reasoning.text') roundThinking += detail.text || '';
               }
-            } catch(e) {
-              if (!(e instanceof SyntaxError)) throw e;
-            }
-          }
-        }
-
-        assistantMsg.swipes[swipeIdx] = fullText;
-        assistantMsg.content = fullText;
-        const now = Date.now();
-        if (now - lastRender > 80) {
-          // Preserve scroll position when user has scrolled away
-          const msgsArea = document.getElementById('messagesArea');
-          const savedScrollTop = userScrolledAway ? msgsArea.scrollTop : null;
-          // Preserve open/closed state of thinking & tool blocks
-          const thinkingOpen = bubbleEl.querySelector('details.thinking-block')?.open === true;
-          const toolOpen = Array.from(bubbleEl.querySelectorAll('details.tool-use-block')).map(el => el.open);
-          _suppressScrollFlag = true;
-          const _st = stripThinkTags(fullText);
-          const _displayText = _st.content;
-          const _displayThinking = _st.thinking ? thinkingText + _st.thinking : thinkingText;
-          setBubbleHTML(bubbleEl, _displayThinking, renderToolBlocksHTML(toolBlocks) + renderMarkdown(_displayText) + renderGenImages(streamImages));
-          if (thinkingOpen) {
-            const details = bubbleEl.querySelector('details.thinking-block');
-            if (details) details.open = true;
-          }
-          toolOpen.forEach((open, i) => {
-            if (open) {
-              const details = bubbleEl.querySelectorAll('details.tool-use-block')[i];
-              if (details) details.open = true;
-            }
-          });
-          if (savedScrollTop !== null) {
-            msgsArea.scrollTop = savedScrollTop;
-          } else {
-            msgsArea.scrollTop = msgsArea.scrollHeight;
-          }
-          _suppressScrollFlag = false;
-          lastRender = now;
-        }
-      }
-      // === Anthropic custom tool call execution (url_fetch etc.) ===
-      let anthropicToolRound = 0;
-      while (pendingAnthropicToolCalls.length > 0 && format === 'anthropic' && anthropicToolRound < 20) {
-        anthropicToolRound++;
-        const toolUseContentBlocks = [];
-        const toolResultBlocks = [];
-        for (const call of pendingAnthropicToolCalls) {
-          toolUseContentBlocks.push({ type: 'tool_use', id: call.id, name: call.name, input: call.input });
-          if (call.name === 'url_fetch') {
-            const tb = toolBlocks[call.toolBlockIndex];
-            const fetchUrl = call.input?.url || '';
-            if (tb) tb.url = fetchUrl;
-            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-            const msgsAreaTmp = document.getElementById('messagesArea');
-            if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
-            const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
-            if (tb) {
-              tb.content = content;
-              tb.searching = false;
-              if (error) tb.error = error;
-            }
-            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-            if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
-            toolResultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: formatUrlFetchResultForModel(content, error, fetchUrl) });
-          } else if (call.name === 'web_search') {
-            const tb = toolBlocks[call.toolBlockIndex];
-            const query = extractWebSearchQueryFromArgs(call.input);
-            if (tb) tb.query = query;
-            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-            const msgsAreaTmp = document.getElementById('messagesArea');
-            if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
-            const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
-            if (tb) {
-              tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
-              tb.searching = false;
-              if (error) tb.error = error;
-            }
-            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-            if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
-            toolResultBlocks.push({ type: 'tool_result', tool_use_id: call.id, content: formatSearchResultsForModel(results, error) });
-          }
-        }
-        // Build follow-up request
-        const prepared = prepareAnthropicMessages(apiMessages);
-        const followUpMessages = [
-          ...prepared.messages,
-          { role: 'assistant', content: [
-            ...(fullText ? [{ type: 'text', text: fullText }] : []),
-            ...toolUseContentBlocks
-          ]},
-          { role: 'user', content: toolResultBlocks }
-        ];
-        const followUpBody = { ...body, messages: followUpMessages, stream: true };
-        delete followUpBody.tool_choice;
-        if (anthropicToolRound >= 20) delete followUpBody.tools;
-        exclude.forEach(k => delete followUpBody[k]);
-        debugLogPayload('API follow-up request', followUpBody, { url, format, model, stage: 'anthropic-stream-tools' });
-        const followUpResp = await fetchApiWithHttpSupport(url, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(followUpBody),
-          signal: abortController.signal
-        }, baseUrl);
-        if (!followUpResp.ok) {
-          let errText = '';
-          try { errText = await followUpResp.text(); } catch(e) {}
-          throw new Error('Follow-up API returned ' + followUpResp.status + (errText ? ': ' + errText.slice(0, 200) : ''));
-        }
-        const preToolText = fullText;
-        fullText = '';
-        pendingAnthropicToolCalls = [];
-        let followInputJsonBuf = '';
-        let followBlockType = null;
-        let followToolUseId = null;
-        let followToolUseName = null;
-        const followCt = followUpResp.headers.get('content-type') || '';
-        if (followCt.includes('application/json')) {
-          const followData = await followUpResp.json();
-          if (followData.type === 'error' || followData.error) {
-            console.warn('Follow-up API error:', followData.error?.message || JSON.stringify(followData.error));
-          }
-          fullText = (followData.content || []).filter(c => c.type === 'text').map(c => c.text).join('') || '';
-          const followThink = (followData.content || []).filter(c => c.type === 'thinking').map(c => c.thinking).join('');
-          if (followThink) thinkingText += followThink;
-          for (const block of (followData.content || [])) {
-            if (block.type === 'tool_use' && HANDLED_TOOLS.has(block.name)) {
-              if (block.name === 'url_fetch') {
-                toolBlocks.push({ type: 'url_fetch', url: block.input?.url || '', content: '', searching: true });
-              } else {
-                toolBlocks.push({ query: extractWebSearchQueryFromArgs(block.input), results: [], searching: true });
-              }
-              pendingAnthropicToolCalls.push({ id: block.id, name: block.name, input: block.input || {}, toolBlockIndex: toolBlocks.length - 1 });
-            }
-          }
-        } else {
-          const followReader = followUpResp.body.getReader();
-          const followDecoder = new TextDecoder();
-          let followBuffer = '';
-          while (true) {
-            const { done, value } = await followReader.read();
-            if (done) break;
-            followBuffer += followDecoder.decode(value, { stream: true });
-            const fLines = followBuffer.split('\n');
-            followBuffer = fLines.pop() || '';
-            for (const fLine of fLines) {
-              const ft = fLine.trim();
-              if (!ft.startsWith('data:')) continue;
-              const fp = ft.slice(5).trim();
-              if (!fp) continue;
-              try {
-                const fj = JSON.parse(fp);
-                if (fj.type === 'error') {
-                  console.warn('Follow-up stream error:', fj.error?.message || JSON.stringify(fj.error));
-                } else if (fj.type === 'content_block_start') {
-                  const cb = fj.content_block;
-                  if (cb && cb.type === 'tool_use' && HANDLED_TOOLS.has(cb.name)) {
-                    followBlockType = 'tool_use';
-                    followToolUseId = cb.id || '';
-                    followToolUseName = cb.name;
-                    followInputJsonBuf = '';
-                    if (cb.name === 'url_fetch') {
-                      toolBlocks.push({ type: 'url_fetch', url: '', content: '', searching: true });
-                    } else {
-                      toolBlocks.push({ query: '', results: [], searching: true });
-                    }
-                  } else if (cb && cb.type === 'server_tool_use') {
-                    followBlockType = 'server_tool_use';
-                    followInputJsonBuf = '';
-                    toolBlocks.push({ query: '', results: [], searching: true });
-                  } else if (cb && cb.type === 'web_search_tool_result') {
-                    followBlockType = 'web_search_tool_result';
-                    const tb = toolBlocks[toolBlocks.length - 1];
-                    if (tb) {
-                      tb.results = (cb.content || []).filter(r => r.type === 'web_search_result').map(r => ({
-                        title: r.title, url: r.url, snippet: r.snippet || r.content || r.description || r.summary || ''
-                      }));
-                      tb.searching = false;
-                    }
-                  } else if (cb && (cb.type === 'text' || cb.type === 'thinking')) {
-                    followBlockType = cb.type;
-                  }
-                } else if (fj.type === 'content_block_delta') {
-                  if (fj.delta?.type === 'text_delta' && fj.delta?.text) fullText += fj.delta.text;
-                  else if (fj.delta?.type === 'thinking_delta' && fj.delta?.thinking) thinkingText += fj.delta.thinking;
-                  else if (fj.delta?.type === 'input_json_delta' && fj.delta?.partial_json) followInputJsonBuf += fj.delta.partial_json;
-                } else if (fj.type === 'content_block_stop') {
-                  if (followBlockType === 'server_tool_use' && followInputJsonBuf) {
-                    try {
-                      const parsed = JSON.parse(followInputJsonBuf);
-                      const tb = toolBlocks[toolBlocks.length - 1];
-                      if (tb && parsed.query) tb.query = parsed.query;
-                    } catch(e) {}
-                    followInputJsonBuf = '';
-                  } else if (followBlockType === 'tool_use' && followToolUseName && followInputJsonBuf) {
-                    try {
-                      const parsed = JSON.parse(followInputJsonBuf);
-                      const tb = toolBlocks[toolBlocks.length - 1];
-                      if (followToolUseName === 'url_fetch') {
-                        if (tb) tb.url = parsed.url || '';
-                      } else if (tb && parsed.query) {
-                        tb.query = parsed.query;
-                      }
-                      pendingAnthropicToolCalls.push({ id: followToolUseId, name: followToolUseName, input: parsed, toolBlockIndex: toolBlocks.length - 1 });
-                    } catch(e) {}
-                    followInputJsonBuf = '';
-                    followToolUseId = null;
-                    followToolUseName = null;
-                  }
-                  followBlockType = null;
-                }
-              } catch(e) {}
-            }
-            assistantMsg.swipes[swipeIdx] = fullText;
-            assistantMsg.content = fullText;
-            const now2 = Date.now();
-            if (now2 - lastRender > 80) {
-              const msgsArea2 = document.getElementById('messagesArea');
-              const savedST = userScrolledAway ? msgsArea2.scrollTop : null;
-              _suppressScrollFlag = true;
-              const _st2 = stripThinkTags(fullText);
-              setBubbleHTML(bubbleEl, _st2.thinking ? thinkingText + _st2.thinking : thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(_st2.content) + renderGenImages(streamImages));
-              if (savedST !== null) msgsArea2.scrollTop = savedST;
-              else msgsArea2.scrollTop = msgsArea2.scrollHeight;
-              _suppressScrollFlag = false;
-              lastRender = now2;
-            }
-          }
-        }
-        if (!fullText && pendingAnthropicToolCalls.length === 0) {
-          try {
-            const recoveryBody = { ...body, messages: followUpMessages, stream: true };
-            // body.system may be a cache_control block array — append a second block
-            // rather than string-joining it, which would stringify to "[object Object]".
-            recoveryBody.system = Array.isArray(body.system)
-              ? body.system.concat([{ type: 'text', text: TOOL_FINAL_ANSWER_NUDGE }])
-              : [body.system, TOOL_FINAL_ANSWER_NUDGE].filter(Boolean).join('\n\n');
-            delete recoveryBody.tools;
-            delete recoveryBody.tool_choice;
-            exclude.forEach(k => delete recoveryBody[k]);
-            debugLogPayload('API recovery request', recoveryBody, { url, format, model, stage: 'anthropic-stream-tools-recovery' });
-            const recoveryResp = await fetchApiWithHttpSupport(url, {
-              method: 'POST',
-              headers,
-              body: JSON.stringify(recoveryBody),
-              signal: abortController.signal
-            }, baseUrl);
-            if (recoveryResp.ok) {
-              await readAnthropicTextStream(recoveryResp);
-            } else {
-              let errText = '';
-              try { errText = await recoveryResp.text(); } catch(e) {}
-              console.warn('Recovery API returned ' + recoveryResp.status + (errText ? ': ' + errText.slice(0, 200) : ''));
-            }
-          } catch(e) {
-            if (e.name === 'AbortError') throw e;
-            console.warn('Anthropic tool recovery failed:', e);
-          }
-        }
-        if (!fullText && preToolText) fullText = preToolText;
-      }
-      // === Parse text-based tool calls (models like Gemini output tool calls as text) ===
-      // These can't use the standard OpenAI tool loop because the API never produced real
-      // tool_calls — fake IDs get rejected. Instead, execute directly and follow up as a user message.
-      if (format !== 'anthropic' && Object.keys(toolCallBuffers).length === 0) {
-        const textToolCalls = parseTextToolCalls(fullText);
-        if (textToolCalls.length > 0) {
-          const savedText = fullText;
-          fullText = stripTextToolCalls(fullText);
-          const textToolResults = [];
-          for (const tc of textToolCalls) {
-            let args = {};
-            try { args = JSON.parse(tc.arguments); } catch(e) {}
-            if (tc.name === 'url_fetch') {
-              const fetchUrl = args.url || '';
-              toolBlocks.push({ type: 'url_fetch', url: fetchUrl, content: '', searching: true });
-              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-            const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
-              const tb = toolBlocks[toolBlocks.length - 1];
-              tb.content = content; tb.searching = false;
-              if (error) tb.error = error;
-              textToolResults.push('URL Fetch (' + fetchUrl + '):\n' + formatUrlFetchResultForModel(content, error, fetchUrl));
-            } else {
-              const query = extractWebSearchQueryFromArgs(args);
-              toolBlocks.push({ query, results: [], searching: true });
-              setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-            const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
-              const tb = toolBlocks[toolBlocks.length - 1];
-              tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
-              tb.searching = false;
-              if (error) tb.error = error;
-              textToolResults.push('Web Search (' + query + '):\n' + formatSearchResultsForModel(results, error));
-            }
-            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-          }
-          // Follow up with results as a user message (compatible with all APIs)
-          const followUpMessages = [...(body.messages || []),
-            { role: 'assistant', content: savedText },
-            { role: 'user', content: 'Here are the tool results:\n\n' + textToolResults.join('\n\n') + '\n\nPlease synthesize a response using these results.' }
-          ];
-          const followUpBody = { ...body, messages: followUpMessages, stream: true };
-          delete followUpBody.tools;
-          delete followUpBody.tool_choice;
-          exclude.forEach(k => delete followUpBody[k]);
-          debugLogPayload('API follow-up request', followUpBody, { url, format, model, stage: 'stream-text-tools' });
-          try {
-            const followUpResp = await fetchApiWithHttpSupport(url, { method: 'POST', headers, body: JSON.stringify(followUpBody), signal: abortController.signal }, baseUrl);
-            if (followUpResp.ok && followUpResp.body) {
-              fullText = '';
-              const fReader = followUpResp.body.getReader();
-              const fDecoder = new TextDecoder();
-              let fBuf = '';
-              while (true) {
-                const { done, value } = await fReader.read();
-                if (done) break;
-                fBuf += fDecoder.decode(value, { stream: true });
-                const fLines = fBuf.split('\n');
-                fBuf = fLines.pop() || '';
-                for (const fl of fLines) {
-                  const ft = fl.trim();
-                  if (!ft.startsWith('data:')) continue;
-                  const fp = ft.slice(5).trim();
-                  if (fp === '[DONE]') continue;
-                  try {
-                    const fj = JSON.parse(fp);
-                    const fd = fj.choices?.[0]?.delta?.content;
-                    if (typeof fd === 'string') fullText += fd;
-                  } catch(e) {}
-                }
-                assistantMsg.swipes[swipeIdx] = fullText;
-                assistantMsg.content = fullText;
-                const now = Date.now();
-                if (now - lastRender > 80) {
-                  setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-                  lastRender = now;
-                }
+              for (const call of delta.tool_calls || []) {
+                const calls = reply.tool_calls ||= [];
+                const index = call.index ?? 0;
+                const current = calls[index] ||= { id: '', type: 'function', function: { name: '', arguments: '' } };
+                const previous = current.function;
+                Object.assign(current, call);
+                delete current.index;
+                current.function = {
+                  ...previous, ...call.function,
+                  name: previous.name + (call.function?.name || ''),
+                  arguments: previous.arguments + (call.function?.arguments || '')
+                };
               }
             }
-          } catch(e) {
-            console.warn('Text tool call follow-up failed:', e);
+            if (choice?.finish_reason != null) { stopReason = choice.finish_reason; complete = true; }
           }
-          if (!fullText) fullText = savedText;
-        }
-      }
-      // === OpenAI tool call execution loop ===
-      let openaiToolRound = 0;
-      let openaiPendingToolCalls = Object.values(toolCallBuffers).filter(tc => HANDLED_TOOLS.has(tc.name));
-      let openaiRunningMessages = body.messages ? [...body.messages] : [];
-      while (openaiPendingToolCalls.length > 0 && format !== 'anthropic' && openaiToolRound < 20) {
-        openaiToolRound++;
-        // Build the assistant message with tool_calls
-        const assistantToolMsg = {
-          role: 'assistant',
-          content: fullText || null,
-          tool_calls: openaiPendingToolCalls.map(tc => ({
-            id: tc.id,
-            type: 'function',
-            function: { name: tc.name, arguments: tc.arguments }
-          }))
+          fullText = textBeforeRound + roundText;
+          thinkingText = thinkingBeforeRound + roundThinking;
+          renderProgress();
         };
-        const toolResultMsgs = [];
-        for (const tc of openaiPendingToolCalls) {
-          const toolName = tc.name;
-          let args = {};
-          try { args = JSON.parse(tc.arguments); } catch(e) {}
-          const msgsAreaTmp = document.getElementById('messagesArea');
-          if (toolName === 'url_fetch') {
-            const fetchUrl = args.url || '';
-            toolBlocks.push({ type: 'url_fetch', url: fetchUrl, content: '', searching: true });
-            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-            if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
-            const { content, error } = await executeAuthorizedTool('url_fetch', { url: fetchUrl }, requestConv, abortController.signal, authorization);
-            const tb = toolBlocks[toolBlocks.length - 1];
-            tb.content = content;
-            tb.searching = false;
-            if (error) tb.error = error;
-            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-            if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
-            toolResultMsgs.push({ role: 'tool', tool_call_id: tc.id, content: formatUrlFetchResultForModel(content, error, fetchUrl) });
-          } else {
-            const query = extractWebSearchQueryFromArgs(args);
-            // Show searching state
-            toolBlocks.push({ query, results: [], searching: true });
-            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-            if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
-            // Execute search
-            const { results, error } = await executeAuthorizedTool('web_search', { query }, requestConv, abortController.signal, authorization);
-            const tb = toolBlocks[toolBlocks.length - 1];
-            tb.results = results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet }));
-            tb.searching = false;
-            if (error) tb.error = error;
-            setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-            if (!userScrolledAway) msgsAreaTmp.scrollTop = msgsAreaTmp.scrollHeight;
-            toolResultMsgs.push({ role: 'tool', tool_call_id: tc.id, content: formatSearchResultsForModel(results, error) });
-          }
-        }
-        // Follow-up streaming request with tool results
-        openaiRunningMessages = [...openaiRunningMessages, assistantToolMsg, ...toolResultMsgs];
-        const followUpBody = { ...body, messages: openaiRunningMessages, stream: true };
-        delete followUpBody.tool_choice;
-        if (openaiToolRound >= 20) delete followUpBody.tools;
-        exclude.forEach(k => delete followUpBody[k]);
-        debugLogPayload('API follow-up request', followUpBody, { url, format, model, stage: 'openai-stream-tools' });
-        const followUpResp = await fetchApiWithHttpSupport(url, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(followUpBody),
-          signal: abortController.signal
-        }, baseUrl);
-        if (!followUpResp.ok) {
-          let errText = '';
-          try { errText = await followUpResp.text(); } catch(e) {}
-          throw new Error('Follow-up API returned ' + followUpResp.status + (errText ? ': ' + errText.slice(0, 200) : ''));
-        }
-        const preToolText = fullText;
-        fullText = '';
-        toolCallBuffers = {};
-        const followReader = followUpResp.body.getReader();
-        const followDecoder = new TextDecoder();
-        let followBuffer = '';
-        while (true) {
-          const { done, value } = await followReader.read();
-          if (done) break;
-          followBuffer += followDecoder.decode(value, { stream: true });
-          const fLines = followBuffer.split('\n');
-          followBuffer = fLines.pop() || '';
-          for (const fLine of fLines) {
-            const ft = fLine.trim();
-            if (!ft.startsWith('data:')) continue;
-            const fp = ft.slice(5).trim();
-            if (fp === '[DONE]') continue;
-            try {
-              const fj = JSON.parse(fp);
-              if (fj.error) {
-                console.warn('Follow-up stream error:', fj.error?.message || JSON.stringify(fj.error));
-              }
-              const fd = fj.choices?.[0]?.delta?.content;
-              if (typeof fd === 'string') fullText += fd;
-              const fr = fj.choices?.[0]?.delta?.reasoning_content
-                || fj.choices?.[0]?.delta?.reasoning;
-              if (fr) thinkingText += fr;
-              const frd = fj.choices?.[0]?.delta?.reasoning_details;
-              if (Array.isArray(frd)) {
-                for (const rd of frd) {
-                  if (rd.type === 'reasoning.text' && rd.text) thinkingText += rd.text;
-                }
-              }
-              const deltaToolCalls = fj.choices?.[0]?.delta?.tool_calls;
-              if (deltaToolCalls) {
-                for (const tc of deltaToolCalls) {
-                  const idx = tc.index ?? 0;
-                  if (!toolCallBuffers[idx]) toolCallBuffers[idx] = { id: '', name: '', arguments: '' };
-                  if (tc.id) toolCallBuffers[idx].id = tc.id;
-                  if (tc.function?.name) toolCallBuffers[idx].name = tc.function.name;
-                  if (tc.function?.arguments) toolCallBuffers[idx].arguments += tc.function.arguments;
-                }
-              }
-            } catch(e) {}
-          }
-          assistantMsg.swipes[swipeIdx] = fullText;
-          assistantMsg.content = fullText;
-          const now2 = Date.now();
-          if (now2 - lastRender > 80) {
-            const msgsArea2 = document.getElementById('messagesArea');
-            const savedST = userScrolledAway ? msgsArea2.scrollTop : null;
-            _suppressScrollFlag = true;
-            const _st2 = stripThinkTags(fullText);
-            const _displayText2 = _st2.content;
-            const _displayThinking2 = _st2.thinking ? thinkingText + _st2.thinking : thinkingText;
-            setBubbleHTML(bubbleEl, _displayThinking2, renderToolBlocksHTML(toolBlocks) + renderMarkdown(_displayText2) + renderGenImages(streamImages));
-            if (savedST !== null) msgsArea2.scrollTop = savedST;
-            else msgsArea2.scrollTop = msgsArea2.scrollHeight;
-            _suppressScrollFlag = false;
-            lastRender = now2;
-          }
-        }
-        openaiPendingToolCalls = Object.values(toolCallBuffers).filter(tc => HANDLED_TOOLS.has(tc.name));
-        if (!fullText && openaiPendingToolCalls.length === 0) {
-          try {
-            const recoveryMessages = [...openaiRunningMessages, { role: 'system', content: TOOL_FINAL_ANSWER_NUDGE }];
-            const recoveryBody = { ...body, messages: recoveryMessages, stream: true };
-            delete recoveryBody.tools;
-            delete recoveryBody.tool_choice;
-            exclude.forEach(k => delete recoveryBody[k]);
-            debugLogPayload('API recovery request', recoveryBody, { url, format, model, stage: 'openai-stream-tools-recovery' });
-            const recoveryResp = await fetchApiWithHttpSupport(url, {
-              method: 'POST',
-              headers,
-              body: JSON.stringify(recoveryBody),
-              signal: abortController.signal
-            }, baseUrl);
-            if (recoveryResp.ok) {
-              await readOpenAiTextStream(recoveryResp);
-            } else {
-              let errText = '';
-              try { errText = await recoveryResp.text(); } catch(e) {}
-              console.warn('Recovery API returned ' + recoveryResp.status + (errText ? ': ' + errText.slice(0, 200) : ''));
+        const acceptLine = line => {
+          if (!line) { acceptEvent(eventData.join('\n')); eventData = []; }
+          else if (line.startsWith('data:')) eventData.push(line.slice(5).trimStart());
+        };
+        try {
+          while (!complete) {
+            const { done, value } = await reader.read();
+            assertRequestOwner(requestConv, messageList, assistantMsg, controller.signal);
+            buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+            const lines = buffer.split(/\r?\n/);
+            buffer = lines.pop() || '';
+            for (const line of lines) { acceptLine(line); if (complete) break; }
+            if (done) {
+              if (buffer) acceptLine(buffer);
+              if (!complete) acceptEvent(eventData.join('\n'));
+              break;
             }
-          } catch(e) {
-            if (e.name === 'AbortError') throw e;
-            console.warn('OpenAI tool recovery failed:', e);
+          }
+        } finally {
+          void reader.cancel().catch(() => {});
+          reader.releaseLock();
+        }
+        if (!complete) {
+          const error = new Error('The provider stream ended before completion. Partial output was kept.');
+          error.requestStatus = 'interrupted';
+          throw error;
+        }
+        readMessage(reply);
+      }
+
+      assertRequestOwner(requestConv, messageList, assistantMsg, controller.signal);
+      if (format === 'anthropic') {
+        const nativeTools = new Map();
+        for (const block of reply.content || []) {
+          if (block.type === 'server_tool_use' && block.name === 'web_search') {
+            const tool = { query: extractWebSearchQueryFromArgs(block.input), results: [], searching: false };
+            nativeTools.set(block.id, tool);
+            toolBlocks.push(tool);
+          } else if (block.type === 'web_search_tool_result') {
+            const tool = nativeTools.get(block.tool_use_id) || { query: '', results: [], searching: false };
+            if (!toolBlocks.includes(tool)) toolBlocks.push(tool);
+            tool.results = (Array.isArray(block.content) ? block.content : []).filter(result => result.type === 'web_search_result')
+              .map(result => ({ title: result.title, url: result.url, snippet: result.snippet || '' }));
+            if (block.content?.type === 'web_search_tool_result_error') tool.error = block.content.error_code || 'Search failed.';
           }
         }
-        if (!fullText && preToolText) fullText = preToolText;
       }
-      const emptyResponse = !String(fullText || '').trim() && !streamImages.length && !toolBlocks.some(block => block.content || (block.results || []).length);
-      if (emptyResponse) {
-        fullText = 'No response received. Retry to try again.';
-        finishRequestMetadata(request, 'failed', 'Provider returned an empty response.', responseStatus);
+      let calls = format === 'anthropic'
+        ? (reply.content || []).filter(block => block.type === 'tool_use').map(block => ({ id: block.id, name: block.name, input: block.input }))
+        : (reply.tool_calls || []).filter(Boolean).map(call => ({ id: call.id, name: call.function?.name, arguments: call.function?.arguments }));
+      let textTools = false;
+      if (!calls.length && format !== 'anthropic' && (toolPolicy.webSearch || toolPolicy.urlFetch)) {
+        calls = parseTextToolCalls(roundText);
+        textTools = calls.length > 0;
       }
-      const stripped = stripThinkTags(fullText);
-      if (stripped.thinking) thinkingText += stripped.thinking;
-      fullText = stripped.content;
-      assistantMsg.swipes[swipeIdx] = fullText;
-      assistantMsg.content = fullText;
-      if (streamImages.length) {
-        assistantMsg.swipeImages = assistantMsg.swipeImages || [];
-        assistantMsg.swipeImages[swipeIdx] = streamImages;
-        assistantMsg.images = streamImages;
+      const enabledCalls = calls.filter(call => call.name === 'web_search' ? toolPolicy.webSearch : call.name === 'url_fetch' && toolPolicy.urlFetch);
+      const nativeContinuation = format === 'anthropic' && stopReason === 'pause_turn' && toolPolicy.webSearch;
+      if (!enabledCalls.length && !nativeContinuation) {
+        if (!stripThinkTags(roundText).content.trim() && !hasRoundImages) throw new Error('The provider returned no final answer.');
+        finishRequestMetadata(request, 'complete', '', responseStatus);
+        break;
       }
-      if (thinkingText) {
-        assistantMsg.swipeThinking = assistantMsg.swipeThinking || [];
-        assistantMsg.swipeThinking[swipeIdx] = thinkingText;
+      if (enabledCalls.length !== calls.length) throw new Error('The provider requested an unavailable tool.');
+      if (toolRound === 20) throw new Error('The tool round limit was reached without a final answer.');
+      if (textTools) fullText = textBeforeRound + stripTextToolCalls(roundText);
+      const results = [];
+      for (const call of enabledCalls) {
+        const args = call.input ?? JSON.parse(call.arguments || '{}');
+        if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('The provider returned invalid tool arguments.');
+        const tool = call.name === 'url_fetch'
+          ? { type: 'url_fetch', url: args.url || '', content: '', searching: true }
+          : { query: extractWebSearchQueryFromArgs(args), results: [], searching: true };
+        toolBlocks.push(tool);
+        renderProgress(true);
+        const result = await executeAuthorizedTool(call.name, args, requestConv, controller.signal, authorization);
+        assertRequestOwner(requestConv, messageList, assistantMsg, controller.signal);
+        Object.assign(tool, result, { searching: false });
+        const content = call.name === 'url_fetch'
+          ? formatUrlFetchResultForModel(result.content, result.error, args.url)
+          : formatSearchResultsForModel(result.results, result.error, sourceRegistry);
+        results.push(format === 'anthropic'
+          ? { type: 'tool_result', tool_use_id: call.id, content, ...(result.error ? { is_error: true } : {}) }
+          : { role: 'tool', tool_call_id: call.id, content });
+        renderProgress(true);
       }
-      if (toolBlocks.length > 0) {
-        assistantMsg.swipeToolUse = assistantMsg.swipeToolUse || [];
-        assistantMsg.swipeToolUse[swipeIdx] = toolBlocks;
+      // Replay the full assistant blocks, including signed thinking, in every exchange.
+      body.messages = [...body.messages, reply];
+      if (textTools) body.messages.push({ role: 'user', content: 'Tool results:\n\n' + results.map(result => result.content).join('\n\n') });
+      else if (format === 'anthropic' && results.length) body.messages.push({ role: 'user', content: results });
+      else body.messages.push(...results);
+      delete body.tool_choice;
+      if (toolRound === 19) {
+        delete body.tools;
+        if (format === 'anthropic') body.system = Array.isArray(body.system)
+          ? body.system.concat({ type: 'text', text: TOOL_FINAL_ANSWER_NUDGE })
+          : [body.system, TOOL_FINAL_ANSWER_NUDGE].filter(Boolean).join('\n\n');
+        else body.messages.push({ role: 'system', content: TOOL_FINAL_ANSWER_NUDGE });
       }
-      const msgsArea = document.getElementById('messagesArea');
-      const savedScrollTop = userScrolledAway ? msgsArea.scrollTop : null;
-      _suppressScrollFlag = true;
-      setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(streamImages));
-      postRenderProcessing(bubbleEl);
-      if (savedScrollTop !== null) {
-        msgsArea.scrollTop = savedScrollTop;
-      } else {
-        msgsArea.scrollTop = msgsArea.scrollHeight;
-      }
-      _suppressScrollFlag = false;
     }
   } catch (e) {
     if (e.name === 'AbortError') {
-      if (!fullText) fullText = '(stopped)';
       finishRequestMetadata(request, 'stopped', 'Generation stopped by the user.', responseStatus);
       announce('Generation stopped.');
     } else {
-      const detail = sanitizeErrorDetail(e);
-      fullText = 'Request failed: ' + detail;
-      finishRequestMetadata(request, 'failed', detail, responseStatus);
+      finishRequestMetadata(request, e.requestStatus || 'failed', e, responseStatus);
       announce('Request failed. Retry is available.');
     }
-    const strippedErr = stripThinkTags(fullText);
-    if (strippedErr.thinking) thinkingText += strippedErr.thinking;
-    fullText = strippedErr.content;
-    assistantMsg.swipes[swipeIdx] = fullText;
-    assistantMsg.content = fullText;
-    if (thinkingText) {
-      assistantMsg.swipeThinking = assistantMsg.swipeThinking || [];
-      assistantMsg.swipeThinking[swipeIdx] = thinkingText;
-    }
-    if (toolBlocks.length > 0) {
-      assistantMsg.swipeToolUse = assistantMsg.swipeToolUse || [];
-      assistantMsg.swipeToolUse[swipeIdx] = toolBlocks;
-    }
-    const msgsArea = document.getElementById('messagesArea');
-    const savedScrollTop = userScrolledAway ? msgsArea.scrollTop : null;
-    _suppressScrollFlag = true;
-    setBubbleHTML(bubbleEl, thinkingText, renderToolBlocksHTML(toolBlocks) + renderMarkdown(fullText) + renderGenImages(assistantMsg.images));
-    if (savedScrollTop !== null) {
-      msgsArea.scrollTop = savedScrollTop;
-    } else {
-      msgsArea.scrollTop = msgsArea.scrollHeight;
-    }
-    _suppressScrollFlag = false;
   } finally {
+    const stripped = stripThinkTags(fullText);
+    thinkingText += stripped.thinking;
+    fullText = stripped.content;
+    toolBlocks.forEach(block => {
+      if (block.searching) { block.searching = false; block.error = request.error || 'Tool request stopped.'; }
+    });
+    renderProgress(true);
+    if (bubbleEl?.isConnected && getActiveConv() === requestConv) postRenderProcessing(bubbleEl);
     persistSwipeSources(assistantMsg, swipeIdx, sourceRegistry);
-    if (request.status === 'pending' || request.status === 'streaming') finishRequestMetadata(request, abortController?.signal?.aborted ? 'stopped' : 'complete', '', responseStatus);
     if (request.status === 'complete') announce('Response complete.');
+    if (action && foregroundAction === action) action.status = request.status;
     updateMessageTokenMetadata(assistantMsg, swipeIdx);
     debugLog('API response', {
       model,
@@ -10564,7 +10395,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       hasThinking: Boolean(thinkingText)
     });
     streaming = false;
-    abortController = null;
+    if (!sending && abortController === controller) abortController = null;
     btn.classList.remove('streaming');
     btn.disabled = false;
     updateSendBtnState();
@@ -10582,7 +10413,7 @@ function updateSendBtnState() {
   const conv = getActiveConv();
   const queueBtn = document.getElementById('followUpQueueBtn');
   if (queueBtn) queueBtn.disabled = readOnlyShare || !conv || pendingAttachmentReads > 0 || (conv.queuedFollowUps || []).length >= 20 || queueingFollowUp || (sending && !streaming);
-  if (streaming) {
+  if (abortController && (sending || streaming)) {
     btn.textContent = 'Stop';
     btn.setAttribute('aria-label', 'Stop generating response');
     btn.disabled = false;
@@ -10610,19 +10441,43 @@ function updateSendBtnState() {
 }
 
 function beginSendingAction() {
-  if (_syncPullInFlight) {
-    showToast('Wait for sync pull to finish.', 'info');
+  if (_syncPullInFlight || localDataOperationsInFlight) {
+    showToast('Wait for the current data operation to finish.', 'info');
     return false;
   }
   if (sending || streaming) return false;
+  abortController = new AbortController();
+  foregroundAction = { conv: getActiveConv(), messageList: messages, controller: abortController, status: 'paused' };
   sending = true;
   updateSendBtnState();
   return true;
 }
 
 function endSendingAction() {
+  const action = foregroundAction;
+  const status = action?.controller.signal.aborted ? 'stopped' : action?.status;
   sending = false;
+  streaming = false;
+  if (abortController === action?.controller) abortController = null;
+  foregroundAction = null;
+  document.getElementById('sendBtn')?.classList.remove('streaming');
   updateSendBtnState();
+  if (action?.conv) {
+    if (status !== 'complete') armedFollowUpConversationIds.delete(action.conv.id);
+    else if (armedFollowUpConversationIds.has(action.conv.id)) setTimeout(() => processQueuedFollowUps(action.conv.id), 0);
+    renderFollowUpQueue();
+    renderSidebar();
+  }
+}
+
+function assertRequestOwner(conv, messageList, message = null, signal = abortController?.signal) {
+  signal?.throwIfAborted();
+  if (!conv || getActiveConv() !== conv || conv.messages !== messageList || messages !== messageList ||
+      (message && !messageList.includes(message))) {
+    const error = new Error('The conversation changed while the request was being prepared.');
+    error.requestStatus = 'interrupted';
+    throw error;
+  }
 }
 
 function resolveWebSearchEnabled(conv = getActiveConv()) {
@@ -10687,7 +10542,7 @@ function renderFollowUpQueue() {
 
 function restoreComposerSnapshot(conv, input, originalText, attachments, overrideModel) {
   const restoredAttachments = cloneDraftAttachments(attachments);
-  if (!conv || activeConvId !== conv.id) {
+  if (!conv || getActiveConv() !== conv) {
     if (conv) {
       if (originalText || restoredAttachments.length) conv.draft = { text: originalText, attachments: restoredAttachments, updatedAt: Date.now() };
       else delete conv.draft;
@@ -10749,6 +10604,13 @@ async function queueFollowUpFromComposer() {
     modelOverride: originalOverride || null,
     createdAt: Date.now()
   };
+  // Queued credentials stay in memory; a reload already requires explicit Resume.
+  try {
+    requestTargets.set(item, Object.freeze({
+      ...getActiveRequestTarget(originalOverride || undefined),
+      toolPolicy: Object.freeze(getToolPolicy(conv))
+    }));
+  } catch (error) { /* A disconnected draft can still be queued. */ }
   conv.queuedFollowUps = (conv.queuedFollowUps || []).concat(item);
   delete conv.draft;
   conv.updatedAt = Date.now();
@@ -10889,7 +10751,7 @@ async function processQueuedFollowUps(convId) {
 // Send Message
 // ============================================
 async function sendMessage({ queuedFollowUp = null } = {}) {
-  if (streaming && abortController && !queuedFollowUp) { abortController.abort(); return 'stopped'; }
+  if ((sending || streaming) && abortController && !queuedFollowUp) { abortController.abort(); return 'stopped'; }
   if (readOnlyShare) return 'paused';
   if (!queuedFollowUp && pendingAttachmentReads > 0) {
     showToast('Wait for attachments to finish reading.', 'info');
@@ -10897,21 +10759,19 @@ async function sendMessage({ queuedFollowUp = null } = {}) {
   }
   if (!beginSendingAction()) return 'paused';
   let finalStatus = 'paused';
-  let requestConvId = activeConvId;
   try {
 
+  stopVoiceInput();
   const input = document.getElementById('chatInput');
   const originalText = queuedFollowUp ? '' : input.value;
   const text = queuedFollowUp ? queuedFollowUp.text : originalText.trim();
   const composerAttachments = queuedFollowUp ? cloneDraftAttachments(queuedFollowUp.attachments) : cloneDraftAttachments(pendingAttachments);
-  const lastMsg = messages[messages.length - 1];
+  const conv = getActiveConv();
+  const messageList = messages;
+  const lastMsg = messageList[messageList.length - 1];
   const isRegenFromFork = !queuedFollowUp && !text && composerAttachments.length === 0 && lastMsg && lastMsg.role === 'user';
   if (!text && composerAttachments.length === 0 && !isRegenFromFork) return finalStatus;
 
-  const proxyUrl = localStorage.getItem('llmProxyUrl');
-  const apiKey = getApiKey();
-  const conv = getActiveConv();
-  requestConvId = conv?.id || activeConvId;
   if (queuedFollowUp && conv?.queuedFollowUps?.[0]?.id !== queuedFollowUp.id) return finalStatus;
 
   if (!isRegenFromFork && !queuedFollowUp) {
@@ -10924,19 +10784,29 @@ async function sendMessage({ queuedFollowUp = null } = {}) {
       closeCommandDropdown();
       persistDraftFromUI();
       await handleCommand(cmd, conv);
-      return 'complete';
+      finalStatus = foregroundAction?.status === 'paused' ? 'complete' : foregroundAction?.status || 'paused';
+      return finalStatus;
     }
   }
 
-  if (!proxyUrl || (providerRequiresKey() && !apiKey)) {
+  const overrideModel = queuedFollowUp ? queuedFollowUp.modelOverride : modelOverride;
+  const queuedTarget = queuedFollowUp && requestTargets.get(queuedFollowUp);
+  if (!queuedTarget && !(localStorage.getItem('llmProxyUrl') || '').trim()) {
+    openModal('setupModal', '#setupProxy');
+    return finalStatus;
+  }
+  const target = queuedTarget || getActiveRequestTarget(overrideModel || undefined);
+  const toolPolicy = target.toolPolicy || getToolPolicy(conv);
+  if (target.keyRequired && !target.apiKey) {
     openModal('setupModal', '#setupProxy');
     return finalStatus;
   }
 
   const queuedAttachments = composerAttachments;
-  const overrideModel = queuedFollowUp ? queuedFollowUp.modelOverride : modelOverride;
   const addedDocs = [];
   const previousTitle = conv?.title;
+  let userMsg = null;
+  const assistantMsg = { role: 'assistant', content: '', swipes: [''], swipeIndex: 0, timestamp: Date.now() };
   if (!isRegenFromFork) {
     let userContent;
     if (composerAttachments.length > 0) {
@@ -10961,9 +10831,9 @@ async function sendMessage({ queuedFollowUp = null } = {}) {
       userContent = text;
     }
 
-    const userMsg = { role: 'user', content: userContent, timestamp: Date.now() };
+    userMsg = { role: 'user', content: userContent, timestamp: Date.now() };
     updateMessageTokenMetadata(userMsg);
-    messages.push(userMsg);
+    messageList.push(userMsg);
     if (conv) {
       if (queuedFollowUp) conv.queuedFollowUps.shift();
       else delete conv.draft;
@@ -10981,11 +10851,13 @@ async function sendMessage({ queuedFollowUp = null } = {}) {
     } catch (err) {
       if (conv && queuedFollowUp) conv.queuedFollowUps.unshift(queuedFollowUp);
       if (conv && addedDocs.length) conv.docs = (conv.docs || []).filter(doc => !addedDocs.includes(doc));
-      messages.pop();
+      const index = messageList.indexOf(userMsg);
+      if (index !== -1) messageList.splice(index, 1);
       if (!queuedFollowUp) restoreComposerSnapshot(conv, input, originalText, queuedAttachments, overrideModel);
       showToast('Could not save your message before sending: ' + sanitizeErrorDetail(err), 'error');
       return finalStatus;
     }
+    assertRequestOwner(conv, messageList, userMsg);
 
     // Auto-title
     if (conv && conv.title === 'New Chat') {
@@ -10995,28 +10867,14 @@ async function sendMessage({ queuedFollowUp = null } = {}) {
     }
   }
 
-  renderMessages();
-
-  const assistantMsg = { role: 'assistant', content: '', swipes: [''], swipeIndex: 0, timestamp: Date.now() };
-  messages.push(assistantMsg);
-
-  const area = document.getElementById('messagesArea');
-  const wrapper = document.createElement('div');
-  wrapper.className = 'msg-wrapper assistant';
-  const bubble = document.createElement('div');
-  bubble.className = 'msg-bubble assistant';
-  bubble.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
-  maybeAddAvatar(wrapper);
-  wrapper.appendChild(bubble);
-  area.appendChild(wrapper);
-  area.scrollTop = area.scrollHeight;
-
-  const requestContext = await buildRequestMessages(conv, { messageList: messages });
+  assertRequestOwner(conv, messageList);
+  const requestContext = await buildRequestMessages(conv, { messageList: messageList.slice() });
+  assertRequestOwner(conv, messageList, userMsg || lastMsg);
   const apiMessages = requestContext.messages;
-  if (guardContextLimit(requestContext, overrideModel)) {
-    messages.pop();
+  if (guardTargetContextLimit(apiMessages, target, target.maxTokens || 8192)) {
     if (!isRegenFromFork) {
-      messages.pop();
+      const index = messageList.indexOf(userMsg);
+      if (index !== -1) messageList.splice(index, 1);
       if (conv) {
         if (addedDocs.length) conv.docs = (conv.docs || []).filter(doc => !addedDocs.includes(doc));
         if (queuedFollowUp) conv.queuedFollowUps.unshift(queuedFollowUp);
@@ -11033,23 +10891,27 @@ async function sendMessage({ queuedFollowUp = null } = {}) {
     return finalStatus;
   }
 
-  finalStatus = await streamResponse(apiMessages, assistantMsg, 0, bubble, overrideModel, null, { conv });
+  messageList.push(assistantMsg);
+  renderMessages();
+  const bubble = document.querySelector('.msg-wrapper[data-msg-idx="' + messageList.indexOf(assistantMsg) + '"] .msg-bubble');
+  if (bubble) bubble.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
+  finalStatus = await streamResponse(apiMessages, assistantMsg, 0, bubble, target.model, null, { conv, messageList, target, toolPolicy });
 
+  assertRequestOwner(conv, messageList, assistantMsg, null);
   if (getSwipeRequest(assistantMsg)?.status === 'complete') {
-    extractMemories(apiMessages, conv);
+    extractMemories(apiMessages, conv, target);
   }
   if (conv) conv.updatedAt = Date.now();
   debouncedSave();
   renderMessages({ preserveScroll: true });
   updateTokenInfo();
+  } catch (error) {
+    finalStatus = error.name === 'AbortError' ? 'stopped' : error.requestStatus || 'failed';
+    if (error.name !== 'AbortError') showToast(sanitizeErrorDetail(error), 'error');
+    renderMessages({ preserveScroll: true });
   } finally {
+    if (foregroundAction) foregroundAction.status = finalStatus;
     endSendingAction();
-    if (finalStatus === 'complete' && armedFollowUpConversationIds.has(requestConvId)) {
-      setTimeout(() => processQueuedFollowUps(requestConvId), 0);
-    } else if (armedFollowUpConversationIds.delete(requestConvId)) {
-      renderFollowUpQueue();
-      renderSidebar();
-    }
   }
   return finalStatus;
 }
@@ -11072,28 +10934,30 @@ async function regenerate() {
     return;
   }
   const conv = getActiveConv();
-  const requestContext = await buildRequestMessages(conv, { messageList: messages, untilIndex: lastIdx });
-  if (guardContextLimit(requestContext)) return;
-  if (!msg.swipes) msg.swipes = [msg.content];
-  msg.swipes.push('');
-  msg.swipeIndex = msg.swipes.length - 1;
-  msg.content = '';
+  const messageList = messages;
+  const target = getActiveRequestTarget();
+  const toolPolicy = getToolPolicy(conv);
+  const requestContext = await buildRequestMessages(conv, { messageList: messageList.slice(), untilIndex: lastIdx });
+  assertRequestOwner(conv, messageList, msg);
+  if (guardTargetContextLimit(requestContext.messages, target, target.maxTokens || 8192)) return;
+  const swipeIdx = addAssistantSwipe(msg);
   renderMessages();
 
-  const area = document.getElementById('messagesArea');
-  const wrappers = area.querySelectorAll('.msg-wrapper.assistant');
-  const lastWrapper = wrappers[wrappers.length - 1];
-  const bubble = lastWrapper.querySelector('.msg-bubble');
+  const bubble = document.querySelector('.msg-wrapper[data-msg-idx="' + lastIdx + '"] .msg-bubble');
   bubble.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
 
   const apiMessages = requestContext.messages;
 
-  await saveConversationImmediately();
-  await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, null, { conv });
+  const status = await streamResponse(apiMessages, msg, swipeIdx, bubble, target.model, null, { conv, messageList, target, toolPolicy });
+  assertRequestOwner(conv, messageList, msg, null);
   if (conv) conv.updatedAt = Date.now();
   debouncedSave();
   renderMessages({ preserveScroll: true });
   updateTokenInfo();
+  return status;
+  } catch (error) {
+    if (foregroundAction) foregroundAction.status = error.name === 'AbortError' ? 'stopped' : error.requestStatus || 'failed';
+    if (error.name !== 'AbortError') showToast(sanitizeErrorDetail(error), 'error');
   } finally {
     endSendingAction();
   }
@@ -11105,7 +10969,8 @@ async function regenerate() {
 async function continueMessage() {
   if (readOnlyShare || !beginSendingAction()) return;
   try {
-  if (NO_TRAILING_ASSISTANT_RE.test(localStorage.getItem('llmModel') || '')) {
+  const target = getActiveRequestTarget();
+  if (NO_TRAILING_ASSISTANT_RE.test(target.model)) {
     showToast('Continue is not supported by this model. Start a new user turn instead.', 'error');
     return;
   }
@@ -11124,26 +10989,33 @@ async function continueMessage() {
   if (!existingText.trim()) return;
 
   const conv = getActiveConv();
+  const messageList = messages;
+  const sourceSwipe = msg.swipeIndex || 0;
+  const toolPolicy = getToolPolicy(conv);
   const requestContext = await buildRequestMessages(conv, {
-    messageList: messages,
+    messageList: messageList.slice(),
     untilIndex: lastIdx + 1,
     targetIndex: lastIdx,
     includeTarget: true
   });
+  assertRequestOwner(conv, messageList, msg);
   const apiMessages = requestContext.messages;
-  if (guardContextLimit(requestContext)) return;
+  if (guardTargetContextLimit(apiMessages, target, target.maxTokens || 8192)) return;
+  const swipeIdx = addAssistantSwipe(msg, sourceSwipe);
+  renderMessages();
 
-  const area = document.getElementById('messagesArea');
-  const wrappers = area.querySelectorAll('.msg-wrapper.assistant');
-  const lastWrapper = wrappers[wrappers.length - 1];
-  const bubble = lastWrapper.querySelector('.msg-bubble');
+  const bubble = document.querySelector('.msg-wrapper[data-msg-idx="' + lastIdx + '"] .msg-bubble');
 
-  await saveConversationImmediately();
-  await streamResponse(apiMessages, msg, msg.swipeIndex, bubble, null, existingText, { conv });
+  const status = await streamResponse(apiMessages, msg, swipeIdx, bubble, target.model, existingText, { conv, messageList, target, toolPolicy });
+  assertRequestOwner(conv, messageList, msg, null);
   if (conv) conv.updatedAt = Date.now();
   debouncedSave();
   renderMessages({ preserveScroll: true });
   updateTokenInfo();
+  return status;
+  } catch (error) {
+    if (foregroundAction) foregroundAction.status = error.name === 'AbortError' ? 'stopped' : error.requestStatus || 'failed';
+    if (error.name !== 'AbortError') showToast(sanitizeErrorDetail(error), 'error');
   } finally {
     endSendingAction();
   }
@@ -11153,10 +11025,12 @@ async function continueMessage() {
 // Clear Chat
 // ============================================
 function clearChat() {
-  if (readOnlyShare) return;
+  if (!prepareConversationTransition()) return;
   if (!confirm('Clear this conversation?')) return;
   const conv = getActiveConv();
   if (conv) {
+    invalidateConversationContext(conv);
+    contextDrafts.delete(conv);
     conv.messages = [];
     conv.title = 'New Chat';
     conv.summary = '';
@@ -11170,6 +11044,7 @@ function clearChat() {
     renderSidebar();
   }
   renderMessages();
+  restoreActiveDraft();
   updateTokenInfo();
 }
 
@@ -11186,7 +11061,7 @@ const EXPORT_SETTING_ALLOWLIST = [
   'llmForceSearch', 'llmMemoryEnabled', 'llmHoldScreenshot', 'llmEmotionSprites', 'llmEmotionSpriteSet', 'llmPromptEntries',
   'llmUrlFetch', 'llmToolConfirm', 'llmSearchApiUrl', 'llmCorsProxy',
   'assistantTheme', 'assistantStarterPrompts', 'assistantStarterPromptsHidden',
-  'assistantCustomTheme', 'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth'
+  'assistantCustomTheme', 'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth', 'assistantPresets'
 ];
 const IMPORT_SETTING_URL_KEYS = new Set(['llmProxyUrl', 'llmSearchApiUrl', 'llmCorsProxy']);
 const IMPORT_SETTING_ALLOWLIST = EXPORT_SETTING_ALLOWLIST.filter(key => ![
@@ -11208,7 +11083,9 @@ function buildSafeExportSettings() {
   const settings = {};
   EXPORT_SETTING_ALLOWLIST.forEach(key => {
     const value = localStorage.getItem(key);
-    if (value !== null) settings[key] = IMPORT_SETTING_URL_KEYS.has(key) ? sanitizeStoredUrl(value) : value;
+    if (value === null) return;
+    const safe = IMPORT_SETTING_URL_KEYS.has(key) ? sanitizeStoredUrl(value) : normalizeStructuredSettingValue(key, value);
+    if (safe !== undefined) settings[key] = safe;
   });
   return settings;
 }
@@ -11243,22 +11120,28 @@ function exportConversation() {
   URL.revokeObjectURL(url);
 }
 
-function exportAllConversations() {
-  const persistentConversations = getPersistentConversations();
+async function exportAllConversations() {
+  if (readOnlyShare) return;
+  try {
+  persistDraftFromUI();
+  if (_projectAutosaveTimer && !await flushProjectAutosave()) throw new Error('Project changes could not be saved.');
+  await saveConversationImmediately();
+  if (!await saveProjects(true)) throw new Error('Project changes could not be saved.');
+  const memories = await loadMemories();
+  const snapshot = db ? await syncCapturePullSnapshot() : { conversations: getPersistentConversations(), projects, memories };
+  const persistentConversations = snapshot.conversations;
   const data = {
     schema: EXPORT_SCHEMA,
     version: EXPORT_VERSION,
     conversations: persistentConversations,
     // Advertised as a full backup, so project instructions and files ride along too.
-    projects: projects,
-    memories: [],
+    projects: snapshot.projects,
+    memories: snapshot.memories,
     drafts: persistentConversations.filter(conv => conv.draft).map(conv => ({ conversationId: conv.id, ...conv.draft })),
     exportedAt: new Date().toISOString(),
     settings: buildSafeExportSettings(),
     profiles: buildSafeExportProfiles()
   };
-  loadMemories().then(memories => {
-    data.memories = memories;
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -11266,7 +11149,8 @@ function exportAllConversations() {
     a.download = 'assistant-export-' + new Date().toISOString().slice(0, 10) + '.json';
     a.click();
     URL.revokeObjectURL(url);
-  }).catch(() => showToast('Could not prepare export.', 'error'));
+    return data;
+  } catch (error) { showToast('Could not prepare export: ' + sanitizeErrorDetail(error), 'error'); return null; }
 }
 
 function normalizeImportedData(data) {
@@ -11276,9 +11160,10 @@ function normalizeImportedData(data) {
   let rawConversations = Array.isArray(data.conversations) ? data.conversations : [];
   if (!rawConversations.length && data.conversation && typeof data.conversation === 'object') rawConversations = [data.conversation];
   if (!rawConversations.length && Array.isArray(data.messages)) rawConversations = [{ id: genId(), title: data.title || 'Imported Chat', messages: data.messages }];
-  const importedConversations = rawConversations.map(raw => {
-    const conv = normalizeConversationRecord(JSON.parse(JSON.stringify(raw)));
+  const importedConversations = normalizeLoadedConversations(rawConversations).conversations.map(conv => {
     conv.toolPolicy = null;
+    // An imported file cannot assert that it has seen this browser's saved revisions.
+    delete conv.syncVersion;
     delete conv.shareGistId;
     delete conv.shareUrl;
     delete conv.shareId;
@@ -11293,7 +11178,7 @@ function normalizeImportedData(data) {
   }));
   const importedProjects = normalizeProjectList(data.projects);
   const importedMemories = normalizeMemoryList(Array.isArray(data.memories) ? data.memories : []).memories;
-  const drafts = Array.isArray(data.drafts) ? data.drafts.map(draft => ({ ...draft })) : [];
+  const drafts = Array.isArray(data.drafts) ? data.drafts.filter(draft => draft && typeof draft === 'object').map(draft => ({ ...draft })) : [];
   const settings = {};
   Object.keys(data.settings || {}).forEach(key => {
     if (IMPORT_SETTING_ALLOWLIST.includes(key)) {
@@ -11390,33 +11275,6 @@ function applySelectedImport() {
   return applyImport(mode);
 }
 
-function mergeConversationRecords(localList, importedList) {
-  const byId = new Map((localList || []).map(raw => {
-    const conv = normalizeConversationRecord(raw);
-    return [conv.id, conv];
-  }));
-  (importedList || []).forEach(raw => {
-    const incoming = normalizeConversationRecord(raw);
-    const current = byId.get(incoming.id);
-    if (!current || Number(incoming.updatedAt) > Number(current.updatedAt)) byId.set(incoming.id, incoming);
-  });
-  return Array.from(byId.values());
-}
-
-function applySafeImportedSettings(settings, profiles = []) {
-  Object.entries(settings || {}).forEach(([key, value]) => {
-    if (IMPORT_SETTING_ALLOWLIST.includes(key)) {
-      const safeValue = IMPORT_SETTING_URL_KEYS.has(key) ? sanitizeStoredUrl(value) : normalizeStructuredSettingValue(key, value);
-      if (safeValue !== undefined && safeValue !== null) localStorage.setItem(key, safeValue);
-    }
-  });
-  if (profiles.length) {
-    const existing = loadProfiles();
-    const merged = mergeByUpdatedId(existing, profiles.map(sanitizeImportedProfileRecord));
-    saveProfiles(merged);
-  }
-}
-
 function mergeByUpdatedId(localList, incomingList) {
   const byId = new Map((localList || []).filter(item => item?.id).map(item => [item.id, item]));
   (incomingList || []).filter(item => item?.id).forEach(item => {
@@ -11445,23 +11303,44 @@ function remapCopiedConversationParents(copies, idMap) {
 }
 
 async function applyImport(mode = 'merge') {
-  if (readOnlyShare || !pendingImport) return;
+  if (readOnlyShare || !pendingImport) return false;
   if (sending || streaming || queueingFollowUp) {
     showToast('Stop the current response before importing.', 'info');
     return;
   }
+  if (pendingAttachmentReads > 0) {
+    showToast('Wait for attachments to finish reading before importing.', 'info');
+    return false;
+  }
   if (!['merge', 'copy', 'replace'].includes(mode)) return;
   if (!beginLocalDataOperation()) return;
+  let committed = false;
   try {
+  if (!db) throw new Error('Import needs a working browser database. Free storage and reload, then retry.');
   const imported = pendingImport;
   const previousActiveConvId = activeConvId;
   if (mode === 'replace' && !confirm('Replace imported categories? This removes local conversations, projects, memories, and drafts.')) return;
   if ((mode === 'replace' && hasPublicShareIds(conversations)) || (mode !== 'replace' && hasPublicShareIds(imported.conversations))) {
     if (!confirm('Some records have public share IDs. Deleting or replacing them does not revoke the public links. Continue?')) return;
   }
+  flushSettingsAutosaves();
+  persistDraftFromUI();
+  if (_projectAutosaveTimer && !await flushProjectAutosave()) throw new Error('Project changes could not be saved. Retry before importing.');
+  if (!await saveProjects(true)) throw new Error('Project changes could not be saved. Retry before importing.');
+  await saveConversationImmediately();
+  await loadMemories();
+  const snapshot = await syncCapturePullSnapshot();
   let importedConversations = imported.conversations.map(conv => normalizeConversationRecord(JSON.parse(JSON.stringify(conv))));
   let importedProjects = JSON.parse(JSON.stringify(imported.projects));
   let importedMemories = imported.memories.slice();
+  imported.drafts.forEach(draft => {
+    const conv = importedConversations.find(item => item.id === draft.conversationId);
+    if (conv && (!conv.draft || Number(draft.updatedAt || 0) > Number(conv.draft.updatedAt || 0))) {
+      conv.draft = { text: typeof draft.text === 'string' ? draft.text : '', attachments: cloneDraftAttachments(draft.attachments), updatedAt: Number(draft.updatedAt) || Date.now() };
+      conv.updatedAt = Math.max(conv.updatedAt, conv.draft.updatedAt);
+      delete conv.syncVersion;
+    }
+  });
   const copyConversationIds = new Map();
   if (mode === 'copy') {
     const projectIds = new Map();
@@ -11474,6 +11353,9 @@ async function applyImport(mode = 'merge') {
       const copy = normalizeConversationRecord(JSON.parse(JSON.stringify(conv)));
       copyConversationIds.set(conv.id, copy.id = genId());
       copy.updatedAt = Date.now();
+      delete copy.syncVersion;
+      delete copy.conflictOf;
+      delete copy.conflictTitle;
       if (copy.projectId) copy.projectId = projectIds.get(copy.projectId) || copy.projectId;
       delete copy.shareGistId;
       delete copy.shareUrl;
@@ -11484,61 +11366,57 @@ async function applyImport(mode = 'merge') {
     remapCopiedConversationParents(importedConversations, copyConversationIds);
     importedMemories = importedMemories.map(memory => ({ ...memory, id: 'mem_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7) }));
   }
-  const localTombstones = syncLoadTombstones();
-  let resurrected = false;
+  const localTombstones = syncCloneJson(snapshot.tombstones);
   const resurrect = (records, category, timestampKey) => records.forEach(record => {
     const deletedAt = Number(localTombstones[category][record.id]) || 0;
     if (!deletedAt) return;
     record[timestampKey] = Math.max(Date.now(), deletedAt + 1, Number(record[timestampKey]) || 0);
     delete localTombstones[category][record.id];
-    resurrected = true;
+    if (category === 'conversations') delete localTombstones.conversationVersions[record.id];
   });
   resurrect(importedConversations, 'conversations', 'updatedAt');
   resurrect(importedProjects, 'projects', 'updatedAt');
   resurrect(importedMemories, 'memories', 'createdAt');
-  if (resurrected) syncSaveTombstones(localTombstones);
   if (sending || streaming || queueingFollowUp) {
     showToast('Stop the current response before importing.', 'info');
     return;
   }
+  const merged = mode === 'replace' ? { conversations: importedConversations, conflicts: [] }
+    : await syncMergeConversationLists(snapshot.conversations, importedConversations);
+  const nextProjects = mode === 'replace' ? importedProjects : syncMergeProjectLists(snapshot.projects, importedProjects);
+  const nextMemories = mode === 'replace' ? importedMemories : syncMergeMemoryLists(snapshot.memories, importedMemories);
   if (mode === 'replace') {
-    const incomingConversationIds = new Set(importedConversations.map(conv => conv.id));
-    const incomingProjectIds = new Set(importedProjects.map(project => project.id));
-    const incomingMemoryIds = new Set(importedMemories.map(memory => memory.id));
-    const localMemories = await loadMemories();
-    if (sending || streaming || queueingFollowUp) {
-      showToast('Stop the current response before importing.', 'info');
-      return;
-    }
-    syncRecordTombstones('conversations', conversations.filter(conv => !incomingConversationIds.has(conv.id)).map(conv => conv.id));
-    syncRecordTombstones('projects', projects.filter(project => !incomingProjectIds.has(project.id)).map(project => project.id));
-    syncRecordTombstones('memories', localMemories.filter(memory => !incomingMemoryIds.has(memory.id)).map(memory => memory.id));
-    replacePersistentConversations(importedConversations, false);
-    projects = importedProjects;
-    await saveMemories(importedMemories);
-  } else {
-    const persistent = getPersistentConversations();
-    const nextConversations = mode === 'copy' ? persistent.concat(importedConversations) : mergeConversationRecords(persistent, importedConversations);
-    replacePersistentConversations(nextConversations, true);
-    projects = mode === 'copy' ? projects.concat(importedProjects) : mergeByUpdatedId(projects, importedProjects);
-    const localMemories = await loadMemories();
-    await saveMemories(mode === 'copy' ? localMemories.concat(importedMemories) : syncMergeMemoryLists(localMemories, importedMemories));
+    [['conversations', importedConversations, 'updatedAt'], ['projects', nextProjects, 'updatedAt'], ['memories', nextMemories, 'createdAt']].forEach(([category, incoming, timestamp]) => {
+      const ids = new Set(incoming.map(record => record.id));
+      snapshot[category].forEach(record => {
+        if (!ids.has(record.id)) {
+          localTombstones[category][record.id] = Math.max(Date.now(), Number(record[timestamp]) || 0);
+          if (category === 'conversations') localTombstones.conversationVersions[record.id] = normalizeConversationVersion(record.syncVersion);
+        }
+      });
+    });
   }
-  imported.drafts.forEach(draft => {
-    const conversationId = mode === 'copy' ? copyConversationIds.get(draft.conversationId) : draft.conversationId;
-    const conv = conversations.find(item => item.id === conversationId && !isTemporaryConversation(item));
-    if (conv && (!conv.draft || Number(draft.updatedAt || 0) > Number(conv.draft.updatedAt || 0))) conv.draft = { text: draft.text || '', attachments: cloneDraftAttachments(draft.attachments), updatedAt: draft.updatedAt || Date.now() };
-  });
-  applySafeImportedSettings(imported.settings, imported.profiles);
+  const settingsValues = { ...imported.settings, [SYNC_TOMBSTONES_KEY]: JSON.stringify(localTombstones) };
+  if (imported.profiles.length) {
+    const existing = JSON.parse(snapshot.settingsValues.assistantProfiles || '[]');
+    settingsValues.assistantProfiles = JSON.stringify(mergeByUpdatedId(Array.isArray(existing) ? existing.map(sanitizeProfileRecord) : [], imported.profiles.map(sanitizeImportedProfileRecord)));
+  }
+  const nextActiveId = mode !== 'replace' && merged.conversations.some(conv => conv.id === previousActiveConvId)
+    ? previousActiveConvId : (merged.conversations[0]?.id || '');
+  const saved = await syncPersistPullData({ conversations: merged.conversations, projects: nextProjects, memories: nextMemories, persistentActiveId: nextActiveId, settingsValues }, snapshot);
+  committed = true;
+  replacePersistentConversations(saved.conversations, mode !== 'replace');
+  projects = saved.projects;
+  setConversationBaseline(saved.conversations);
+  projectBaseline = new Map(projects.map(project => [project.id, serializeConversation(project)]));
   armedFollowUpConversationIds.clear();
   activeConvId = mode !== 'replace' && conversations.some(conv => conv.id === previousActiveConvId)
     ? previousActiveConvId
     : (conversations[0]?.id || null);
   messages = getActiveConv()?.messages || [];
-  await saveConversationImmediately();
-  await saveProjects();
   pendingImport = null;
   pendingImportMeta = null;
+  try {
   closeModal('importPreviewModal');
   if (document.getElementById('settingsModal')?.classList.contains('open')) closeModal('settingsModal');
   renderSidebar();
@@ -11546,7 +11424,17 @@ async function applyImport(mode = 'merge') {
   restoreActiveDraft();
   updateTokenInfo();
   renderConnectionChip();
+  syncRefreshAppliedSettings();
+  } catch (error) { console.warn('Import committed; interface refresh failed:', error); }
+  notifyConversationConflicts(saved.conversations.filter(conv => conv.conflictOf).map(conv => conv.id));
+  syncScheduleAutoPush();
   showToast('Import applied (' + mode + ').', 'success');
+  return true;
+  } catch (error) {
+    console.error(committed ? 'Import refresh failed:' : 'Import was not applied:', error);
+    showToast(committed ? 'Import was saved, but the display could not be refreshed. Reload this tab.' :
+      'Import was not applied: ' + sanitizeErrorDetail(error) + ' Keep the file and retry after resolving the problem.', 'error', 0);
+    return committed;
   } finally {
     endLocalDataOperation();
   }
@@ -11572,6 +11460,10 @@ async function renderStorageSummary() {
 
 async function clearDataCategory(category) {
   if (readOnlyShare) return;
+  if (category === 'conversations' && (sending || streaming || queueingFollowUp)) {
+    showToast('Stop the current response before clearing conversations.', 'info');
+    return;
+  }
   const labels = { conversations: 'conversations', drafts: 'drafts', memories: 'memories', credentials: 'provider, search, and sync credentials' };
   if (!labels[category] || !confirm('Clear ' + labels[category] + '? This cannot be undone.')) return;
   if (!beginLocalDataOperation()) return;
@@ -11582,8 +11474,10 @@ async function clearDataCategory(category) {
     conversations = [];
     activeConvId = null;
     createConversation();
+    await saveConversationImmediately();
   } else if (category === 'drafts') {
     conversations.forEach(conv => {
+      if (conv.draft?.text || conv.draft?.attachments?.length || conv.queuedFollowUps?.length) conv.updatedAt = Math.max(Date.now(), (Number(conv.updatedAt) || 0) + 1);
       delete conv.draft;
       conv.queuedFollowUps = [];
     });
@@ -11599,16 +11493,21 @@ async function clearDataCategory(category) {
   } else if (category === 'credentials') {
     ['llmApiKey', 'llmSearchApiKey'].forEach(key => { localStorage.removeItem(key); sessionStorage.removeItem(key); });
     ['assistantSyncGistToken', 'assistantSyncPassphrase', 'assistantSyncGistId', 'assistantSyncSalt', 'assistantSyncLastHash', 'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, SYNC_STATE_GIST_KEY, SYNC_AUTO_PUSH_KEY, SYNC_AUTO_PENDING_KEY].forEach(key => localStorage.removeItem(key));
-    ['setKey', 'setSearchApiKey', 'setupKey', 'setSyncToken', 'setSyncGistId', 'setSyncPassphrase'].forEach(id => {
+    ['setKey', 'setSearchApiKey', 'setupKey', 'setSyncToken', 'setSyncGistId', 'setSyncPassphrase', 'syncPairingText', 'syncPairingCode'].forEach(id => {
       const input = document.getElementById(id);
       if (input) input.value = '';
     });
     scrubProfileSecrets();
+    const canvas = document.getElementById('syncPairingQr');
+    if (canvas) canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+    document.getElementById('syncPairingOutput').hidden = true;
     renderSyncSettings();
   }
   await renderStorageSummary();
   renderConnectionChip();
   showToast('Cleared ' + labels[category] + '.', 'success');
+  } catch (error) {
+    reportPersistenceError(error);
   } finally {
     endLocalDataOperation();
   }
@@ -11715,11 +11614,14 @@ function synapseSelfTest() {
     const legacySettings = syncNormalizeSettingsPayload({ exportedAt: '2026-01-01T00:00:00Z', settings: { assistantTheme: 'dark' } });
     assert(legacySettings.settings.assistantTheme === 'dark' && !Object.prototype.hasOwnProperty.call(legacySettings.settings, 'llmPromptEntries'), 'legacy settings presence');
     assert(syncConversationFileName('a.b') !== syncConversationFileName('a:b'), 'sync filename uniqueness');
-    const merged = mergeConversationRecords([{ id: 'same', updatedAt: 1, messages: [] }], [{ id: 'same', updatedAt: 2, messages: [{ role: 'user', content: 'newer' }] }]);
-    assert(merged[0].messages.length === 1, 'import merge');
+    assert(chooseConversationWinner({ id: 'same', updatedAt: 2, messages: [{ role: 'user', content: 'newer' }] }, { id: 'same', updatedAt: 1, messages: [] }) === null, 'unknown divergent history needs a copy');
     const storedConversation = { id: 'persist', updatedAt: 1, messages: [] };
     const appendedConversation = { id: 'persist', updatedAt: 1, messages: [{ role: 'assistant', content: 'reply' }] };
     assert(chooseConversationWinner(appendedConversation, storedConversation, serializeConversation(storedConversation)) === appendedConversation, 'same-tab persistence');
+    const occupied = { id: 'collision', title: 'Unrelated', messages: [] };
+    const collisionRecords = new Map([['persist', storedConversation], ['collision', occupied]]);
+    const recoveredCollision = reconcileConversationRecord(collisionRecords, appendedConversation, 'collision');
+    assert(recoveredCollision.id !== 'collision' && collisionRecords.get('collision') === occupied && recoveredCollision.messages.length === 1, 'conflict IDs do not overwrite unrelated records');
     assert(syncFilterDeletedRecords([storedConversation], { persist: 2 }, 'updatedAt').length === 0, 'conversation tombstone filtering');
     const originalConversations = conversations;
     const originalActiveConvId = activeConvId;
@@ -11830,15 +11732,21 @@ function syncUpdateGistScope(nextGistId, previousGistId = '') {
 }
 
 function syncScheduleAutoPush() {
-  if (readOnlyShare || localStorage.getItem(SYNC_AUTO_PUSH_KEY) !== 'true') return;
-  localStorage.setItem(SYNC_AUTO_PENDING_KEY, 'true');
-  clearTimeout(_syncAutoPushTimer);
-  _syncAutoPushTimer = setTimeout(syncRunAutoPush, SYNC_AUTO_PUSH_DELAY);
+  try {
+    if (readOnlyShare || localStorage.getItem(SYNC_AUTO_PUSH_KEY) !== 'true') return;
+    localStorage.setItem(SYNC_AUTO_PENDING_KEY, 'true');
+    clearTimeout(_syncAutoPushTimer);
+    _syncAutoPushTimer = setTimeout(syncRunAutoPush, SYNC_AUTO_PUSH_DELAY);
+  } catch (error) {
+    console.warn('Could not schedule automatic sync:', error);
+    syncSetStatus('unknown', 'Auto-push unavailable', 'Browser storage failed. Local database saves are separate; retry sync after freeing storage.');
+  }
 }
 
 async function syncRunAutoPush() {
   clearTimeout(_syncAutoPushTimer);
   _syncAutoPushTimer = null;
+  try {
   if (readOnlyShare || localStorage.getItem(SYNC_AUTO_PUSH_KEY) !== 'true' ||
       localStorage.getItem(SYNC_AUTO_PENDING_KEY) !== 'true' || navigator.onLine === false) return false;
   if (_syncOperationInFlight) return false;
@@ -11856,6 +11764,11 @@ async function syncRunAutoPush() {
   }
   if (localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
   return true;
+  } catch (error) {
+    console.warn('Automatic sync failed:', error);
+    syncSetStatus('unknown', 'Auto-push unavailable', 'Browser storage failed. Free storage and retry.');
+    return false;
+  }
 }
 
 function syncToggleAutoPush(input) {
@@ -11873,20 +11786,54 @@ function syncToggleAutoPush(input) {
 }
 
 function syncSaveSettings(showSavedToast = true, schedule = true) {
+  const applied = [];
+  let previous;
+  try {
+  previous = syncGetStoredConfig();
   const cfg = syncGetConfigFromInputs();
   const previousGistId = localStorage.getItem('assistantSyncGistId') || '';
-  syncUpdateGistScope(cfg.gistId, previousGistId);
-  syncSetStoredValue('assistantSyncGistToken', cfg.token);
-  syncSetStoredValue('assistantSyncGistId', cfg.gistId);
-  syncSetStoredValue('assistantSyncPassphrase', cfg.passphrase);
+  const scoped = localStorage.getItem(SYNC_STATE_GIST_KEY) || '';
   const autoPush = cfg.autoPush && syncAutoPushIsConfigured(cfg);
-  localStorage.setItem(SYNC_AUTO_PUSH_KEY, autoPush ? 'true' : 'false');
-  if (!autoPush) localStorage.removeItem(SYNC_AUTO_PENDING_KEY);
+  const values = {
+    assistantSyncGistToken: cfg.token || null, assistantSyncGistId: cfg.gistId || null,
+    assistantSyncPassphrase: cfg.passphrase || null, [SYNC_STATE_GIST_KEY]: cfg.gistId || null,
+    [SYNC_AUTO_PUSH_KEY]: autoPush ? 'true' : 'false'
+  };
+  if ((scoped && scoped !== cfg.gistId) || (!scoped && previousGistId && previousGistId !== cfg.gistId)) {
+    [SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, 'assistantSyncSalt', 'assistantSyncLastHash',
+      'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_AUTO_PENDING_KEY].forEach(key => { values[key] = null; });
+  }
+  if (!autoPush) values[SYNC_AUTO_PENDING_KEY] = null;
+  Object.entries(values).sort((a, b) => Number(a[1] === null) - Number(b[1] === null)).forEach(([key, after]) => {
+    const before = localStorage.getItem(key);
+    if (before === after) return;
+    if (after === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, after);
+    applied.push({ key, before, after });
+  });
   cfg.autoPush = autoPush;
   renderSyncSettings();
   if (schedule && autoPush) syncScheduleAutoPush();
   if (showSavedToast) showToast('Sync settings saved.', 'success');
   return cfg;
+  } catch (error) {
+    applied.reverse().forEach(({ key, before, after }) => {
+      try {
+        if (localStorage.getItem(key) !== after) return;
+        if (before === null) localStorage.removeItem(key);
+        else localStorage.setItem(key, before);
+      } catch (restoreError) { console.error('Could not restore sync setting:', key, restoreError); }
+    });
+    if (previous?.gistId) {
+      [['setSyncToken', previous.token], ['setSyncGistId', previous.gistId], ['setSyncPassphrase', previous.passphrase]].forEach(([id, value]) => {
+        const input = document.getElementById(id);
+        if (input) input.value = value;
+      });
+    }
+    syncSetStatus('unknown', 'Settings not saved', 'Browser storage failed. Keep the existing pairing details and retry after freeing storage.');
+    if (showSavedToast) showToast('Could not save sync settings. Free storage and retry.', 'error');
+    return null;
+  }
 }
 
 function syncSetStatus(state, message, details) {
@@ -11918,7 +11865,8 @@ function setSyncBusy(busy) {
     composer.inert = busy;
     composer.setAttribute('aria-busy', String(busy));
   }
-  updateSendBtnState();
+  try { updateSendBtnState(); }
+  catch (error) { console.warn('Could not refresh composer state:', error); }
 }
 
 function renderSyncSettings() {
@@ -12120,12 +12068,16 @@ async function syncGetGistFileContent(gist, filename) {
 }
 
 async function syncReadManifest(gist, token) {
-  const content = await syncGetGistFileContent(gist, 'manifest.json', token);
-  const manifest = JSON.parse(content);
-  if (!manifest || manifest.app !== 'Synapse' || manifest.schema !== 'gist-sync-v1') {
-    throw new Error('This Gist does not look like a Synapse sync Gist.');
-  }
-  return manifest;
+  if (gist?.truncated) throw new Error('GitHub truncated the file list. Keep this Gist as a backup and start a new sync Gist; no data was changed.');
+  const hasUpdates = Object.keys(gist?.files || {}).some(name => /^synapse-update-[A-Za-z0-9_-]+\.json\.enc$/.test(name));
+  const hasLegacyChats = Object.keys(gist?.files || {}).some(name => /^conv_.+\.json\.enc$/.test(name));
+  try {
+    const manifest = JSON.parse(await syncGetGistFileContent(gist, 'manifest.json', token));
+    if (manifest?.app === 'Synapse' && ['gist-sync-v1', 'gist-sync-v2'].includes(manifest.schema)) return manifest;
+  } catch (error) { if (!hasUpdates && !hasLegacyChats) throw error; }
+  if (hasLegacyChats) return { app: 'Synapse', schema: 'gist-sync-v1', version: 1 };
+  if (hasUpdates) return { app: 'Synapse', schema: 'gist-sync-v2', version: 2 };
+  throw new Error('This Gist does not look like a Synapse sync Gist.');
 }
 
 function syncConversationFileName(id) {
@@ -12142,13 +12094,20 @@ function syncNormalizeConversation(conv) {
 
 function syncNormalizeTombstones(value) {
   const source = value && typeof value === 'object' ? value : {};
-  const normalized = { conversations: {}, projects: {}, memories: {} };
-  Object.keys(normalized).forEach(category => {
+  const normalized = { conversations: {}, projects: {}, memories: {}, conversationVersions: {}, conversationRoots: {} };
+  ['conversations', 'projects', 'memories'].forEach(category => {
     const entries = source[category] && typeof source[category] === 'object' ? source[category] : {};
     Object.entries(entries).forEach(([id, deletedAt]) => {
       const timestamp = Number(deletedAt);
       if (id && Number.isFinite(timestamp) && timestamp > 0) normalized[category][id] = timestamp;
     });
+  });
+  Object.entries(source.conversationVersions && typeof source.conversationVersions === 'object' ? source.conversationVersions : {}).forEach(([id, value]) => {
+    const version = normalizeConversationVersion(value);
+    if (Object.hasOwn(normalized.conversations, id) && Object.keys(version).length) normalized.conversationVersions[id] = version;
+  });
+  Object.entries(source.conversationRoots || {}).forEach(([id, root]) => {
+    if (Object.hasOwn(normalized.conversations, id) && typeof root === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(root)) normalized.conversationRoots[id] = root;
   });
   return normalized;
 }
@@ -12169,25 +12128,42 @@ function syncRecordTombstones(category, ids, deletedAt = Date.now()) {
     ? new Set(conversations.filter(isTemporaryConversation).map(conv => conv.id))
     : new Set();
   (ids || []).filter(id => id && !temporaryIds.has(id)).forEach(id => {
-    tombstones[category][id] = Math.max(Number(tombstones[category][id]) || 0, deletedAt);
+    const record = category === 'conversations' ? conversations.find(conv => conv.id === id) : null;
+    tombstones[category][id] = Math.max(Number(tombstones[category][id]) || 0, deletedAt, Number(record?.updatedAt) || 0);
+    if (record) {
+      const seen = { ...tombstones.conversationVersions[id] };
+      Object.entries(normalizeConversationVersion(record.syncVersion)).forEach(([writer, count]) => { seen[writer] = Math.max(Number(seen[writer]) || 0, count); });
+      tombstones.conversationVersions[id] = seen;
+      tombstones.conversationRoots[id] = record.conflictOf || id;
+    }
   });
   syncSaveTombstones(tombstones);
 }
 
 function syncRemoveTombstones(category, ids) {
   const tombstones = syncLoadTombstones();
-  (ids || []).forEach(id => delete tombstones[category]?.[id]);
+  (ids || []).forEach(id => {
+    delete tombstones[category]?.[id];
+    if (category === 'conversations') delete tombstones.conversationVersions[id];
+    if (category === 'conversations') delete tombstones.conversationRoots[id];
+  });
   syncSaveTombstones(tombstones);
 }
 
 function syncMergeTombstones(localValue, remoteValue) {
   const local = syncNormalizeTombstones(localValue);
   const remote = syncNormalizeTombstones(remoteValue);
-  Object.keys(local).forEach(category => {
+  ['conversations', 'projects', 'memories'].forEach(category => {
     Object.entries(remote[category]).forEach(([id, deletedAt]) => {
       local[category][id] = Math.max(Number(local[category][id]) || 0, deletedAt);
     });
   });
+  Object.entries(remote.conversationVersions).forEach(([id, version]) => {
+    const merged = { ...local.conversationVersions[id] };
+    Object.entries(version).forEach(([writer, count]) => { merged[writer] = Math.max(Number(merged[writer]) || 0, count); });
+    local.conversationVersions[id] = merged;
+  });
+  Object.assign(local.conversationRoots, remote.conversationRoots);
   return local;
 }
 
@@ -12333,119 +12309,86 @@ function syncApplySettings(state) {
 async function syncReadRemoteConversations(gist, manifest, passphrase, keyCache = {}) {
   const remoteConversations = [];
   const entries = Array.isArray(manifest.files?.conversations) ? manifest.files.conversations : [];
-  for (const entry of entries) {
-    if (!entry?.file) continue;
-    const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, entry.file), passphrase, keyCache);
-    if (payload?.conversation) remoteConversations.push(payload.conversation);
+  const files = new Set(entries.map(entry => entry?.file).filter(file => typeof file === 'string' && file));
+  Object.keys(gist?.files || {}).filter(name => /^conv_.+\.json\.enc$/.test(name)).forEach(name => files.add(name));
+  for (const filename of files) {
+    const payload = await syncDecryptPayload(await syncGetGistFileContent(gist, filename), passphrase, keyCache);
+    if (payload?.conversation) {
+      // Old clients can carry, but do not advance, newer persistence metadata.
+      delete payload.conversation.syncVersion;
+      remoteConversations.push(payload.conversation);
+    }
   }
   return remoteConversations;
 }
 
 async function syncReadRemoteData(gist, manifest, passphrase) {
+  const archiveBytes = Object.values(gist?.files || {}).reduce((sum, file) => sum + (Number(file?.size) || new TextEncoder().encode(file?.content || '').byteLength), 0);
+  if (archiveBytes > 64 * 1024 * 1024) throw new Error('This sync archive exceeds the 64 MiB read limit. Keep it and its passphrase for recovery; no local data was changed.');
   const keyCache = {};
   const decryptFile = async filename => syncDecryptPayload(
     await syncGetGistFileContent(gist, filename), passphrase, keyCache);
   const existingFile = (pointer, fallback) => pointer || (gist?.files?.[fallback] ? fallback : '');
-  const settingsFile = existingFile(manifest.files?.settings, 'settings.json.enc');
-  const memoriesFile = existingFile(manifest.files?.memories, 'memories.json.enc');
-  const projectsFile = existingFile(manifest.files?.projects, 'projects.json.enc');
-  const tombstonesFile = existingFile(manifest.files?.tombstones, 'tombstones.json.enc');
+  const legacy = manifest.schema === 'gist-sync-v1';
+  const settingsFile = legacy && existingFile(manifest.files?.settings, 'settings.json.enc');
+  const memoriesFile = legacy && existingFile(manifest.files?.memories, 'memories.json.enc');
+  const projectsFile = legacy && existingFile(manifest.files?.projects, 'projects.json.enc');
+  const tombstonesFile = legacy && existingFile(manifest.files?.tombstones, 'tombstones.json.enc');
   const settingsPayload = settingsFile ? await decryptFile(settingsFile) : {};
   const memoriesPayload = memoriesFile ? await decryptFile(memoriesFile) : {};
   const projectsPayload = projectsFile ? await decryptFile(projectsFile) : {};
   const tombstonesPayload = tombstonesFile ? await decryptFile(tombstonesFile) : {};
-  return {
+  const remote = {
     conversations: await syncReadRemoteConversations(gist, manifest, passphrase, keyCache),
     settingsState: syncNormalizeSettingsPayload(settingsPayload),
     memories: Array.isArray(memoriesPayload.memories) ? memoriesPayload.memories : [],
     projects: normalizeProjectList(projectsPayload.projects),
     tombstones: syncNormalizeTombstones(tombstonesPayload.tombstones)
   };
+  const updates = Object.keys(gist?.files || {}).filter(name => /^synapse-update-[A-Za-z0-9_-]+\.json\.enc$/.test(name)).sort();
+  for (const filename of updates) {
+    const update = await decryptFile(filename);
+    if (update?.app !== 'Synapse' || update.schema !== 'gist-sync-update-v2' || !Array.isArray(update.conversations) ||
+        !Array.isArray(update.memories) || !Array.isArray(update.projects)) throw new Error('Invalid sync update: ' + filename);
+    remote.tombstones = syncMergeTombstones(remote.tombstones, update.tombstones);
+    remote.settingsState = syncMergeSettingsStates(remote.settingsState, update.settingsState);
+    remote.conversations.push(...update.conversations);
+    remote.memories = syncMergeMemoryLists(remote.memories, update.memories);
+    remote.projects = syncMergeProjectLists(remote.projects, update.projects);
+  }
+  remote.conversations = (await syncMergeConversationLists([], remote.conversations, remote.tombstones.conversations, remote.tombstones.conversationVersions, remote.tombstones.conversationRoots)).conversations;
+  return remote;
 }
 
-// merged is already reconciled with the current Gist snapshot.
+// Each push owns a new file. GitHub leaves omitted files unchanged; no manifest race can hide an update.
 async function syncBuildGistFiles(passphrase, existingManifest = null, merged = null) {
-  clearTimeout(_saveDebounceTimer);
-
   const existingSalt = existingManifest?.salt || localStorage.getItem('assistantSyncSalt') || '';
   const context = await syncBuildCryptoContext(passphrase, existingSalt || null);
-  localStorage.setItem('assistantSyncSalt', context.saltBase64);
-
   const now = Date.now();
   const tombstones = syncNormalizeTombstones(merged?.tombstones || syncLoadTombstones());
   const settingsState = syncNormalizeSettingsPayload(merged?.settingsState || syncCollectSettingsState());
-  const settingsPayload = { version: 2, exportedAt: new Date(now).toISOString(), ...settingsState };
-  const memoriesPayload = {
-    version: 1,
-    exportedAt: new Date(now).toISOString(),
-    memories: syncFilterDeletedRecords(merged?.memories || await loadMemories(), tombstones.memories, 'createdAt')
-  };
-  const projectsPayload = {
-    version: 1,
-    exportedAt: new Date(now).toISOString(),
+  const payload = {
+    app: 'Synapse', schema: 'gist-sync-update-v2', version: 2, updatedAt: now,
+    tombstones, settingsState,
+    conversations: (await syncMergeConversationLists([], merged?.conversations || getPersistentConversations(), tombstones.conversations, tombstones.conversationVersions, tombstones.conversationRoots)).conversations,
+    memories: syncFilterDeletedRecords(merged?.memories || await loadMemories(), tombstones.memories, 'createdAt'),
     projects: syncFilterDeletedRecords(normalizeProjectList(merged?.projects || projects), tombstones.projects, 'updatedAt')
   };
-  const tombstonesPayload = { version: 1, exportedAt: new Date(now).toISOString(), tombstones };
-  const sourceConversations = merged?.conversations || getPersistentConversations();
-  const localConversations = syncFilterDeletedRecords(
-    sourceConversations.filter(conv => !isTemporaryConversation(conv)), tombstones.conversations, 'updatedAt').map(syncNormalizeConversation);
-  const files = {
-    'settings.json.enc': { content: await syncEncryptPayloadWithKey(settingsPayload, context) },
-    'memories.json.enc': { content: await syncEncryptPayloadWithKey(memoriesPayload, context) },
-    'projects.json.enc': { content: await syncEncryptPayloadWithKey(projectsPayload, context) },
-    'tombstones.json.enc': { content: await syncEncryptPayloadWithKey(tombstonesPayload, context) }
-  };
-
-  const conversationEntries = [];
-  for (const conv of localConversations) {
-    const filename = syncConversationFileName(conv.id);
-    const payload = { version: 1, exportedAt: new Date(now).toISOString(), conversation: conv };
-    files[filename] = { content: await syncEncryptPayloadWithKey(payload, context) };
-    conversationEntries.push({
-      id: conv.id,
-      file: filename,
-      updatedAt: Number(conv.updatedAt) || 0,
-      hash: await syncSha256Hex(conv)
-    });
-  }
-
+  const filename = 'synapse-update-' + syncBytesToBase64Url(syncRandomBytes(24)) + '.json.enc';
+  const content = await syncEncryptPayloadWithKey(payload, context);
+  if (new TextEncoder().encode(content).byteLength > 8 * 1024 * 1024) throw new Error('This encrypted snapshot exceeds the 8 MiB sync limit. Export a local backup and reduce attachments before retrying.');
+  const files = { [filename]: { content } };
   const manifest = {
-    version: 1,
-    app: 'Synapse',
-    schema: 'gist-sync-v1',
-    updatedAt: now,
-    writeId: syncGetDeviceId() + ':' + now + ':' + Math.random().toString(36).slice(2, 8),
-    deviceId: syncGetDeviceId(),
-    salt: context.saltBase64,
-    kdf: { name: 'PBKDF2-SHA256', iterations: SYNC_KDF_ITERATIONS },
-    files: {
-      settings: 'settings.json.enc',
-      memories: 'memories.json.enc',
-      projects: 'projects.json.enc',
-      tombstones: 'tombstones.json.enc',
-      conversations: conversationEntries
-    },
-    hashes: {
-      settings: await syncSha256Hex(settingsPayload.settings),
-      memories: await syncSha256Hex(memoriesPayload.memories),
-      projects: await syncSha256Hex(projectsPayload.projects)
-    }
+    version: 2, app: 'Synapse', schema: 'gist-sync-v2', salt: context.saltBase64,
+    kdf: { name: 'PBKDF2-SHA256', iterations: SYNC_KDF_ITERATIONS }
   };
-  files['manifest.json'] = { content: JSON.stringify(manifest, null, 2) };
-  return { files, manifest };
-}
-
-function syncIsOwnedFileName(name) {
-  return name === 'manifest.json'
-    || name === 'settings.json.enc'
-    || name === 'memories.json.enc'
-    || name === 'projects.json.enc'
-    || name === 'tombstones.json.enc'
-    || (name.startsWith('conv_') && name.endsWith('.json.enc'));
+  if (!existingManifest) files['manifest.json'] = { content: JSON.stringify(manifest) };
+  return { files, manifest, filename, conversationCount: payload.conversations.length, hash: await syncSha256Hex({ ...payload, updatedAt: 0 }) };
 }
 
 async function syncPushToGist(options = {}) {
   const auto = options.auto === true;
+  if (readOnlyShare) return false;
   if (localDataOperationsInFlight > 0) {
     if (!auto) showToast('Wait for local data changes to finish.', 'info');
     return false;
@@ -12458,128 +12401,131 @@ async function syncPushToGist(options = {}) {
     if (!auto) showToast('A sync operation is already in progress.', 'info');
     return false;
   }
-  flushSettingsAutosaves();
   _syncOperationInFlight = true;
-  const pendingAtStart = localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true';
-  if (auto || pendingAtStart) localStorage.removeItem(SYNC_AUTO_PENDING_KEY);
-  const cfg = auto ? syncGetStoredConfig() : syncSaveSettings(false, false);
+  let pendingAtStart = false;
+  let cfg;
   let succeeded = false;
+  let uploaded = false;
   try {
+    if (!db) throw new Error('Encrypted sync needs a working browser database. Export a local backup and reload before syncing.');
+    flushSettingsAutosaves();
+    pendingAtStart = localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true';
+    if (auto || pendingAtStart) localStorage.removeItem(SYNC_AUTO_PENDING_KEY);
+    cfg = auto ? syncGetStoredConfig() : syncSaveSettings(false, false);
+    if (!cfg) throw new Error('Sync settings could not be saved. Free storage and retry.');
     syncValidateConfig(cfg, auto);
     persistDraftFromUI();
-    if (_projectAutosaveTimer) await flushProjectAutosave();
-    await _projectSaveChain;
+    if (_projectAutosaveTimer && !await flushProjectAutosave()) throw new Error('Project changes could not be saved. Retry before pushing.');
+    if (!await saveProjects(true)) throw new Error('Project changes could not be saved. Retry before pushing.');
     await saveConversationImmediately();
+    await loadMemories();
     syncSetStatus('checking', 'Pushing...', 'Encrypting local data and writing Gist files.');
+    const settingsState = syncCollectSettingsState();
+    const local = await syncCapturePullSnapshot();
+    local.settingsState = settingsState;
     let built;
     if (cfg.gistId) {
       const url = SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId);
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const snapshot = await fetchGistResponse(url, { cache: 'no-store' }, cfg.token);
-        const gist = snapshot.data;
-        let existingManifest;
-        try { existingManifest = await syncReadManifest(gist, cfg.token); }
-        catch (e) { throw new Error('Existing Gist is not a Synapse sync Gist. Clear the Gist ID to create a new one.'); }
-        const remote = await syncReadRemoteData(gist, existingManifest, cfg.passphrase);
-        const tombstones = syncMergeTombstones(syncLoadTombstones(), remote.tombstones);
-        const merged = {
-          tombstones,
-          settingsState: syncMergeSettingsStates(syncCollectSettingsState(), remote.settingsState),
-          conversations: (await syncMergeConversationLists(conversations, remote.conversations, tombstones.conversations)).conversations,
-          memories: syncMergeMemoryLists(await loadMemories(), remote.memories, tombstones.memories),
-          projects: syncMergeProjectLists(projects, remote.projects, tombstones.projects)
-        };
-        built = await syncBuildGistFiles(cfg.passphrase, existingManifest, merged);
-        const patchFiles = { ...built.files };
-        Object.keys(gist?.files || {}).forEach(name => {
-          if (syncIsOwnedFileName(name) && !patchFiles[name]) patchFiles[name] = null;
-        });
-        await fetchGistResponse(url, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ description: 'Synapse encrypted sync data', files: patchFiles })
-        }, cfg.token);
-        const verified = await fetchGist(url, { cache: 'no-store' }, cfg.token);
-        const verifiedManifest = await syncReadManifest(verified, cfg.token);
-        if (verifiedManifest.writeId === built.manifest.writeId) {
-          syncSaveTombstones(syncMergeTombstones(syncLoadTombstones(), tombstones));
-          break;
-        }
-        if (attempt === 2) throw new Error('Sync Gist changed during push. Try again.');
-      }
+      const gist = await fetchGist(url, { cache: 'no-store' }, cfg.token);
+      const existingManifest = await syncReadManifest(gist, cfg.token);
+      // ponytail: bounded append-only snapshots. Rotate manually, never delete another device's updates.
+      if (Object.keys(gist.files || {}).length >= 250) throw new Error('This sync Gist has reached the 250-file safety limit. Pull on all devices and export a backup, then clear the Gist ID to start a new one.');
+      await syncReadRemoteData(gist, existingManifest, cfg.passphrase); // Verify the key, without applying remote data locally.
+      built = await syncBuildGistFiles(cfg.passphrase, existingManifest, local);
+      const size = Object.values(gist.files || {}).reduce((sum, file) => sum + (Number(file?.size) || new TextEncoder().encode(file?.content || '').byteLength), 0);
+      if (size + new TextEncoder().encode(built.files[built.filename].content).byteLength > 32 * 1024 * 1024) throw new Error('This sync archive would exceed 32 MiB. Pull on all devices and export a backup, then start a new Gist. The old Gist is unchanged.');
+      if (gist.files?.[built.filename]) throw new Error('Sync update name already exists. Retry; no remote file was changed.');
+      await fetchGistResponse(url, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ files: built.files })
+      }, cfg.token);
+      uploaded = true;
+      const verified = await fetchGist(url, { cache: 'no-store' }, cfg.token);
+      if (await syncGetGistFileContent(verified, built.filename) !== built.files[built.filename].content) throw new Error('The uploaded update could not be verified. Retrying will not overwrite it.');
     } else {
-      built = await syncBuildGistFiles(cfg.passphrase);
+      built = await syncBuildGistFiles(cfg.passphrase, null, local);
       const gist = await fetchGist(SYNC_GIST_API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ description: 'Synapse encrypted sync data', public: false, files: built.files })
       }, cfg.token);
       cfg.gistId = gist.id;
-      localStorage.setItem('assistantSyncGistId', cfg.gistId);
-      localStorage.setItem(SYNC_STATE_GIST_KEY, cfg.gistId);
+      uploaded = true;
       const gistEl = document.getElementById('setSyncGistId');
       if (gistEl) gistEl.value = cfg.gistId;
+      localStorage.setItem('assistantSyncGistId', cfg.gistId);
+      localStorage.setItem(SYNC_STATE_GIST_KEY, cfg.gistId);
     }
 
+    localStorage.setItem('assistantSyncSalt', built.manifest.salt);
     localStorage.setItem('assistantSyncLastPushAt', String(Date.now()));
-    localStorage.setItem('assistantSyncLastHash', await syncSha256Hex(built.manifest));
+    localStorage.setItem('assistantSyncLastHash', built.hash);
     renderSyncSettings();
-    syncSetStatus('current', 'Pushed', 'Encrypted sync Gist updated with ' + built.manifest.files.conversations.length + ' conversations.');
+    syncSetStatus('current', 'Pushed', 'Saved a separate encrypted update with ' + built.conversationCount + ' conversations. Remote changes are applied only by Pull now.');
     succeeded = true;
     if (!auto) showToast('Sync push complete.', 'success');
     return true;
   } catch (err) {
     console.error('Sync push failed:', err);
-    const message = err.name === 'OperationError' ? 'Could not decrypt the existing sync Gist. Check the passphrase.' : (err.message || 'Unable to push sync data.');
+    const message = err.name === 'OperationError' ? 'Could not decrypt the existing sync Gist. Check the passphrase.' :
+      (uploaded ? 'An update was uploaded to Gist ' + cfg.gistId + ', but confirmation or local storage failed. Keep that Gist ID. ' : '') + (err.message || 'Unable to push sync data.');
     syncSetStatus('unknown', 'Push failed', message);
     if (!auto) showToast('Sync push failed: ' + message, 'error', 6000);
     return false;
   } finally {
-    if (!succeeded && syncAutoPushIsConfigured(cfg) && (auto || pendingAtStart)) {
-      localStorage.setItem(SYNC_AUTO_PENDING_KEY, 'true');
-    }
     _syncOperationInFlight = false;
-    if (succeeded && localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
-        localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
+    try {
+      if (!succeeded && syncAutoPushIsConfigured(cfg) && (auto || pendingAtStart)) localStorage.setItem(SYNC_AUTO_PENDING_KEY, 'true');
+      if (succeeded && localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
+          localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
+    } catch (error) { console.warn('Could not save automatic sync state:', error); }
   }
 }
 
-async function syncMergeConversationLists(localList, remoteList, tombstones = {}) {
+async function syncMergeConversationLists(localList, remoteList, tombstones = {}, deletionVersions = {}, deletionRoots = {}) {
   const merged = new Map();
+  const inputs = [...(localList || []), ...(remoteList || [])];
+  const roots = new Map([...inputs.filter(record => record && typeof record === 'object').map(record => [record.id, record.conflictOf || record.id]), ...Object.entries(deletionRoots)]);
   let added = 0;
   let updated = 0;
   let tied = 0;
-  (localList || []).filter(conv => !isTemporaryConversation(conv)).map(syncNormalizeConversation).forEach(conv => merged.set(conv.id, conv));
-
-  for (const remoteRaw of remoteList || []) {
-    const remote = syncNormalizeConversation(remoteRaw);
-    const local = merged.get(remote.id);
-    if (!local) {
-      merged.set(remote.id, remote);
-      added++;
-      continue;
-    }
-    const remoteUpdated = Number(remote.updatedAt) || 0;
-    const localUpdated = Number(local.updatedAt) || 0;
-    if (remoteUpdated > localUpdated) {
-      merged.set(remote.id, remote);
-      updated++;
-      continue;
-    }
-    if (remoteUpdated === localUpdated) {
-      if (compareConversationRecords(remote, local) > 0) {
-        merged.set(remote.id, remote);
-        tied++;
-      }
-    }
+  const conflicts = [];
+  for (const [index, raw] of inputs.entries()) {
+    if (!raw || typeof raw !== 'object' || isTemporaryConversation(raw)) continue;
+    let record;
+    try { record = syncNormalizeConversation(raw); }
+    catch (error) { console.warn('Unreadable sync chat skipped:', raw.id, error); continue; }
+    const conflictId = await conversationConflictId(record);
+    if (!Object.keys(record.syncVersion || {}).length) record.syncVersion = { ['legacy:' + conflictId]: 1 };
+    const root = record.conflictOf || record.id;
+    const deletions = Object.keys(tombstones).filter(id => id === record.id || id === root || roots.get(id) === root);
+    if (deletions.some(id => {
+      if (!Object.hasOwn(deletionVersions, id)) return false;
+      const order = compareConversationVersions({ syncVersion: deletionVersions[id] }, record);
+      return order === 0 || order === 1;
+    })) continue;
+    const previous = merged.get(record.id);
+    const size = merged.size;
+    const saved = reconcileConversationRecord(merged, record, conflictId);
+    if (index < (localList || []).length) continue;
+    if (merged.size > size) added++;
+    else if (previous && conversationContent(previous) !== conversationContent(saved)) updated++;
+    if (saved.id !== record.id && merged.size > size) { conflicts.push(saved.id); tied++; }
   }
-
-  return {
-    conversations: syncFilterDeletedRecords(Array.from(merged.values()), tombstones, 'updatedAt'),
-    added,
-    updated,
-    tied
-  };
+  const visible = new Map();
+  for (const record of merged.values()) {
+    const deletedAt = Math.max(Number(tombstones[record.id]) || 0, Number(tombstones[record.conflictOf]) || 0);
+    if (!deletedAt || Number(record.updatedAt) > deletedAt) { visible.set(record.id, record); continue; }
+    const seen = Object.hasOwn(deletionVersions, record.id) ? deletionVersions[record.id] : null;
+    // Unknown deletion ancestry is recovered, not guessed from the clock.
+    const order = seen ? compareConversationVersions({ syncVersion: seen }, record) : null;
+    if (order === 0 || order === 1) continue;
+    const copy = makeConversationConflict(record, await conversationConflictId(record));
+    if (Number(tombstones[copy.id]) >= Number(copy.updatedAt)) continue;
+    visible.set(copy.id, copy);
+    conflicts.push(copy.id);
+  }
+  return { conversations: [...visible.values()], added, updated, tied, conflicts };
 }
 
 function syncMergeProjectLists(localList, remoteList, tombstones = {}) {
@@ -12609,116 +12555,115 @@ function syncMergeMemoryLists(localList, remoteList, tombstones = {}) {
     .sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0));
 }
 
-async function syncPersistPullData({ conversations: nextConversations, memories: nextMemories, projects: nextProjects, persistentActiveId }) {
+async function syncPersistPullData({ conversations: nextConversations, memories: nextMemories, projects: nextProjects, persistentActiveId, settingsValues = {} }, snapshot) {
+  if (!db || !snapshot?.database) throw new Error('Import and pull need a working browser database. Free storage and reload, then retry.');
   const conversationRecords = (nextConversations || []).map(syncNormalizeConversation);
+  for (const record of conversationRecords) {
+    if (!Object.keys(record.syncVersion || {}).length) record.syncVersion = { ['legacy:' + await conversationConflictId(record)]: 1 };
+  }
   const memoryRecords = normalizeMemoryList(nextMemories || []).memories;
   const projectRecords = normalizeProjectList(nextProjects || []);
   const storedActiveId = String(persistentActiveId || '');
-
-  if (!db) {
-    localStorage.setItem('assistantConversations', JSON.stringify(conversationRecords));
-    localStorage.setItem('assistantMemories', JSON.stringify(memoryRecords));
-    localStorage.setItem('assistantProjects', JSON.stringify(projectRecords));
-    localStorage.setItem('assistantActiveConvId', storedActiveId);
-    return;
-  }
-
-  await new Promise((resolve, reject) => {
+  const values = { ...settingsValues, assistantActiveConvId: storedActiveId };
+  return new Promise((resolve, reject) => {
     const tx = db.transaction(['conversations', 'memories', 'meta'], 'readwrite');
     const conversationStore = tx.objectStore('conversations');
     const memoryStore = tx.objectStore('memories');
     const metaStore = tx.objectStore('meta');
-    conversationStore.clear();
-    conversationRecords.forEach(record => conversationStore.put(record));
-    memoryStore.clear();
-    memoryRecords.forEach(record => memoryStore.put(record));
-    metaStore.put({ key: 'projects', value: projectRecords });
-    metaStore.put({ key: 'activeConvId', value: storedActiveId });
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error || new Error('Sync data transaction failed.'));
-    tx.onabort = () => reject(tx.error || new Error('Sync data transaction was aborted.'));
+    const requests = {
+      conversations: conversationStore.getAll(), memories: memoryStore.getAll(),
+      projects: metaStore.get('projects'), tombstones: metaStore.get('syncTombstones')
+    };
+    const appliedSettings = [];
+    let pending = Object.keys(requests).length;
+    let failure;
+    const write = () => {
+      if (--pending) return;
+      try {
+        const current = {
+          conversations: requests.conversations.result, memories: requests.memories.result,
+          projects: requests.projects.result || null, tombstones: requests.tombstones.result || null
+        };
+        if (serializeConversation(current) !== serializeConversation(snapshot.database) ||
+            sending || streaming || queueingFollowUp || pendingAttachmentReads > 0 ||
+            serializeConversation(getPersistentConversations()) !== snapshot.localConversations ||
+            serializeConversation(projects) !== snapshot.localProjects ||
+            Object.entries(snapshot.settingsValues).some(([key, value]) => localStorage.getItem(key) !== value)) {
+          throw new Error('Local data changed while this operation was being prepared. Nothing was applied; retry to include those changes.');
+        }
+        // localStorage is not transactional. Restore only values still owned by this attempt if IDB aborts.
+        Object.entries(values).forEach(([key, value]) => {
+          const before = localStorage.getItem(key);
+          const after = value == null ? null : String(value);
+          if (before === after) return;
+          if (after === null) localStorage.removeItem(key);
+          else localStorage.setItem(key, after);
+          appliedSettings.push({ key, before, after });
+        });
+        const replace = (store, before, records) => {
+          const ids = new Set(records.map(record => record.id));
+          before.forEach(record => { if (!ids.has(record.id)) store.delete(record.id); });
+          records.forEach(record => store.put(record));
+        };
+        replace(conversationStore, current.conversations, conversationRecords);
+        replace(memoryStore, current.memories, memoryRecords);
+        metaStore.put({ key: 'projects', value: projectRecords });
+        metaStore.put({ key: 'activeConvId', value: storedActiveId });
+        if (Object.hasOwn(values, SYNC_TOMBSTONES_KEY)) metaStore.put({ key: 'syncTombstones', value: syncNormalizeTombstones(JSON.parse(values[SYNC_TOMBSTONES_KEY] || '{}')) });
+      } catch (error) { failure = error; tx.abort(); }
+    };
+    Object.values(requests).forEach(request => { request.onsuccess = write; });
+    tx.oncomplete = () => {
+      broadcastPersistenceChange();
+      resolve({ conversations: conversationRecords, memories: memoryRecords, projects: projectRecords });
+    };
+    tx.onabort = () => {
+      const unrestored = [];
+      appliedSettings.reverse().forEach(({ key, before, after }) => {
+        try {
+          if (localStorage.getItem(key) !== after) return;
+          if (before === null) localStorage.removeItem(key);
+          else localStorage.setItem(key, before);
+        } catch (error) { unrestored.push(key); }
+      });
+      const error = failure || tx.error || new Error('The data transaction was aborted.');
+      reject(unrestored.length ? new Error(error.message + ' Some settings could not be restored. Free storage before retrying: ' + unrestored.join(', ')) : error);
+    };
+    tx.onerror = () => { failure = failure || tx.error; };
   });
-
-  try {
-    localStorage.setItem('assistantActiveConvId', storedActiveId);
-    localStorage.removeItem('assistantConversations');
-    localStorage.removeItem('assistantMemories');
-    localStorage.removeItem('assistantProjects');
-  } catch (error) {
-    console.warn('Could not update sync fallback metadata:', error);
-  }
 }
 
 async function syncCapturePullSnapshot() {
+  if (!db) throw new Error('Import and pull need a working browser database. Free storage and reload, then retry.');
+  const localConversations = serializeConversation(getPersistentConversations());
+  const localProjects = serializeConversation(projects);
   const settingsValues = {};
-  SYNC_SETTINGS_KEYS.forEach(key => { settingsValues[key] = localStorage.getItem(key); });
-  return {
-    settingsValues,
-    settingsStateRaw: localStorage.getItem(SYNC_SETTINGS_STATE_KEY),
-    tombstones: syncCloneJson(syncLoadTombstones()),
-    memories: syncCloneJson(await loadMemories()),
-    projects: syncCloneJson(projects),
-    conversations: syncCloneJson(getPersistentConversations()),
-    activeConvId,
-    persistentActiveId: getPersistentActiveConvId(),
-    autoPushPending: localStorage.getItem(SYNC_AUTO_PENDING_KEY),
-    salt: localStorage.getItem('assistantSyncSalt')
-  };
-}
-
-function syncRestoreSettingsSnapshot(snapshot) {
-  SYNC_SETTINGS_KEYS.forEach(key => {
-    const value = snapshot.settingsValues[key];
-    if (value === null) localStorage.removeItem(key);
-    else localStorage.setItem(key, value);
+  new Set([...SYNC_SETTINGS_KEYS, ...EXPORT_SETTING_ALLOWLIST, SYNC_SETTINGS_STATE_KEY, SYNC_TOMBSTONES_KEY,
+    SYNC_AUTO_PENDING_KEY, 'assistantSyncSalt', 'assistantActiveConvId', 'assistantSyncLastPullAt',
+    'assistantConversations', 'assistantMemories', 'assistantProjects']).forEach(key => { settingsValues[key] = localStorage.getItem(key); });
+  const database = await new Promise((resolve, reject) => {
+    const tx = db.transaction(['conversations', 'memories', 'meta'], 'readonly');
+    const requests = {
+      conversations: tx.objectStore('conversations').getAll(), memories: tx.objectStore('memories').getAll(),
+      projects: tx.objectStore('meta').get('projects'), tombstones: tx.objectStore('meta').get('syncTombstones')
+    };
+    tx.oncomplete = () => resolve(Object.fromEntries(Object.entries(requests).map(([key, request]) => [key, request.result || null])));
+    tx.onerror = tx.onabort = () => reject(tx.error || new Error('Could not read the local data snapshot.'));
   });
-  if (snapshot.settingsStateRaw === null) localStorage.removeItem(SYNC_SETTINGS_STATE_KEY);
-  else localStorage.setItem(SYNC_SETTINGS_STATE_KEY, snapshot.settingsStateRaw);
-  syncRefreshAppliedSettings();
-}
-
-async function syncRollbackPull(snapshot) {
-  const errors = [];
-  const recordError = (step, error) => {
-    console.error('Sync rollback ' + step + ' failed:', error);
-    errors.push(step + ': ' + (error?.message || String(error)));
+  return {
+    database, settingsValues,
+    localConversations, localProjects,
+    tombstones: syncMergeTombstones(database.tombstones?.value, syncLoadTombstones()),
+    memories: normalizeMemoryList(database.memories).memories,
+    projects: normalizeProjectList(database.projects?.value),
+    conversations: database.conversations.map(syncNormalizeConversation),
+    activeConvId,
+    persistentActiveId: getPersistentActiveConvId()
   };
-  clearTimeout(_syncAutoPushTimer);
-  _syncAutoPushTimer = null;
-  try { await syncPersistPullData(snapshot); }
-  catch (error) { recordError('data restore', error); }
-  try { syncRestoreSettingsSnapshot(snapshot); }
-  catch (error) { recordError('settings restore', error); }
-  try { syncSaveTombstones(snapshot.tombstones); }
-  catch (error) { recordError('deletion record restore', error); }
-  try { syncSetStoredValue(SYNC_AUTO_PENDING_KEY, snapshot.autoPushPending); }
-  catch (error) { recordError('auto-push state restore', error); }
-  try { syncSetStoredValue('assistantSyncSalt', snapshot.salt); }
-  catch (error) { recordError('encryption state restore', error); }
-  try {
-    projects = syncCloneJson(snapshot.projects);
-    replacePersistentConversations(syncCloneJson(snapshot.conversations), true);
-    activeConvId = conversations.some(conv => conv.id === snapshot.activeConvId)
-      ? snapshot.activeConvId
-      : (conversations[0]?.id || null);
-    messages = getActiveConv()?.messages || [];
-    setConversationBaseline(snapshot.conversations);
-  } catch (error) {
-    recordError('in-memory restore', error);
-  }
-  try {
-    renderSidebar();
-    renderMessages();
-    updateTokenInfo();
-    updateCharacterUI();
-    restoreActiveDraft();
-  } catch (error) {
-    recordError('interface restore', error);
-  }
-  if (errors.length) throw new Error('Sync rollback was incomplete: ' + errors.join('; '));
 }
 
 async function syncPullFromGist() {
+  if (readOnlyShare) return false;
   if (sending || streaming || queueingFollowUp) {
     showToast('Stop the current response before pulling sync data.', 'info');
     return false;
@@ -12735,35 +12680,38 @@ async function syncPullFromGist() {
     showToast('A sync operation is already in progress.', 'info');
     return false;
   }
-  flushSettingsAutosaves();
   _syncOperationInFlight = true;
   _syncPullInFlight = true;
-  setSyncBusy(true);
   const previousActiveConvId = activeConvId;
-  const cfg = syncSaveSettings(false, false);
-  let succeeded = false;
+  let committed = false;
   try {
+    if (!db) throw new Error('Encrypted sync needs a working browser database. Export a local backup and reload before syncing.');
+    setSyncBusy(true);
+    flushSettingsAutosaves();
+    const cfg = syncSaveSettings(false, false);
+    if (!cfg) throw new Error('Sync settings could not be saved. Free storage and retry.');
     syncValidateConfig(cfg, true);
     persistDraftFromUI();
-    if (_projectAutosaveTimer) await flushProjectAutosave();
-    await _projectSaveChain;
+    if (_projectAutosaveTimer && !await flushProjectAutosave()) throw new Error('Project changes could not be saved. Retry before pulling.');
+    if (!await saveProjects(true)) throw new Error('Project changes could not be saved. Retry before pulling.');
     await saveConversationImmediately();
+    await loadMemories();
     syncSetStatus('checking', 'Pulling...', 'Fetching and decrypting sync files.');
     const gist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
     const manifest = await syncReadManifest(gist, cfg.token);
     const remote = await syncReadRemoteData(gist, manifest, cfg.passphrase);
+    await saveConversationImmediately();
+    const snapshot = await syncCapturePullSnapshot();
     const remoteTombstones = syncNormalizeTombstones(remote.tombstones);
-    const localTombstonesBeforePull = syncLoadTombstones();
-    const localMemoriesBeforePull = await loadMemories();
     const incomingDeletionCount = (records, category, timestampKey) => records.filter(record => {
       const remoteDeletedAt = Number(remoteTombstones[category]?.[record.id]) || 0;
-      const localDeletedAt = Number(localTombstonesBeforePull[category]?.[record.id]) || 0;
+      const localDeletedAt = Number(snapshot.tombstones[category]?.[record.id]) || 0;
       return remoteDeletedAt > localDeletedAt && remoteDeletedAt >= Number(record[timestampKey] || 0);
     }).length;
     const deletionCounts = {
-      conversations: incomingDeletionCount(getPersistentConversations(), 'conversations', 'updatedAt'),
-      projects: incomingDeletionCount(projects, 'projects', 'updatedAt'),
-      memories: incomingDeletionCount(localMemoriesBeforePull, 'memories', 'createdAt')
+      conversations: incomingDeletionCount(snapshot.conversations, 'conversations', 'updatedAt'),
+      projects: incomingDeletionCount(snapshot.projects, 'projects', 'updatedAt'),
+      memories: incomingDeletionCount(snapshot.memories, 'memories', 'createdAt')
     };
     const totalDeletions = Object.values(deletionCounts).reduce((sum, count) => sum + count, 0);
     if (totalDeletions) {
@@ -12772,17 +12720,21 @@ async function syncPullFromGist() {
         syncSetStatus('current', 'Pull cancelled', 'No local data was changed.');
         return false;
       }
+      for (const record of snapshot.conversations) {
+        const deletedAt = Number(remoteTombstones.conversations[record.id]) || 0;
+        if (!remoteTombstones.conversationVersions[record.id] && deletedAt > (Number(snapshot.tombstones.conversations[record.id]) || 0) && deletedAt >= Number(record.updatedAt)) {
+          remoteTombstones.conversationVersions[record.id] = { ...record.syncVersion, ['legacy:' + await conversationConflictId(record)]: 1 };
+        }
+      }
     }
-    await saveConversationImmediately();
     if (sending || streaming || queueingFollowUp) throw new Error('Stop the current response before applying pulled sync data.');
     if (localDataOperationsInFlight > 0) throw new Error('Wait for local data changes to finish before applying pulled sync data.');
 
-    const snapshot = await syncCapturePullSnapshot();
-    const liveTombstones = syncMergeTombstones(snapshot.tombstones, remote.tombstones);
+    const liveTombstones = syncMergeTombstones(snapshot.tombstones, remoteTombstones);
     const liveSettingsState = syncMergeSettingsStates(syncCollectSettingsState(false, false), remote.settingsState);
     const liveMemories = syncMergeMemoryLists(snapshot.memories, remote.memories, liveTombstones.memories);
     const liveProjects = syncMergeProjectLists(snapshot.projects, remote.projects, liveTombstones.projects);
-    const liveMerged = await syncMergeConversationLists(snapshot.conversations, remote.conversations, liveTombstones.conversations);
+    const liveMerged = await syncMergeConversationLists(snapshot.conversations, remote.conversations, liveTombstones.conversations, liveTombstones.conversationVersions, liveTombstones.conversationRoots);
     const temporaryActive = conversations.find(conv => conv.id === snapshot.activeConvId && isTemporaryConversation(conv));
     const nextActiveId = temporaryActive?.id ||
       (liveMerged.conversations.some(conv => conv.id === snapshot.activeConvId) ? snapshot.activeConvId : (liveMerged.conversations[0]?.id || null));
@@ -12790,32 +12742,25 @@ async function syncPullFromGist() {
       ? snapshot.persistentActiveId
       : (liveMerged.conversations[0]?.id || '');
 
-    try {
-      await syncPersistPullData({
-        conversations: liveMerged.conversations,
-        memories: liveMemories,
-        projects: liveProjects,
-        persistentActiveId: nextPersistentActiveId
-      });
-      syncApplySettings(liveSettingsState);
-      syncSaveTombstones(liveTombstones);
-      projects = liveProjects;
-      armedFollowUpConversationIds.clear();
-      replacePersistentConversations(liveMerged.conversations, true);
-      activeConvId = conversations.some(conv => conv.id === nextActiveId) ? nextActiveId : (conversations[0]?.id || null);
-      messages = getActiveConv()?.messages || [];
-      setConversationBaseline(liveMerged.conversations);
-      if (manifest.salt) localStorage.setItem('assistantSyncSalt', manifest.salt);
-    } catch (applyError) {
-      let error = applyError instanceof Error ? applyError : new Error(String(applyError));
-      try {
-        await syncRollbackPull(snapshot);
-      } catch (rollbackError) {
-        console.error('Sync pull rollback failed:', rollbackError);
-        error = new Error(error.message + ' Some local data could not be restored.');
-      }
-      throw error;
-    }
+    const settingsValues = {
+      ...liveSettingsState.settings,
+      [SYNC_SETTINGS_STATE_KEY]: JSON.stringify(liveSettingsState),
+      [SYNC_TOMBSTONES_KEY]: JSON.stringify(liveTombstones),
+      assistantSyncLastPullAt: String(Date.now())
+    };
+    if (manifest.salt) settingsValues.assistantSyncSalt = manifest.salt;
+    const saved = await syncPersistPullData({
+      conversations: liveMerged.conversations, memories: liveMemories, projects: liveProjects,
+      persistentActiveId: nextPersistentActiveId, settingsValues
+    }, snapshot);
+    committed = true;
+    projects = saved.projects;
+    projectBaseline = new Map(projects.map(project => [project.id, serializeConversation(project)]));
+    armedFollowUpConversationIds.clear();
+    replacePersistentConversations(saved.conversations, true);
+    activeConvId = conversations.some(conv => conv.id === nextActiveId) ? nextActiveId : (conversations[0]?.id || null);
+    messages = getActiveConv()?.messages || [];
+    setConversationBaseline(saved.conversations);
 
     try {
       renderSidebar();
@@ -12823,17 +12768,21 @@ async function syncPullFromGist() {
       updateTokenInfo();
       updateCharacterUI();
       restoreActiveDraft();
+      syncRefreshAppliedSettings();
+      renderSyncSettings();
     } catch (renderError) {
       console.error('Sync pull render refresh failed:', renderError);
     }
-    localStorage.setItem('assistantSyncLastPullAt', String(Date.now()));
-    renderSyncSettings();
     syncSetStatus('current', 'Pulled', 'Merged ' + remote.conversations.length + ' remote conversations. Added ' + liveMerged.added + ', updated ' + liveMerged.updated + '.');
     showToast('Sync pull complete.', 'success');
-    succeeded = true;
+    notifyConversationConflicts(saved.conversations.filter(conv => conv.conflictOf).map(conv => conv.id));
     return true;
   } catch (err) {
     console.error('Sync pull failed:', err);
+    if (committed) {
+      syncSetStatus('current', 'Pull saved', 'The data was saved, but the display could not be refreshed. Reload this tab.');
+      return true;
+    }
     const message = err.name === 'OperationError' ? 'Could not decrypt sync data. Check the passphrase.' : (err.message || 'Unable to pull sync data.');
     syncSetStatus('unknown', 'Pull failed', message);
     showToast('Sync pull failed: ' + message, 'error', 6000);
@@ -12842,18 +12791,29 @@ async function syncPullFromGist() {
     _syncOperationInFlight = false;
     _syncPullInFlight = false;
     setSyncBusy(false);
-    if (localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
-        localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
+    try {
+      if (localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
+          localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
+    } catch (error) { console.warn('Could not read automatic sync state:', error); }
   }
 }
 
 function syncGeneratePassphrase() {
   try {
+    if (_syncOperationInFlight) { showToast('Wait for the current sync operation to finish.', 'info'); return false; }
+    const cfg = syncGetConfigFromInputs();
+    if ((cfg.gistId || localStorage.getItem('assistantSyncGistId')) && !confirm('Generate a passphrase for a NEW sync Gist? The existing Gist will not be changed. Keep its pairing code first; you will need the old passphrase to read it.')) return false;
     const passphrase = syncBytesToBase64Url(syncRandomBytes(24)).match(/.{1,6}/g).join('-');
     const passEl = document.getElementById('setSyncPassphrase');
     if (passEl) passEl.value = passphrase;
-    syncSaveSettings(false, false);
+    const gistEl = document.getElementById('setSyncGistId');
+    if (gistEl) gistEl.value = '';
+    const autoEl = document.getElementById('setSyncAutoPush');
+    if (autoEl) autoEl.checked = false;
+    _syncInputsLoaded = true;
+    if (!syncSaveSettings(false, false)) throw new Error('Browser storage failed. Keep the pairing details shown before retrying.');
     showToast('Sync passphrase generated.', 'success');
+    return true;
   } catch (err) {
     showToast('Could not generate passphrase: ' + (err.message || err), 'error');
   }
@@ -12877,6 +12837,7 @@ async function syncCopyPassphrase() {
 
 function syncBuildPairingText() {
   const cfg = syncSaveSettings(false, false);
+  if (!cfg) throw new Error('Sync settings could not be saved. Free storage and retry.');
   if (!cfg.gistId) throw new Error('Push once to create a Gist before pairing.');
   if (!cfg.passphrase) throw new Error('Sync passphrase is required for pairing.');
   const includeToken = document.getElementById('setSyncQrIncludeToken')?.checked;
@@ -12917,7 +12878,7 @@ function syncApplyPairingText(text, silent = false) {
     if (gistEl) gistEl.value = payload.gistId;
     if (passEl) passEl.value = payload.passphrase;
     if (payload.token && tokenEl) tokenEl.value = payload.token;
-    syncSaveSettings(false, false);
+    if (!syncSaveSettings(false, false)) throw new Error('Sync settings could not be saved. Free storage and retry.');
     showToast('Pairing code applied.', 'success');
     return true;
   } catch (err) {
@@ -12930,19 +12891,24 @@ function syncLoadScriptOnce(id, src, globalName) {
   if (globalName && window[globalName]) return Promise.resolve(window[globalName]);
   syncLoadScriptOnce.promises = syncLoadScriptOnce.promises || {};
   if (syncLoadScriptOnce.promises[id]) return syncLoadScriptOnce.promises[id];
-  syncLoadScriptOnce.promises[id] = new Promise((resolve, reject) => {
-    const existing = document.getElementById(id);
-    if (existing) {
-      existing.addEventListener('load', () => resolve(globalName ? window[globalName] : true), { once: true });
-      existing.addEventListener('error', () => reject(new Error('Failed to load ' + src)), { once: true });
-      return;
-    }
+  syncLoadScriptOnce.attempts = syncLoadScriptOnce.attempts || {};
+  const attempt = syncLoadScriptOnce.attempts[id] || 0;
+  const load = src.endsWith('.mjs')
+    ? import(src + (attempt ? '?retry=' + attempt : '')).then(module => module.default || module)
+    : new Promise((resolve, reject) => {
+    document.getElementById(id)?.remove();
     const script = document.createElement('script');
     script.id = id;
     script.src = src;
     script.onload = () => resolve(globalName ? window[globalName] : true);
     script.onerror = () => reject(new Error('Failed to load ' + src));
     document.head.appendChild(script);
+  });
+  syncLoadScriptOnce.promises[id] = load.catch(error => {
+    delete syncLoadScriptOnce.promises[id];
+    syncLoadScriptOnce.attempts[id] = attempt + 1;
+    document.getElementById(id)?.remove();
+    throw error;
   });
   return syncLoadScriptOnce.promises[id];
 }
@@ -12955,9 +12921,10 @@ async function syncRenderPairingQr() {
     const canvas = document.getElementById('syncPairingQr');
     if (output) output.hidden = false;
     if (textArea) textArea.value = text;
-    await syncLoadScriptOnce('syncQrCodeScript', 'https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js', 'QRCode');
-    if (!window.QRCode?.toCanvas) throw new Error('QR generator did not load.');
-    await window.QRCode.toCanvas(canvas, text, {
+    // A single-file bundle also makes retries independent of cached dependency failures.
+    const qr = await syncLoadScriptOnce('syncQrCodeScript', 'https://esm.sh/qrcode@1.5.4/es2022/qrcode.bundle.mjs');
+    if (!qr?.toCanvas) throw new Error('QR generator did not load.');
+    await qr.toCanvas(canvas, text, {
       width: 192,
       margin: 1,
       errorCorrectionLevel: 'M',
@@ -13499,13 +13466,12 @@ function openGlobalSearch() {
   overlay.className = 'char-info-overlay';
   const popup = document.createElement('div');
   popup.className = 'char-info-popup';
-  popup.style.width = '500px';
   popup.setAttribute('role', 'dialog');
   popup.setAttribute('aria-modal', 'true');
   popup.setAttribute('aria-labelledby', 'globalSearchTitle');
   popup.setAttribute('tabindex', '-1');
   popup.innerHTML = '<h3 id="globalSearchTitle">Search All Messages</h3>' +
-    '<input type="text" id="globalSearchInput" placeholder="Type to search across all conversations..." style="width:100%;padding:10px;font-family:inherit;font-size:0.9em;background:var(--hover);border:1px solid var(--card-border);border-radius:8px;color:var(--text-primary);margin-bottom:12px;outline:none">' +
+    '<input type="text" id="globalSearchInput" aria-label="Search all messages" placeholder="Type to search across all conversations..." style="width:100%;padding:10px;font-family:inherit;font-size:0.9em;background:var(--hover);border:1px solid var(--card-border);border-radius:8px;color:var(--text-primary);margin-bottom:12px">' +
     '<div class="sr-only" id="globalSearchStatus" aria-live="polite" aria-atomic="true"></div>' +
     '<div class="global-search-results" id="globalSearchResults" role="region" aria-live="polite" aria-label="Search results"><div style="color:var(--text-secondary);font-size:0.85em;text-align:center;padding:20px">Start typing to search</div></div>';
 
@@ -13717,7 +13683,7 @@ function navigateChatSearch(dir) {
 // File Attachments
 // ============================================
 function resizeImageIfNeeded(file, maxDim, quality) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     if (!file.type.startsWith('image/')) { resolve(null); return; }
     const img = new Image();
     img.onload = () => {
@@ -13732,7 +13698,7 @@ function resizeImageIfNeeded(file, maxDim, quality) {
       canvas.getContext('2d').drawImage(img, 0, 0, width, height);
       resolve(canvas.toDataURL('image/jpeg', quality));
     };
-    img.onerror = () => { URL.revokeObjectURL(img.src); resolve(null); };
+    img.onerror = () => { URL.revokeObjectURL(img.src); reject(new Error('This image could not be decoded. Try PNG, JPEG, WebP, GIF or AVIF.')); };
     img.src = URL.createObjectURL(file);
   });
 }
@@ -13981,10 +13947,10 @@ async function readAttachmentFile(file, options = {}) {
   if (!file) return false;
   const mime = (file.type || '').toLowerCase();
   const name = file.name || 'file';
-  const originConvId = activeConvId;
+  const originConv = getActiveConv();
   const deliver = typeof options.onAttachment === 'function'
     ? options.onAttachment
-    : attachment => queueAttachmentForConversation(originConvId, attachment);
+    : attachment => queueAttachmentForConversation(originConv?.id, attachment);
   const queueText = (text, fallbackMime, typeName) => {
     const value = String(text || '').trim();
     if (!value) throw new Error(typeName + ' contains no readable text.');
@@ -14001,14 +13967,16 @@ async function readAttachmentFile(file, options = {}) {
   attachmentStatusMessage = '';
   renderPreviews();
   try {
+    if (!file.size) throw new Error('The file is empty.');
     const isImage = mime.startsWith('image/');
-    if (isImage) {
+    if (mime === 'image/svg+xml' || /\.svg$/i.test(name)) {
+      // SVG is supported as source text, not as an active image document.
+      queueText(await file.text(), 'image/svg+xml', 'SVG');
+    } else if (isImage) {
       const resizedUrl = await resizeImageIfNeeded(file, 1536, 0.85);
-      if (resizedUrl) {
-        deliver({ type: 'image', dataUrl: resizedUrl, name, mime: 'image/jpeg' });
-      } else {
-        deliver({ type: 'image', dataUrl: await readFileAsDataURL(file), name, mime: file.type });
-      }
+      const dataUrl = safeMediaUrl(resizedUrl || await readFileAsDataURL(file));
+      if (!dataUrl) throw new Error('This image format cannot be attached. Try PNG, JPEG, WebP, GIF or AVIF.');
+      deliver({ type: 'image', dataUrl, name, mime: resizedUrl ? 'image/jpeg' : file.type });
     } else if (mime === 'application/pdf' || /\.pdf$/i.test(name)) {
       queueText(await extractPdfText(await file.arrayBuffer()), 'application/pdf', 'PDF');
     } else if (DOCX_EXTENSIONS.test(name) || DOCX_MIMES.has(mime)) {
@@ -14121,8 +14089,7 @@ function handleMentionInput(ta) {
   if (!atMatch) { closeMentionDropdown(); return; }
 
   const query = atMatch[1].toLowerCase();
-  let models = [];
-  try { models = JSON.parse(localStorage.getItem('llmModelList') || '[]'); } catch(e) { console.warn('Model list parse error:', e); }
+  const models = readCachedModels();
   if (models.length === 0) { closeMentionDropdown(); return; }
 
   const filtered = models.filter(m => m.toLowerCase().includes(query)).slice(0, 8);
@@ -14231,6 +14198,7 @@ async function importCharacterCard(event) {
   const file = event.target.files[0];
   if (!file) return;
   event.target.value = '';
+  if (readOnlyShare || sending || streaming || queueingFollowUp) return;
   if (!beginLocalDataOperation()) return;
 
   try {
@@ -14284,12 +14252,14 @@ async function importCharacterCard(event) {
       });
     }
 
+    if (!prepareConversationTransition()) return;
     conversations.unshift(conv);
     activeConvId = conv.id;
     messages = conv.messages;
     saveConversations();
     renderSidebar();
     renderMessages();
+    restoreActiveDraft();
     updateTokenInfo();
     updateCharacterUI();
 
@@ -14356,15 +14326,22 @@ function showCharacterInfo() {
 // ============================================
 // Voice Input
 // ============================================
+// Stop dictation and read-aloud without changing the composer's draft.
 function stopVoiceInput() {
-  if (!voiceRec) return;
   const recognition = voiceRec;
   voiceRec = null;
-  recognition.onresult = null;
-  recognition.onend = null;
-  recognition.onerror = null;
-  try { recognition.stop(); } catch (error) { console.warn('Voice input stop failed:', error); }
-  document.getElementById('voiceBtn')?.classList.remove('recording');
+  if (recognition) {
+    recognition.onresult = null;
+    recognition.onend = null;
+    recognition.onerror = null;
+    try { recognition.abort(); } catch (error) { console.warn('Voice input stop failed:', error); }
+  }
+  const button = document.getElementById('voiceBtn');
+  button?.classList.remove('recording');
+  button?.setAttribute('aria-pressed', 'false');
+  button?.setAttribute('aria-label', 'Voice input');
+  if (button) button.title = 'Voice input';
+  stopReadAloud();
 }
 
 function toggleVoice() {
@@ -14377,27 +14354,40 @@ function toggleVoice() {
     return;
   }
 
-  voiceRec = new SR();
-  voiceRec.lang = 'en-US';
-  voiceRec.interimResults = true;
-  voiceRec.continuous = true;
+  stopReadAloud();
+  const recognition = new SR();
+  voiceRec = recognition;
+  recognition.lang = 'en-US';
+  recognition.interimResults = true;
+  recognition.continuous = true;
 
   const input = document.getElementById('chatInput');
   const startText = input.value;
+  const originConvId = activeConvId;
   btn.classList.add('recording');
+  btn.setAttribute('aria-pressed', 'true');
+  btn.setAttribute('aria-label', 'Stop voice input');
+  btn.title = 'Stop voice input';
 
-  voiceRec.onresult = (e) => {
+  recognition.onresult = (e) => {
+    if (voiceRec !== recognition || activeConvId !== originConvId) return;
     let transcript = '';
     for (let i = 0; i < e.results.length; i++) transcript += e.results[i][0].transcript;
     input.value = startText + transcript;
-    input.style.height = 'auto';
-    input.style.height = Math.min(input.scrollHeight, 150) + 'px';
-    persistDraftFromUI();
+    input.dispatchEvent(new Event('input', { bubbles: true }));
   };
 
-  voiceRec.onend = () => { btn.classList.remove('recording'); voiceRec = null; };
-  voiceRec.onerror = () => { btn.classList.remove('recording'); voiceRec = null; };
-  voiceRec.start();
+  recognition.onend = () => { if (voiceRec === recognition) stopVoiceInput(); };
+  recognition.onerror = event => {
+    if (voiceRec !== recognition) return;
+    stopVoiceInput();
+    if (event.error !== 'aborted') showToast('Voice input failed. Check microphone permission and try again.', 'error');
+  };
+  try { recognition.start(); }
+  catch (error) {
+    stopVoiceInput();
+    showToast('Could not start voice input. Check microphone permission and try again.', 'error');
+  }
 }
 
 // Window bridge for inline handlers and external hooks

@@ -15,7 +15,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="./styles.css?v=202609050856">
+<link rel="stylesheet" href="./styles.css?v=202609051110">
 </head>
 <body>
 
@@ -119,7 +119,7 @@
         </div>
       </div>
       <input type="file" id="importInput" accept=".json" style="display:none" onchange="importConversation(event)">
-      <button class="toolbar-btn context-toggle" id="contextToggle" onclick="toggleContextPanel()" title="Toggle context panel" aria-label="Toggle context panel" aria-controls="contextPanel" aria-expanded="true">Panel</button>
+      <button class="toolbar-btn context-toggle" id="contextToggle" onclick="toggleContextPanel()" title="Show or hide the conversation panel" aria-label="Toggle conversation panel" aria-controls="contextPanel" aria-expanded="true">Panel</button>
     </div>
   </header>
 
@@ -167,8 +167,8 @@
       <button class="input-btn" onclick="document.getElementById('fileInput').click()" title="Attach file" aria-label="Attach file"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.2 7.3 8.4 12a3.2 3.2 0 0 1-4.5-4.5l5.2-5.2a2.1 2.1 0 0 1 3 3L7 10.4a1.05 1.05 0 0 1-1.5-1.5l4.7-4.7"/></svg></button>
       <input type="file" id="fileInput" multiple style="display:none" onchange="handleFileSelect(event)">
       <textarea id="chatInput" placeholder="Type a message..." rows="1" aria-label="Message" aria-controls="commandDropdown" aria-expanded="false"></textarea>
-      <button class="input-btn" id="voiceBtn" onclick="toggleVoice()" title="Voice input" aria-label="Voice input"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="1.5" width="4" height="7.5" rx="2"/><path d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.5M6 14.5h4"/></svg></button>
-      <button class="input-control-btn" id="contextBtn" onclick="openContextPreview()" title="Review what will be sent" aria-label="Review message context" aria-controls="contextPanel" aria-expanded="true">Context</button>
+      <button class="input-btn" id="voiceBtn" onclick="toggleVoice()" title="Voice input" aria-label="Voice input" aria-pressed="false"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="1.5" width="4" height="7.5" rx="2"/><path d="M3.5 7.5a4.5 4.5 0 0 0 9 0M8 12v2.5M6 14.5h4"/></svg></button>
+      <button class="input-control-btn" id="contextBtn" onclick="openContextPreview()" title="Preview the context sent with your next request" aria-label="Preview request context" aria-controls="contextPanel" aria-expanded="true">Context</button>
       <div class="composer-more">
         <button class="input-control-btn" id="composerMoreBtn" onclick="toggleComposerMenu(event)" title="More composer actions" aria-label="More composer actions" aria-controls="composerMenu" aria-expanded="false">+</button>
         <div class="toolbar-menu composer-menu" id="composerMenu" role="menu" aria-label="Composer actions">
@@ -185,13 +185,13 @@
 </main>
 
 <!-- Conversation context -->
-<aside class="context-panel" id="contextPanel" aria-label="Conversation context" aria-hidden="false">
+<aside class="context-panel" id="contextPanel" aria-label="Conversation panel" aria-hidden="false">
   <header class="context-panel-header">
     <div>
       <span class="context-panel-kicker" id="contextConversationTitle">Current chat</span>
-      <h2>Context</h2>
+      <h2>Conversation panel</h2>
     </div>
-    <button type="button" class="context-panel-close" onclick="toggleContextPanel(false)" aria-label="Close context panel">&times;</button>
+    <button type="button" class="context-panel-close" onclick="toggleContextPanel(false)" aria-label="Close conversation panel">&times;</button>
   </header>
   <div class="context-panel-body">
     <details class="context-panel-section" id="goalSection" open>
@@ -262,14 +262,6 @@
       <option value="lmstudio">LM Studio</option>
       <option value="custom">Custom</option>
     </select>
-    <label for="setupProxy">Base URL</label>
-    <input type="text" id="setupProxy" placeholder="https://api.openai.com/v1" autocomplete="url">
-    <label for="setupApiFormat">API format</label>
-    <select id="setupApiFormat">
-      <option value="auto">Auto-detect</option>
-      <option value="openai">OpenAI-compatible</option>
-      <option value="anthropic">Anthropic Messages</option>
-    </select>
     <div class="password-field-form">
       <input class="sr-only" type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true">
       <label for="setupKey">API Key</label>
@@ -287,6 +279,17 @@
       <button class="model-refresh-btn" type="button" onclick="refreshModels('setup', this)" title="Refresh model list" aria-label="Refresh setup model list"><svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1M13.5 1.5v3h-3"/></svg></button>
     </div>
     <input type="text" id="setupModelManual" placeholder="Or type model name manually" aria-label="Manual model name" oninput="document.getElementById('setupModelSelect').value=''">
+    <details class="settings-disclosure" id="setupAdvanced">
+      <summary>Advanced connection settings</summary>
+      <label for="setupProxy">Base URL</label>
+      <input type="text" id="setupProxy" placeholder="https://api.openai.com/v1" autocomplete="url">
+      <label for="setupApiFormat">API format</label>
+      <select id="setupApiFormat">
+        <option value="auto">Auto-detect</option>
+        <option value="openai">OpenAI-compatible</option>
+        <option value="anthropic">Anthropic Messages</option>
+      </select>
+    </details>
     <div class="connection-test-row"><button type="button" class="btn btn-secondary" onclick="testConnection('setup')">Test connection</button><span id="setupConnectionStatus" class="connection-status" aria-live="polite"></span></div>
     <p class="form-error" id="setupError" role="alert" hidden></p>
     <div class="modal-actions">
@@ -321,8 +324,6 @@
         <option value="lmstudio">LM Studio</option>
         <option value="custom">Custom</option>
       </select>
-      <label for="setProxy">Base URL</label>
-      <input type="text" id="setProxy" placeholder="https://api.openai.com/v1" autocomplete="url">
       <form class="password-field-form" onsubmit="return false">
         <input class="sr-only" type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true">
         <label for="setKey">API Key</label>
@@ -341,6 +342,10 @@
       </div>
       <input type="text" id="setModelManual" placeholder="Or type model name manually" aria-label="Manual model name" oninput="document.getElementById('setModelSelect').value=''">
       <div class="connection-test-row"><button type="button" class="btn btn-secondary" onclick="testConnection('settings')">Test connection</button><span id="settingsConnectionStatus" class="connection-status" aria-live="polite"></span></div>
+      <details class="settings-disclosure" id="settingsConnectionOptions">
+      <summary>Advanced connection and request settings</summary>
+      <label for="setProxy">Base URL</label>
+      <input type="text" id="setProxy" placeholder="https://api.openai.com/v1" autocomplete="url">
       <label for="setContextWindow">Context window</label>
       <input type="number" id="setContextWindow" min="256" step="256" placeholder="Auto from model metadata">
       <div class="setting-hint">Optional per-profile override. Token counts are estimates.</div>
@@ -373,6 +378,7 @@
       <div class="setting-hint">Not sent to Claude Opus 5 / Sonnet 5 / Opus 4.7+ &mdash; those models reject it.</div>
       <label for="setMaxTokens">Max response tokens</label>
       <input type="number" id="setMaxTokens" step="256" min="256" placeholder="8192">
+      <div id="anthropicOptions" hidden>
       <div class="modal-section">Anthropic Options</div>
       <label class="toggle-row">
         <input type="checkbox" id="setPromptCache" checked> Prompt caching
@@ -391,6 +397,7 @@
         <option value="xhigh">Extra high</option>
         <option value="max">Max</option>
       </select>
+      </div>
       <label for="setExtraParams">Extra Parameters (JSON)</label>
       <textarea id="setExtraParams" placeholder='{"temperature": 0.7, "max_tokens": 4096}'></textarea>
       <label for="setExcludeParams">Exclude Parameters (comma-separated)</label>
@@ -398,6 +405,7 @@
       <label for="setPrefill">Assistant Prefill</label>
       <input type="text" id="setPrefill" placeholder="e.g. Sure! Here's">
       <div class="setting-hint">Not supported by Claude Opus 5 / Sonnet 5 / Opus 4.6+ &mdash; leave empty on those models.</div>
+      </details>
     </div>
 
     <div class="settings-tab-content" id="settingsTab-prompts" role="tabpanel" aria-labelledby="settingsTabButton-prompts" hidden>
@@ -526,7 +534,7 @@
     </label>
     <label class="toggle-row">
       <input type="checkbox" id="setForceSearch"> Force tool use
-      <span class="toggle-hint">Always call tools · prevents hallucinating answers</span>
+      <span class="toggle-hint">Requests a tool call when supported; answers still need checking.</span>
     </label>
     <label class="toggle-row">
       <input type="checkbox" id="setUrlFetch"> URL fetching
@@ -755,6 +763,6 @@
   </div>
 </div>
 
-<script type="module" src="./js/main.js?v=202609050856"></script>
+<script type="module" src="./js/main.js?v=202609051110"></script>
 </body>
 </html>

@@ -22,7 +22,7 @@
   --card-bg: #1a211b;
   --error-color: #ff7777;
   --danger-color: #ef4444;
-  --danger-hover: #dc2626;
+  --danger-hover: #f87171;
   --success-color: #22c55e;
   --success-text: #101410;
   --warning-color: #eab308;
@@ -372,6 +372,7 @@ svg.icon {
 .conv-more:hover,
 .conv-more[aria-expanded="true"] { background: var(--hover); color: var(--text-primary); }
 .sidebar-empty { padding: 28px 12px; color: var(--text-secondary); font-size: .82em; text-align: center; }
+.sidebar-empty .btn { min-height: 44px; margin-top: 10px; }
 
 /* Main Area */
 .main {
@@ -583,7 +584,6 @@ svg.icon {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  touch-action: pan-y;
 }
 .chat-placeholder {
   color: var(--text-secondary);
@@ -979,6 +979,10 @@ svg.icon {
 .setup-modal { max-width: 520px; }
 .settings-modal { max-width: 760px; }
 .settings-tab-content[hidden] { display: none !important; }
+.settings-disclosure { margin: 12px 0; border-top: 1px solid var(--card-border); }
+.settings-disclosure > summary { padding: 12px 0; color: var(--text-primary); font-size: .85em; cursor: pointer; }
+.settings-tab.unsaved::after { content: ' *'; }
+.settings-save-status.unsaved { color: var(--text-primary); }
 .form-error {
   min-height: 1.3em;
   margin: 4px 0 8px;
@@ -1817,10 +1821,12 @@ body.theme-light .hljs-symbol, body.theme-light .hljs-bullet, body.theme-light .
   border: 1px solid var(--card-border);
   border-radius: 16px;
   padding: 24px;
-  max-width: 480px;
+  max-width: min(480px, calc(100vw - 24px));
   width: 90%;
   max-height: 80vh;
+  max-height: 80dvh;
   overflow-y: auto;
+  overflow-wrap: anywhere;
   z-index: 1100;
   box-shadow: 0 8px 32px rgba(0,0,0,0.5);
 }
@@ -1916,7 +1922,7 @@ body.theme-light .hljs-symbol, body.theme-light .hljs-bullet, body.theme-light .
   .scroll-fab { width: 44px; height: 44px; bottom: 8px; right: 12px; }
 }
 /* Focus-visible for keyboard navigation */
-button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }

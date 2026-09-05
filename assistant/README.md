@@ -16,7 +16,7 @@ Use it from GitHub Pages, run it from a local server, or download the standalone
 - The toolbar chip opens a searchable profile and model picker. Each assistant swipe records lifecycle, timing, HTTP, and sanitised error metadata.
 - Compare two models before sending. Synapse makes two non-streaming requests and stores both replies as response swipes. A cross-provider key stays in memory only for that comparison.
 
-API keys can be saved as **Remember on this device** (`localStorage`) or **This tab only** (`sessionStorage`). Legacy `llmApiKey` values remain remembered until changed. Browser storage is not an encrypted vault.
+API keys can be saved as **Remember on this device** (`localStorage`) or **This tab only** (`sessionStorage`). Each key is bound to its provider, base URL and API format, so changing the connection in another tab can't send it somewhere else. Older saved keys need one confirmation: review the prefilled connection and save it. Browser storage is not an encrypted vault.
 
 ### Chats
 
@@ -27,9 +27,11 @@ API keys can be saved as **Remember on this device** (`localStorage`) or **This 
 - 'Complete draft' and 'Suggest follow-ups' call the selected provider only when you ask. Suggestions fill the composer and never send themselves.
 - Edit a user message and resend from that point.
 - Regenerate assistant messages and switch between swipes.
+- Failed or interrupted responses keep the text already received. Retry and Continue create another version instead of replacing the old one. A failed response or Stop pauses the follow-up queue.
 - Fork a chat from any message. Parent and child links stay available in the Context panel.
 - Set a per-chat goal and generate or save a conversation summary for context.
-- Use the right Context panel for goals, request previews, per-chat tools, summaries, sources, and related forks. Individual messages can be included or excluded; compaction summarizes older turns without deleting them.
+- Use the right Context panel for goals, request previews, per-chat tools, summaries, sources, and related forks. Individual messages can be included or excluded; compaction summarises older turns without deleting them. Summaries track which turns they cover, and edits or forks discard summaries that cross the changed history.
+- Unfinished Context edits survive redraws and chat switches until you save or discard them. They're session-only, unlike the saved composer draft.
 - Queue follow-up messages, attachments, and one-message model overrides while a response is streaming. Queues persist across reloads but remain paused until you choose Resume.
 - Draft text and pending attachments are saved per conversation and restored after switching chats or reloading.
 - Select message ranges for screenshots.
@@ -101,13 +103,7 @@ Some browsers block requests from `file://` pages. If API calls fail from the st
 
 ### Source Files
 
-If you cloned the repo, you can open `assistant/index.html` directly:
-
-```bash
-open assistant/index.html       # macOS
-xdg-open assistant/index.html   # Linux
-start assistant/index.html      # Windows
-```
+If you cloned the repo, serve the `assistant` directory over HTTP using the instructions below. Opening the source `index.html` directly from disk can block its JavaScript modules; direct file opening is for the standalone build.
 
 ### Local Server
 
@@ -152,20 +148,38 @@ Important keys include:
 | Key | Contents |
 |---|---|
 | `llmProxyUrl` | API base URL |
-| `llmApiKey` | Remembered API key (legacy and current compatibility key) |
+| `llmApiKey` | API key and its approved connection, in the selected device or tab store |
 | `llmModel` | Active model |
 | `assistantProfiles` | Saved connection profiles |
 | `assistantTheme` | Current theme |
-| `assistantCustomTheme` | Custom theme colors |
+| `assistantCustomTheme` | Custom theme colours |
 | `llmPromptEntries` | Prompt entries |
 | `assistantStarterPrompts` | Local starter prompts |
 | `assistantDebug` | Debug logging toggle |
 
 Temporary chats never enter browser storage and disappear on reload or close. Use 'Export backup' in Data settings when you want a copy of everything persistent.
 
-Optional GitHub Gist sync encrypts conversations, memories, projects, prompts, presets, and appearance settings before storing them in a private Gist. Push now creates or updates it; Pull now is always manual. After the first push, you can opt into debounced automatic pushes from the Sync tab. Automatic push is off by default and never pulls or runs on shared read-only pages.
+When two tabs or devices change the same chat independently, Synapse keeps conflicting histories as separate, labelled copies. Choose which one to continue. I don't want a later draft timestamp deciding which conversation you lose.
 
-The Data settings tab reports approximate category sizes and browser usage/quota, provides separate confirmed clear actions, and previews imports before applying them. Imports accept schema-less legacy single-chat files and current bulk files. Merge uses newer `updatedAt` values; Copy remaps IDs; Replace requires an additional confirmation. Export schema version is `synapse-export` version 2. Credentials are excluded from settings/profiles in exports and imports.
+Optional GitHub Gist sync encrypts conversations, memories, projects, prompts, presets and appearance settings. Each push adds a separately named encrypted snapshot rather than replacing another device's files. Pull now is always manual, including applying remote deletions. After the first push, you can opt into automatic pushes from the Sync tab; they're off by default and never run on shared read-only pages.
+
+Older encrypted Gists remain readable. Update Synapse on every device before using the new sync format; older builds don't understand the separate update files. Sync stops adding snapshots at 250 files or a 32 MiB archive, with an 8 MiB limit per snapshot and a 64 MiB read limit. To rotate, pull on all devices, export a backup, then clear the Gist ID and push to create a new archive. Keep the old Gist and its passphrase until you've checked the new one. Generating a replacement passphrase requires explicit consent to start a new Gist.
+
+The Data tab reports approximate storage usage, provides confirmed clear actions and previews imports. Merge preserves divergent chat versions; Copy assigns new IDs; Replace needs another confirmation. Full backups include saved presets. Export schema is `synapse-export` version 2; legacy single-chat files still import. Credentials and unsupported profile settings are excluded.
+
+Import and encrypted sync require a working browser database. Local fallback storage supports editing and exporting, but not the same cross-tab protections. Failed imports leave the database unchanged and restore settings still owned by that attempt. A browser or device crash between database and settings writes isn't an all-or-nothing operation across both stores, so keep backups. If another tab reports a storage upgrade, reload it before editing.
+
+## Checks
+
+With Node, Playwright Core and its matching Chromium already available, run from the repository root:
+
+```bash
+node assistant/tests/run.cjs
+node assistant/tests/run.cjs --standalone
+node assistant/tests/run.cjs release
+```
+
+Set `PLAYWRIGHT_MODULE` to an installed Playwright Core module path if Node can't resolve it. The checks use disposable browser storage and mocked providers, with nonlocal requests blocked. They don't exercise real accounts, microphones or physical touch devices. Rebuild `synapse.html` using the root project notes after changing source files, and update the cache URLs and build date together.
 
 ## Project Files
 
@@ -177,12 +191,13 @@ assistant/
   version.json        Build metadata for local update checks
   favicon.ico
   assets/
-    emotion-sprites/  CC0 emotion sprite images from N8python/claudesona
+    emotion-sprites/  Provider sprites and original Cat artwork
   js/
     main.js           App logic
     lib/
       dom-utils.js    Focus helpers
-      text-utils.js   HTML escaping and color helpers
+      text-utils.js   HTML escaping and colour helpers
+  tests/              Isolated browser regression checks
 ```
 
 ## Browser Support
@@ -198,4 +213,4 @@ Synapse targets current Chrome, Firefox, Safari, and Edge. Some features depend 
 
 Made by [purachina](https://platberlitz.github.io/).
 
-Emotion sprites are from [N8python/claudesona](https://github.com/N8python/claudesona) under CC0 1.0 Universal.
+Claude, GPT and Gemini emotion sprites are from [N8python/claudesona](https://github.com/N8python/claudesona) under CC0 1.0 Universal. The Cat set is original artwork for Synapse.
