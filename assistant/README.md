@@ -64,7 +64,7 @@ API keys can be saved as **Remember on this device** (`localStorage`) or **This 
 - A muted forest-green workbench theme by default, plus built-in themes, a custom colour picker, and light/dark/system toggle.
 - Custom font, message width, font size, and border radius settings.
 - Syntax highlighting, LaTeX, Mermaid diagrams, tables, code blocks, spoilers, and generated image display.
-- Optional local emotion sprites for Claude, GPT, and Gemini output tags, with automatic or manual sprite-set selection.
+- Optional local emotion sprites for Claude, GPT and Gemini, plus a soft-painted Cat with 24 expressions. Choose Cat in Appearance to use it with any model; Auto still follows the model.
 - Mobile layout with touch-friendly controls.
 
 ## Keyboard Shortcuts

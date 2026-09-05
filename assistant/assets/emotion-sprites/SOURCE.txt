@@ -1,3 +1,8 @@
+Claude, GPT and Gemini sprites
 Source: https://github.com/N8python/claudesona
 License: CC0 1.0 Universal
 Upstream version at integration: 1.1.1
+
+Cat sprites
+Original artwork for Synapse, separate from the upstream collection.
+PNG originals and the full expression sheet are in cat-originals/.
