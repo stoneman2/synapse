@@ -12375,7 +12375,6 @@ async function syncReadRemoteConversations(gist, manifest, passphrase, keyCache 
 
 async function syncReadRemoteData(gist, manifest, passphrase) {
   const archiveBytes = Object.values(gist?.files || {}).reduce((sum, file) => sum + (Number(file?.size) || new TextEncoder().encode(file?.content || '').byteLength), 0);
-  if (archiveBytes > 64 * 1024 * 1024) throw new Error('This sync archive exceeds the 64 MiB read limit. Keep it and its passphrase for recovery; no local data was changed.');
   const keyCache = {};
   const decryptFile = async filename => syncDecryptPayload(
     await syncGetGistFileContent(gist, filename), passphrase, keyCache);
