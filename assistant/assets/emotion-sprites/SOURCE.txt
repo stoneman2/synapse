@@ -3,6 +3,6 @@ Source: https://github.com/N8python/claudesona
 License: CC0 1.0 Universal
 Upstream version at integration: 1.1.1
 
-Cat sprites
+Cat, Butler, Maid and Calico Plushie sprites
 Original artwork for Synapse, separate from the upstream collection.
-PNG originals and the full expression sheet are in cat-originals/.
+PNG originals and full expression sheets are in cat-originals/, butler-originals/, maid-originals/ and plushie-originals/.

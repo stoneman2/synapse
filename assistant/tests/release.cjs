@@ -15,7 +15,9 @@ module.exports = async function(page) {
     assert.ok(html.includes('js/main.js?v=' + token));
   }
   for (const text of [main, standalone]) assert.ok(text.includes("buildDate: '" + date + "'"));
-  assert.equal((standalone.match(/"cat_[a-z]+":"data:image\/webp;base64,/g) || []).length, 24);
+  for (const prefix of ['cat', 'butler', 'maid', 'plushie']) {
+    assert.equal((standalone.match(new RegExp('"' + prefix + '_[a-z]+":"data:image/webp;base64,', 'g')) || []).length, 24);
+  }
   assert.ok(!standalone.includes('<script type="module" src="./js/main.js'));
 
   let previous = true;
@@ -68,14 +70,17 @@ module.exports = async function(page) {
     assert.ok((await tab.evaluate(async token => (await (await caches.open('synapse-' + token)).match('./js/main.js?v=' + token)).text(), token)).includes(date));
     await tab.evaluate(async () => {
       await fetch('./version.json');
-      await fetch(getEmotionSpriteAssetUrl('cat_happy'));
+      for (const prefix of ['cat', 'butler', 'maid', 'plushie']) await fetch(getEmotionSpriteAssetUrl(prefix + '_happy'));
     });
     await context.setOffline(true);
     await tab.reload({ waitUntil: 'load' });
     await tab.waitForFunction(() => window.getActiveConv?.()?.id === 'release-chat');
     assert.equal(await tab.evaluate(() => synapseSelfTest().ok), true);
     assert.equal(await tab.evaluate(() => getActiveConv().messages[0].content), 'Keep this through upgrade');
-    assert.equal(await tab.evaluate(async () => (await fetch(getEmotionSpriteAssetUrl('cat_happy'))).ok), true);
+    assert.equal(await tab.evaluate(async () => {
+      const results = await Promise.all(['cat', 'butler', 'maid', 'plushie'].map(prefix => fetch(getEmotionSpriteAssetUrl(prefix + '_happy'))));
+      return results.every(response => response.ok);
+    }), true);
     assert.equal(await tab.evaluate(async () => (await (await fetch('./version.json')).json()).buildDate), date);
     assert.deepEqual(errors, []);
   } finally {

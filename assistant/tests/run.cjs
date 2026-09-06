@@ -25,7 +25,7 @@ const server = http.createServer(async (request, response) => {
     browser = await chromium.launch({ headless: true });
     const args = process.argv.slice(2);
     const suites = args.filter(arg => arg !== '--standalone');
-    for (const name of suites.length ? suites : ['privacy', 'persistence', 'requests', 'context', 'interface']) {
+    for (const name of suites.length ? suites : ['privacy', 'persistence', 'requests', 'context', 'interface', 'sprites']) {
       assert.match(name, /^[a-z]+$/);
       const context = await browser.newContext({ serviceWorkers: 'block', viewport: { width: 1440, height: 1000 } });
       await context.route(/^https?:/, route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());

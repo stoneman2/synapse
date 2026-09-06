@@ -111,7 +111,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-09-05T11:10:36+08:00',
+  buildDate: '2026-09-06T08:39:57+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -323,16 +323,20 @@ const TAG_COLORS = [
 
 const EMOTION_SPRITE_ASSET_PATH = './assets/emotion-sprites/';
 const EMOTION_SPRITE_ASSET_URLS = {};
+const CHARACTER_EMOTIONS = [
+  'neutral', 'happy', 'excited', 'amused', 'playful', 'affectionate',
+  'curious', 'thoughtful', 'focused', 'confident', 'proud', 'relieved',
+  'surprised', 'confused', 'uncertain', 'sceptical', 'embarrassed', 'apologetic',
+  'concerned', 'sad', 'crying', 'frustrated', 'angry', 'sleepy'
+];
 const EMOTION_SPRITE_SETS = {
   claude: ['amused', 'concerned', 'curious', 'frustrated', 'happy', 'playful', 'sad', 'sheepish', 'skeptical', 'thoughtful', 'touched', 'uncertain', 'warm'],
   gpt: ['caution', 'coherence_seeking', 'confidence', 'confusion', 'curiosity', 'focus', 'frustration', 'helpfulness', 'novelty_detection', 'satisfaction', 'surprise', 'uncertainty', 'urgency'],
   gemini: ['caution', 'certainty', 'convergence', 'dissonance', 'equilibrium', 'generative_flow', 'inquisitiveness', 'perplexity', 'resolution', 'resonance', 'saturation', 'uncertainty', 'vigilance'],
-  cat: [
-    'neutral', 'happy', 'excited', 'amused', 'playful', 'affectionate',
-    'curious', 'thoughtful', 'focused', 'confident', 'proud', 'relieved',
-    'surprised', 'confused', 'uncertain', 'sceptical', 'embarrassed', 'apologetic',
-    'concerned', 'sad', 'crying', 'frustrated', 'angry', 'sleepy'
-  ]
+  cat: CHARACTER_EMOTIONS,
+  butler: CHARACTER_EMOTIONS,
+  maid: CHARACTER_EMOTIONS,
+  plushie: CHARACTER_EMOTIONS
 };
 const EMOTION_SPRITE_NAMES = Object.fromEntries(Object.entries(EMOTION_SPRITE_SETS).flatMap(([prefix, emotions]) => emotions.map(emotion => [prefix + '_' + emotion, prefix])));
 const EMOTION_SPRITE_TAG_RE = new RegExp('<[\\s\\u200B\\u200C\\u200D\\uFEFF]*(' + Object.keys(EMOTION_SPRITE_NAMES).join('|') + ')[\\s\\u200B\\u200C\\u200D\\uFEFF]*(?:/[\\s\\u200B\\u200C\\u200D\\uFEFF]*)?>', 'g');
@@ -11649,11 +11653,13 @@ function synapseSelfTest() {
       storedSync.passphrase === (localStorage.getItem('assistantSyncPassphrase') || ''), 'auto-push stored configuration');
     EMOTION_SPRITE_TAG_RE.lastIndex = 0;
     assert(EMOTION_SPRITE_TAG_RE.test('<gpt_helpfulness />'), 'emotion sprite tag');
-    assert(EMOTION_SPRITE_SETS.cat.length === 24 && new Set(EMOTION_SPRITE_SETS.cat).size === 24, '24 distinct cat expressions');
-    for (const emotion of EMOTION_SPRITE_SETS.cat) {
-      const name = 'cat_' + emotion;
-      EMOTION_SPRITE_TAG_RE.lastIndex = 0;
-      assert(EMOTION_SPRITE_NAMES[name] === 'cat' && EMOTION_SPRITE_TAG_RE.test('<' + name + ' />'), 'cat expression tag: ' + emotion);
+    for (const prefix of ['cat', 'butler', 'maid', 'plushie']) {
+      assert(EMOTION_SPRITE_SETS[prefix].length === 24 && new Set(EMOTION_SPRITE_SETS[prefix]).size === 24, '24 distinct ' + prefix + ' expressions');
+      for (const emotion of EMOTION_SPRITE_SETS[prefix]) {
+        const name = prefix + '_' + emotion;
+        EMOTION_SPRITE_TAG_RE.lastIndex = 0;
+        assert(EMOTION_SPRITE_NAMES[name] === prefix && EMOTION_SPRITE_TAG_RE.test('<' + name + ' />'), 'expression tag: ' + name);
+      }
     }
     const result = { ok: true, checks: ['normalization', 'goal and queue', 'fork lineage', 'context filtering', 'source numbering', 'legacy import', 'legacy branches', 'legacy settings', 'trust boundaries', 'request targets', 'manual AI parsing', 'comparison alignment', 'sync filenames', 'persistence arbitration', 'tombstones', 'temporary chat isolation', 'updatedAt merge', 'auto-push configuration', 'auto-push stored configuration', 'emotion sprite tag'] };
     console.info('Synapse self-test passed', result);
