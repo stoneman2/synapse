@@ -11884,6 +11884,17 @@ function syncSetStatus(state, message, details) {
     status.setAttribute('aria-live', 'polite');
   }
   if (detailsEl) detailsEl.textContent = details || '';
+  const indicator = document.getElementById('syncIndicator');
+  const quick = document.getElementById('syncQuickStatus');
+  const button = document.getElementById('syncQuickButton');
+  const cfg = syncGetStoredConfig();
+  if (indicator) {
+    indicator.hidden = readOnlyShare || !cfg.token || !cfg.passphrase;
+    indicator.className = 'sync-indicator ' + (state || 'unknown');
+    indicator.title = details || message || 'Sync status';
+  }
+  if (quick) quick.textContent = message || 'Sync status';
+  if (button) button.disabled = state === 'checking';
 }
 
 function setSyncBusy(busy) {

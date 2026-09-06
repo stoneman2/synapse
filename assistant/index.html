@@ -88,6 +88,11 @@
       <span class="toolbar-title" id="toolbarTitle">New Chat</span>
     </div>
     <div class="toolbar-right">
+      <div class="sync-indicator unknown" id="syncIndicator" hidden>
+        <span class="sync-indicator-dot" aria-hidden="true"></span>
+        <span class="sync-indicator-text" id="syncQuickStatus" role="status">Sync status</span>
+        <button class="sync-quick-button" id="syncQuickButton" type="button" onclick="syncPullFromGist()" title="Sync now: pull latest changes" aria-label="Sync now: pull latest changes">&#8635;</button>
+      </div>
       <div class="connection-picker-wrap">
         <button class="connection-chip" id="connectionChip" onclick="toggleConnectionPicker(event)" title="Switch model or profile" aria-label="Switch model or profile" aria-controls="connectionPicker" aria-expanded="false">
           <span class="connection-chip-provider" id="connectionChipProvider">Not connected</span>

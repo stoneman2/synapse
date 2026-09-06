@@ -1087,6 +1087,35 @@ svg.icon {
   font-size: 0.8em;
   line-height: 1.4;
 }
+.sync-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  height: 32px;
+  padding-left: 9px;
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  background: var(--hover);
+  font-size: 0.72em;
+  font-weight: 600;
+}
+.sync-indicator[hidden] { display: none; }
+.sync-indicator-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--text-secondary); }
+.sync-indicator.current .sync-indicator-dot { background: var(--success-color); }
+.sync-indicator.checking .sync-indicator-dot { background: var(--accent); }
+.sync-indicator.unknown .sync-indicator-dot,
+.sync-indicator.dirty .sync-indicator-dot,
+.sync-indicator.offline .sync-indicator-dot,
+.sync-indicator.paused .sync-indicator-dot { background: var(--warning-color); }
+.sync-indicator-text { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sync-quick-button { width: 32px; height: 30px; padding: 0; border: 0; border-left: 1px solid var(--card-border); border-radius: 0 7px 7px 0; color: var(--text-secondary); background: transparent; font: inherit; font-size: 16px; cursor: pointer; }
+.sync-quick-button:hover:not(:disabled) { color: var(--text-primary); background: var(--overlay-10); }
+.sync-quick-button:disabled { cursor: wait; opacity: 0.6; }
+@media (max-width: 768px) {
+  .sync-indicator-text { display: none; }
+}
 .sync-passphrase-row input {
   min-width: 0;
   margin-bottom: 0;
@@ -2400,6 +2429,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
       <span class="toolbar-title" id="toolbarTitle">New Chat</span>
     </div>
     <div class="toolbar-right">
+      <div class="sync-indicator unknown" id="syncIndicator" hidden>
+        <span class="sync-indicator-dot" aria-hidden="true"></span>
+        <span class="sync-indicator-text" id="syncQuickStatus" role="status">Sync status</span>
+        <button class="sync-quick-button" id="syncQuickButton" type="button" onclick="syncPullFromGist()" title="Sync now: pull latest changes" aria-label="Sync now: pull latest changes">&#8635;</button>
+      </div>
       <div class="connection-picker-wrap">
         <button class="connection-chip" id="connectionChip" onclick="toggleConnectionPicker(event)" title="Switch model or profile" aria-label="Switch model or profile" aria-controls="connectionPicker" aria-expanded="false">
           <span class="connection-chip-provider" id="connectionChipProvider">Not connected</span>
@@ -15026,6 +15060,17 @@ function syncSetStatus(state, message, details) {
     status.setAttribute('aria-live', 'polite');
   }
   if (detailsEl) detailsEl.textContent = details || '';
+  const indicator = document.getElementById('syncIndicator');
+  const quick = document.getElementById('syncQuickStatus');
+  const button = document.getElementById('syncQuickButton');
+  const cfg = syncGetStoredConfig();
+  if (indicator) {
+    indicator.hidden = readOnlyShare || !cfg.token || !cfg.passphrase;
+    indicator.className = 'sync-indicator ' + (state || 'unknown');
+    indicator.title = details || message || 'Sync status';
+  }
+  if (quick) quick.textContent = message || 'Sync status';
+  if (button) button.disabled = state === 'checking';
 }
 
 function setSyncBusy(busy) {
