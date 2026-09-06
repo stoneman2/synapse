@@ -15557,7 +15557,6 @@ async function syncBuildGistFiles(passphrase, existingManifest = null, merged = 
   };
   const filename = 'synapse-update-' + syncBytesToBase64Url(syncRandomBytes(24)) + '.json.enc';
   const content = await syncEncryptPayloadWithKey(payload, context);
-  if (new TextEncoder().encode(content).byteLength > 8 * 1024 * 1024) throw new Error('This encrypted snapshot exceeds the 8 MiB sync limit. Export a local backup and reduce attachments before retrying.');
   const files = { [filename]: { content } };
   const manifest = {
     version: 2, app: 'Synapse', schema: 'gist-sync-v2', salt: context.saltBase64,
