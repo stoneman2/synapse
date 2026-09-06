@@ -12088,14 +12088,15 @@ async function fetchGistResponse(url, options = {}, token = '') {
   };
   if (token) headers.Authorization = 'Bearer ' + token;
   const response = await fetch(url, { ...options, headers });
-  if (!response.ok) {
+  if (!response.ok && response.status !== 304) {
     const error = new Error(syncFormatGistError(response, await response.text()));
     error.status = response.status;
     throw error;
   }
   return {
-    data: response.status === 204 ? null : await response.json(),
-    etag: response.headers.get('etag') || ''
+    data: response.status === 204 || response.status === 304 ? null : await response.json(),
+    etag: response.headers.get('etag') || '',
+    notModified: response.status === 304
   };
 }
 
@@ -12481,6 +12482,11 @@ async function syncPushToGist(options = {}) {
       if (Object.keys(gist.files || {}).length >= 250) throw new Error('This sync Gist has reached the 250-file safety limit. Pull on all devices and export a backup, then clear the Gist ID to start a new one.');
       await syncReadRemoteData(gist, existingManifest, cfg.passphrase); // Verify the key, without applying remote data locally.
       built = await syncBuildGistFiles(cfg.passphrase, existingManifest, local);
+      if (built.hash && built.hash === localStorage.getItem('assistantSyncLastHash')) {
+        syncSetStatus('current', 'Already synced', 'No local changes need to be pushed.');
+        succeeded = true;
+        return true;
+      }
       const size = Object.values(gist.files || {}).reduce((sum, file) => sum + (Number(file?.size) || new TextEncoder().encode(file?.content || '').byteLength), 0);
       if (gist.files?.[built.filename]) throw new Error('Sync update name already exists. Retry; no remote file was changed.');
       await fetchGistResponse(url, {
@@ -12746,7 +12752,16 @@ async function syncPullFromGist(options = {}) {
     await saveConversationImmediately();
     await loadMemories();
     syncSetStatus('checking', 'Pulling...', 'Fetching and decrypting sync files.');
-    const gist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+    const headers = {};
+    const lastEtag = localStorage.getItem('assistantSyncLastEtag') || '';
+    if (!options.force && lastEtag) headers['If-None-Match'] = lastEtag;
+    const remoteResponse = await fetchGistResponse(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store', headers }, cfg.token);
+    if (remoteResponse.notModified) {
+      syncSetStatus('current', 'Already synced', 'No remote changes were found.');
+      return true;
+    }
+    const gist = remoteResponse.data;
+    if (remoteResponse.etag) localStorage.setItem('assistantSyncLastEtag', remoteResponse.etag);
     const manifest = await syncReadManifest(gist, cfg.token);
     const remote = await syncReadRemoteData(gist, manifest, cfg.passphrase);
     await saveConversationImmediately();
