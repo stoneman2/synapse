@@ -111,7 +111,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-09-06T08:39:57+08:00',
+  buildDate: '2026-09-06T08:59:19+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -336,7 +336,8 @@ const EMOTION_SPRITE_SETS = {
   cat: CHARACTER_EMOTIONS,
   butler: CHARACTER_EMOTIONS,
   maid: CHARACTER_EMOTIONS,
-  plushie: CHARACTER_EMOTIONS
+  plushie: CHARACTER_EMOTIONS,
+  zom: CHARACTER_EMOTIONS
 };
 const EMOTION_SPRITE_NAMES = Object.fromEntries(Object.entries(EMOTION_SPRITE_SETS).flatMap(([prefix, emotions]) => emotions.map(emotion => [prefix + '_' + emotion, prefix])));
 const EMOTION_SPRITE_TAG_RE = new RegExp('<[\\s\\u200B\\u200C\\u200D\\uFEFF]*(' + Object.keys(EMOTION_SPRITE_NAMES).join('|') + ')[\\s\\u200B\\u200C\\u200D\\uFEFF]*(?:/[\\s\\u200B\\u200C\\u200D\\uFEFF]*)?>', 'g');
@@ -11653,7 +11654,7 @@ function synapseSelfTest() {
       storedSync.passphrase === (localStorage.getItem('assistantSyncPassphrase') || ''), 'auto-push stored configuration');
     EMOTION_SPRITE_TAG_RE.lastIndex = 0;
     assert(EMOTION_SPRITE_TAG_RE.test('<gpt_helpfulness />'), 'emotion sprite tag');
-    for (const prefix of ['cat', 'butler', 'maid', 'plushie']) {
+    for (const prefix of ['cat', 'butler', 'maid', 'plushie', 'zom']) {
       assert(EMOTION_SPRITE_SETS[prefix].length === 24 && new Set(EMOTION_SPRITE_SETS[prefix]).size === 24, '24 distinct ' + prefix + ' expressions');
       for (const emotion of EMOTION_SPRITE_SETS[prefix]) {
         const name = prefix + '_' + emotion;

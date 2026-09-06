@@ -15,7 +15,7 @@ module.exports = async function(page) {
     assert.ok(html.includes('js/main.js?v=' + token));
   }
   for (const text of [main, standalone]) assert.ok(text.includes("buildDate: '" + date + "'"));
-  for (const prefix of ['cat', 'butler', 'maid', 'plushie']) {
+  for (const prefix of ['cat', 'butler', 'maid', 'plushie', 'zom']) {
     assert.equal((standalone.match(new RegExp('"' + prefix + '_[a-z]+":"data:image/webp;base64,', 'g')) || []).length, 24);
   }
   assert.ok(!standalone.includes('<script type="module" src="./js/main.js'));
@@ -70,7 +70,7 @@ module.exports = async function(page) {
     assert.ok((await tab.evaluate(async token => (await (await caches.open('synapse-' + token)).match('./js/main.js?v=' + token)).text(), token)).includes(date));
     await tab.evaluate(async () => {
       await fetch('./version.json');
-      for (const prefix of ['cat', 'butler', 'maid', 'plushie']) await fetch(getEmotionSpriteAssetUrl(prefix + '_happy'));
+      for (const prefix of ['cat', 'butler', 'maid', 'plushie', 'zom']) await fetch(getEmotionSpriteAssetUrl(prefix + '_happy'));
     });
     await context.setOffline(true);
     await tab.reload({ waitUntil: 'load' });
@@ -78,7 +78,7 @@ module.exports = async function(page) {
     assert.equal(await tab.evaluate(() => synapseSelfTest().ok), true);
     assert.equal(await tab.evaluate(() => getActiveConv().messages[0].content), 'Keep this through upgrade');
     assert.equal(await tab.evaluate(async () => {
-      const results = await Promise.all(['cat', 'butler', 'maid', 'plushie'].map(prefix => fetch(getEmotionSpriteAssetUrl(prefix + '_happy'))));
+      const results = await Promise.all(['cat', 'butler', 'maid', 'plushie', 'zom'].map(prefix => fetch(getEmotionSpriteAssetUrl(prefix + '_happy'))));
       return results.every(response => response.ok);
     }), true);
     assert.equal(await tab.evaluate(async () => (await (await fetch('./version.json')).json()).buildDate), date);

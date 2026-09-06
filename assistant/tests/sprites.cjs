@@ -8,10 +8,10 @@ module.exports = async function(page) {
   await page.evaluate(() => closeModal('setupModal'));
   await page.evaluate(() => openSettingsSection('appearance'));
   assert.deepEqual(await page.locator('#setEmotionSpriteSet option').evaluateAll(options => options.map(option => option.value)),
-    ['auto', 'claude', 'gpt', 'gemini', 'cat', 'butler', 'maid', 'plushie']);
+    ['auto', 'claude', 'gpt', 'gemini', 'cat', 'butler', 'maid', 'plushie', 'zom']);
   await page.locator('#setEmotionSprites').check();
 
-  for (const prefix of ['cat', 'butler', 'maid', 'plushie']) {
+  for (const prefix of ['cat', 'butler', 'maid', 'plushie', 'zom']) {
     await page.locator('#setEmotionSpriteSet').selectOption(prefix);
     await page.waitForFunction(prefix => localStorage.getItem('llmEmotionSpriteSet') === prefix && areEmotionSpritesEnabled(), prefix);
     await page.reload({ waitUntil: 'networkidle' });

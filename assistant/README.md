@@ -66,7 +66,7 @@ API keys can be saved as **Remember on this device** (`localStorage`) or **This 
 - A muted forest-green workbench theme by default, plus built-in themes, a custom colour picker, and light/dark/system toggle.
 - Custom font, message width, font size, and border radius settings.
 - Syntax highlighting, LaTeX, Mermaid diagrams, tables, code blocks, spoilers, and generated image display.
-- Optional local emotion sprites for Claude, GPT and Gemini, plus Cat, Butler, Maid and Calico Plushie with 24 expressions each. Choose a character in Appearance to use it with any model; Auto still follows the model.
+- Optional local emotion sprites for Claude, GPT and Gemini, plus Cat, Butler, Maid, Calico Plushie and Zom with 24 expressions each. Choose a character in Appearance to use it with any model; Auto still follows the model.
 - Mobile layout with touch-friendly controls.
 
 ## Keyboard Shortcuts
@@ -213,4 +213,4 @@ Synapse targets current Chrome, Firefox, Safari, and Edge. Some features depend 
 
 Made by [purachina](https://platberlitz.github.io/).
 
-Claude, GPT and Gemini emotion sprites are from [N8python/claudesona](https://github.com/N8python/claudesona) under CC0 1.0 Universal. Cat, Butler, Maid and Calico Plushie are original artwork for Synapse.
+Claude, GPT and Gemini emotion sprites are from [N8python/claudesona](https://github.com/N8python/claudesona) under CC0 1.0 Universal. Cat, Butler, Maid and Calico Plushie are original artwork for Synapse. Zom's expression set is based on a supplied character reference and is separate from that CC0 collection.
