@@ -1,3 +1,12 @@
+Claude, GPT and Gemini sprites
 Source: https://github.com/N8python/claudesona
 License: CC0 1.0 Universal
 Upstream version at integration: 1.1.1
+
+Cat, Butler, Maid and Calico Plushie sprites
+Original artwork for Synapse, separate from the upstream collection.
+PNG originals and full expression sheets are in cat-originals/, butler-originals/, maid-originals/ and plushie-originals/.
+
+Zom sprites
+Expression artwork based on a supplied character reference, separate from the upstream CC0 collection.
+PNG originals and the full expression sheet are in zom-originals/.
