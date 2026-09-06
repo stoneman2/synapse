@@ -12482,7 +12482,6 @@ async function syncPushToGist(options = {}) {
       await syncReadRemoteData(gist, existingManifest, cfg.passphrase); // Verify the key, without applying remote data locally.
       built = await syncBuildGistFiles(cfg.passphrase, existingManifest, local);
       const size = Object.values(gist.files || {}).reduce((sum, file) => sum + (Number(file?.size) || new TextEncoder().encode(file?.content || '').byteLength), 0);
-      if (size + new TextEncoder().encode(built.files[built.filename].content).byteLength > 32 * 1024 * 1024) throw new Error('This sync archive would exceed 32 MiB. Pull on all devices and export a backup, then start a new Gist. The old Gist is unchanged.');
       if (gist.files?.[built.filename]) throw new Error('Sync update name already exists. Retry; no remote file was changed.');
       await fetchGistResponse(url, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' },
