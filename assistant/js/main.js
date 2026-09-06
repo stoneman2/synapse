@@ -3745,7 +3745,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   const shareId = new URLSearchParams(location.search).get('share');
   readOnlyShare = !!shareId;
   if (readOnlyShare) document.body.classList.add('share-view');
-  if (!readOnlyShare) window.addEventListener('online', () => syncRunAutoPush());
+  if (!readOnlyShare) {
+    window.addEventListener('online', () => syncScheduleAutoPull(true));
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') syncScheduleAutoPull();
+    });
+    window.addEventListener('focus', () => syncScheduleAutoPull());
+  }
 
   if (!readOnlyShare) {
     // Migration: strip endpoint suffix from proxy URL
@@ -3781,7 +3787,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     migrateToPromptEntries();
     await loadConversations();
     initConversationChannel();
-    void syncRunAutoPush();
+    void syncRunAutoPull(true).then(() => syncRunAutoPush());
   }
   loadTheme();
   loadCustomFont(localStorage.getItem('assistantFont') || '');
@@ -11691,11 +11697,14 @@ function syncGetDeviceId() {
 
 let _syncInputsLoaded = false;
 let _syncAutoPushTimer;
+let _syncAutoPullTimer;
+let _syncLastAutoPullAt = 0;
 let _syncOperationInFlight = false;
 // Pull replaces all local state, so it alone must lock the UI. Push only
 // snapshots local data into the Gist; anything changed mid-push is picked up
 // by the next auto-push, so the app stays usable while a push runs.
 let _syncPullInFlight = false;
+const SYNC_AUTO_PULL_COOLDOWN = 15000;
 
 function syncAutoPushIsConfigured(cfg) {
   return !!(cfg?.token && cfg?.passphrase && cfg?.gistId);
@@ -11776,6 +11785,29 @@ async function syncRunAutoPush() {
     syncSetStatus('unknown', 'Auto-push unavailable', 'Browser storage failed. Free storage and retry.');
     return false;
   }
+}
+
+async function syncRunAutoPull(force = false) {
+  if (readOnlyShare || navigator.onLine === false || _syncOperationInFlight || _syncPullInFlight) return false;
+  const cfg = syncGetStoredConfig();
+  if (!syncAutoPushIsConfigured(cfg)) return false;
+  const now = Date.now();
+  if (!force && now - _syncLastAutoPullAt < SYNC_AUTO_PULL_COOLDOWN) return false;
+  _syncLastAutoPullAt = now;
+  try {
+    return await syncPullFromGist({ auto: true });
+  } catch (error) {
+    console.warn('Automatic sync pull failed:', error);
+    return false;
+  }
+}
+
+function syncScheduleAutoPull(force = false) {
+  clearTimeout(_syncAutoPullTimer);
+  _syncAutoPullTimer = setTimeout(() => {
+    _syncAutoPullTimer = null;
+    void syncRunAutoPull(force);
+  }, force ? 0 : 250);
 }
 
 function syncToggleAutoPush(input) {
@@ -12669,18 +12701,19 @@ async function syncCapturePullSnapshot() {
   };
 }
 
-async function syncPullFromGist() {
+async function syncPullFromGist(options = {}) {
+  const auto = options.auto === true;
   if (readOnlyShare) return false;
   if (sending || streaming || queueingFollowUp) {
-    showToast('Stop the current response before pulling sync data.', 'info');
+    if (!auto) showToast('Stop the current response before pulling sync data.', 'info');
     return false;
   }
   if (pendingAttachmentReads > 0) {
-    showToast('Wait for attachments to finish reading.', 'info');
+    if (!auto) showToast('Wait for attachments to finish reading.', 'info');
     return false;
   }
   if (localDataOperationsInFlight > 0) {
-    showToast('Wait for local data changes to finish.', 'info');
+    if (!auto) showToast('Wait for local data changes to finish.', 'info');
     return false;
   }
   if (_syncOperationInFlight) {
