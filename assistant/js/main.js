@@ -111,12 +111,15 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-09-06T08:59:19+08:00',
+  buildDate: '2026-09-07T05:38:00+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
 const SYNC_GIST_API_URL = 'https://api.github.com/gists';
 const SYNC_KDF_ITERATIONS = 120000;
+const SYNC_FILE_MAX_BYTES = 8 * 1024 * 1024;
+const SYNC_ARCHIVE_MAX_BYTES = 32 * 1024 * 1024;
+const SYNC_UPDATE_FILE = /^synapse-update-[A-Za-z0-9_-]+\.json\.enc$/;
 const SYNC_AUTO_PUSH_KEY = 'assistantSyncAutoPush';
 const SYNC_AUTO_PENDING_KEY = 'assistantSyncAutoPushPending';
 const SYNC_TOMBSTONES_KEY = 'assistantSyncTombstones';
@@ -12120,12 +12123,13 @@ async function syncGetGistFileContent(gist, filename) {
 
 async function syncReadManifest(gist, token) {
   if (gist?.truncated) throw new Error('GitHub truncated the file list. Keep this Gist as a backup and start a new sync Gist; no data was changed.');
-  const hasUpdates = Object.keys(gist?.files || {}).some(name => /^synapse-update-[A-Za-z0-9_-]+\.json\.enc$/.test(name));
+  const hasUpdates = Object.keys(gist?.files || {}).some(name => SYNC_UPDATE_FILE.test(name));
   const hasLegacyChats = Object.keys(gist?.files || {}).some(name => /^conv_.+\.json\.enc$/.test(name));
-  try {
+  if (gist?.files?.['manifest.json']) {
     const manifest = JSON.parse(await syncGetGistFileContent(gist, 'manifest.json', token));
-    if (manifest?.app === 'Synapse' && ['gist-sync-v1', 'gist-sync-v2'].includes(manifest.schema)) return manifest;
-  } catch (error) { if (!hasUpdates && !hasLegacyChats) throw error; }
+    if (manifest?.app === 'Synapse' && ['gist-sync-v1', 'gist-sync-v2', 'gist-sync-v3'].includes(manifest.schema)) return manifest;
+    throw new Error('Unsupported sync format. Update Synapse on this device before syncing.');
+  }
   if (hasLegacyChats) return { app: 'Synapse', schema: 'gist-sync-v1', version: 1 };
   if (hasUpdates) return { app: 'Synapse', schema: 'gist-sync-v2', version: 2 };
   throw new Error('This Gist does not look like a Synapse sync Gist.');
@@ -12374,12 +12378,12 @@ async function syncReadRemoteConversations(gist, manifest, passphrase, keyCache 
 }
 
 async function syncReadRemoteData(gist, manifest, passphrase) {
-  const archiveBytes = Object.values(gist?.files || {}).reduce((sum, file) => sum + (Number(file?.size) || new TextEncoder().encode(file?.content || '').byteLength), 0);
+  if (syncGistSize(gist.files) > 2 * SYNC_ARCHIVE_MAX_BYTES) throw new Error('This sync archive exceeds the 64 MiB read limit. Keep it and its passphrase for recovery; no local data was changed.');
   const keyCache = {};
   const decryptFile = async filename => syncDecryptPayload(
     await syncGetGistFileContent(gist, filename), passphrase, keyCache);
   const existingFile = (pointer, fallback) => pointer || (gist?.files?.[fallback] ? fallback : '');
-  const legacy = manifest.schema === 'gist-sync-v1';
+  const legacy = manifest.schema === 'gist-sync-v1' || manifest.legacy === true;
   const settingsFile = legacy && existingFile(manifest.files?.settings, 'settings.json.enc');
   const memoriesFile = legacy && existingFile(manifest.files?.memories, 'memories.json.enc');
   const projectsFile = legacy && existingFile(manifest.files?.projects, 'projects.json.enc');
@@ -12395,11 +12399,9 @@ async function syncReadRemoteData(gist, manifest, passphrase) {
     projects: normalizeProjectList(projectsPayload.projects),
     tombstones: syncNormalizeTombstones(tombstonesPayload.tombstones)
   };
-  const updates = Object.keys(gist?.files || {}).filter(name => /^synapse-update-[A-Za-z0-9_-]+\.json\.enc$/.test(name)).sort();
-  for (const filename of updates) {
-    const update = await decryptFile(filename);
-    if (update?.app !== 'Synapse' || update.schema !== 'gist-sync-update-v2' || !Array.isArray(update.conversations) ||
-        !Array.isArray(update.memories) || !Array.isArray(update.projects)) throw new Error('Invalid sync update: ' + filename);
+  remote.archive = await syncReadArchiveUpdates(gist, passphrase, keyCache);
+  for (const filename of [...remote.archive.updates.keys()].sort()) {
+    const update = remote.archive.updates.get(filename);
     remote.tombstones = syncMergeTombstones(remote.tombstones, update.tombstones);
     remote.settingsState = syncMergeSettingsStates(remote.settingsState, update.settingsState);
     remote.conversations.push(...update.conversations);
@@ -12410,7 +12412,99 @@ async function syncReadRemoteData(gist, manifest, passphrase) {
   return remote;
 }
 
-// Each push owns a new file. GitHub leaves omitted files unchanged; no manifest race can hide an update.
+function syncGistSize(files) {
+  return Object.values(files || {}).reduce((sum, file) => sum + (Number(file?.size) || new TextEncoder().encode(file?.content || '').byteLength), 0);
+}
+
+// Keep original update names and boundaries: conflict reconciliation is order-sensitive.
+// Only repeated string storage is removed, never historical edits or deletion ancestry.
+function syncPackUpdates(updates) {
+  const strings = [];
+  const indices = new Map();
+  const json = JSON.stringify([...updates], (key, value) => {
+    if (typeof value !== 'string' || (value.length < 256 && !value.startsWith('~synapse:'))) return value;
+    if (!indices.has(value)) { indices.set(value, strings.length); strings.push(value); }
+    return '~synapse:' + indices.get(value);
+  });
+  return { app: 'Synapse', schema: 'gist-sync-pack-v3', json, strings };
+}
+
+async function syncReadArchiveUpdates(gist, passphrase, keyCache = {}) {
+  if (gist?.truncated) throw new Error('GitHub returned an incomplete sync file list. No files were changed.');
+  const updates = new Map();
+  const hashes = new Map();
+  const snapshotHashes = new Set();
+  const sourceFiles = new Set();
+  for (const filename of Object.keys(gist?.files || {}).filter(name => SYNC_UPDATE_FILE.test(name)).sort()) {
+    let payload = await syncDecryptPayload(await syncGetGistFileContent(gist, filename), passphrase, keyCache);
+    sourceFiles.add(filename);
+    if (payload?.app === 'Synapse' && payload.schema === 'gist-sync-parts-v3') {
+      if (!Number.isSafeInteger(payload.bytes) || payload.bytes <= 0 || payload.bytes > SYNC_ARCHIVE_MAX_BYTES ||
+          payload.parts !== Math.ceil(payload.bytes / SYNC_FILE_MAX_BYTES) || !/^[a-f0-9]{64}$/.test(payload.hash)) throw new Error('Invalid split sync update: ' + filename);
+      const parts = [];
+      for (let i = 0; i < payload.parts; i++) {
+        const name = filename + '.part-' + i;
+        const part = await syncGetGistFileContent(gist, name);
+        if (part.length !== Math.min(SYNC_FILE_MAX_BYTES, payload.bytes - i * SYNC_FILE_MAX_BYTES)) throw new Error('Incomplete sync part: ' + name);
+        parts.push(part);
+        sourceFiles.add(name);
+      }
+      const content = parts.join('');
+      if (await syncSha256Hex(content) !== payload.hash) throw new Error('Damaged split sync update: ' + filename);
+      payload = await syncDecryptPayload(content, passphrase, keyCache);
+    }
+    let entries = [[filename, payload]];
+    if (payload?.app === 'Synapse' && payload.schema === 'gist-sync-pack-v3') {
+      if (typeof payload.json !== 'string' || !Array.isArray(payload.strings) || payload.strings.some(value => typeof value !== 'string')) throw new Error('Invalid packed sync update: ' + filename);
+      entries = JSON.parse(payload.json, (key, value) => {
+        if (typeof value !== 'string' || !value.startsWith('~synapse:')) return value;
+        const index = value.slice(9);
+        if (!/^(0|[1-9][0-9]*)$/.test(index) || !Object.hasOwn(payload.strings, index)) throw new Error('Missing packed sync text: ' + filename);
+        return payload.strings[index];
+      });
+      if (!Array.isArray(entries) || !entries.length) throw new Error('Empty packed sync update: ' + filename);
+    }
+    for (const entry of entries) {
+      if (!Array.isArray(entry) || entry.length !== 2) throw new Error('Invalid packed sync entry: ' + filename);
+      const [name, update] = entry;
+      if (typeof name !== 'string' || !SYNC_UPDATE_FILE.test(name) || update?.app !== 'Synapse' || update.schema !== 'gist-sync-update-v2' ||
+          !Array.isArray(update.conversations) || !Array.isArray(update.memories) || !Array.isArray(update.projects)) throw new Error('Unsupported or invalid sync update: ' + filename);
+      const hash = await syncSha256Hex(update);
+      if (hashes.has(name) && hashes.get(name) !== hash) throw new Error('Conflicting copies of sync update: ' + name);
+      if (updates.has(name)) continue;
+      hashes.set(name, hash);
+      updates.set(name, update);
+      snapshotHashes.add(await syncSha256Hex({ ...update, updatedAt: 0 }));
+    }
+  }
+  return { updates, hashes, snapshotHashes, sourceFiles };
+}
+
+// Fresh names keep concurrent writes discoverable. A v3 envelope also makes old v2 readers stop,
+// even those which fall back to filename discovery after rejecting a newer manifest.
+async function syncBuildUpdateFiles(payload, context, filename, existingManifest) {
+  let content = await syncEncryptPayloadWithKey(payload, context);
+  if (content.length > SYNC_FILE_MAX_BYTES && payload.schema === 'gist-sync-update-v2') {
+    payload = syncPackUpdates(new Map([[filename, payload]]));
+    content = await syncEncryptPayloadWithKey(payload, context);
+  }
+  if (content.length > SYNC_ARCHIVE_MAX_BYTES) throw new Error('The sync data still exceeds 32 MiB after consolidation. Export a backup before reducing stored data; the existing Gist was not changed.');
+  const files = {};
+  const split = content.length > SYNC_FILE_MAX_BYTES;
+  if (split) {
+    for (let i = 0; i * SYNC_FILE_MAX_BYTES < content.length; i++) files[filename + '.part-' + i] = { content: content.slice(i * SYNC_FILE_MAX_BYTES, (i + 1) * SYNC_FILE_MAX_BYTES) };
+    files[filename] = { content: await syncEncryptPayloadWithKey({ app: 'Synapse', schema: 'gist-sync-parts-v3', parts: Object.keys(files).length, bytes: content.length, hash: await syncSha256Hex(content) }, context) };
+  } else files[filename] = { content };
+  const version = split || payload.schema === 'gist-sync-pack-v3' || existingManifest?.schema === 'gist-sync-v3' ? 3 : 2;
+  const manifest = {
+    ...existingManifest, version, app: 'Synapse', schema: 'gist-sync-v' + version, salt: context.saltBase64,
+    kdf: { name: 'PBKDF2-SHA256', iterations: SYNC_KDF_ITERATIONS }
+  };
+  if (existingManifest?.schema === 'gist-sync-v1') manifest.legacy = true;
+  if (!existingManifest || (version === 3 && existingManifest.schema !== 'gist-sync-v3')) files['manifest.json'] = { content: JSON.stringify(manifest) };
+  return { files, manifest };
+}
+
 async function syncBuildGistFiles(passphrase, existingManifest = null, merged = null) {
   const existingSalt = existingManifest?.salt || localStorage.getItem('assistantSyncSalt') || '';
   const context = await syncBuildCryptoContext(passphrase, existingSalt || null);
@@ -12425,14 +12519,8 @@ async function syncBuildGistFiles(passphrase, existingManifest = null, merged = 
     projects: syncFilterDeletedRecords(normalizeProjectList(merged?.projects || projects), tombstones.projects, 'updatedAt')
   };
   const filename = 'synapse-update-' + syncBytesToBase64Url(syncRandomBytes(24)) + '.json.enc';
-  const content = await syncEncryptPayloadWithKey(payload, context);
-  const files = { [filename]: { content } };
-  const manifest = {
-    version: 2, app: 'Synapse', schema: 'gist-sync-v2', salt: context.saltBase64,
-    kdf: { name: 'PBKDF2-SHA256', iterations: SYNC_KDF_ITERATIONS }
-  };
-  if (!existingManifest) files['manifest.json'] = { content: JSON.stringify(manifest) };
-  return { files, manifest, filename, conversationCount: payload.conversations.length, hash: await syncSha256Hex({ ...payload, updatedAt: 0 }) };
+  return { ...await syncBuildUpdateFiles(payload, context, filename, existingManifest), context, payload, filename,
+    conversationCount: payload.conversations.length, hash: await syncSha256Hex({ ...payload, updatedAt: 0 }) };
 }
 
 async function syncPushToGist(options = {}) {
@@ -12473,28 +12561,65 @@ async function syncPushToGist(options = {}) {
     const local = await syncCapturePullSnapshot();
     local.settingsState = settingsState;
     let built;
+    let unchanged = false;
+    let consolidated = false;
+    let cleanupPending = false;
     if (cfg.gistId) {
       const url = SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId);
       const gist = await fetchGist(url, { cache: 'no-store' }, cfg.token);
       const existingManifest = await syncReadManifest(gist, cfg.token);
-      // ponytail: bounded append-only snapshots. Rotate manually, never delete another device's updates.
-      if (Object.keys(gist.files || {}).length >= 250) throw new Error('This sync Gist has reached the 250-file safety limit. Pull on all devices and export a backup, then clear the Gist ID to start a new one.');
-      await syncReadRemoteData(gist, existingManifest, cfg.passphrase); // Verify the key, without applying remote data locally.
+      const remote = await syncReadRemoteData(gist, existingManifest, cfg.passphrase);
       built = await syncBuildGistFiles(cfg.passphrase, existingManifest, local);
-      if (built.hash && built.hash === localStorage.getItem('assistantSyncLastHash')) {
-        syncSetStatus('current', 'Already synced', 'No local changes need to be pushed.');
-        succeeded = true;
-        return true;
+      unchanged = remote.archive.snapshotHashes.has(built.hash);
+      const additions = unchanged ? {} : built.files;
+      const proposed = { ...gist.files, ...additions };
+      const obsolete = new Set();
+      const expectedHashes = new Map();
+      if (syncGistSize(proposed) > SYNC_ARCHIVE_MAX_BYTES || Object.keys(proposed).length >= 250) {
+        const updates = new Map(remote.archive.updates);
+        if (!unchanged) updates.set(built.filename, built.payload);
+        if (!updates.size) throw new Error('No complete sync updates are available to consolidate. The existing Gist was not changed.');
+        const pack = syncPackUpdates(updates);
+        const filename = 'synapse-update-' + syncBytesToBase64Url(syncRandomBytes(24)) + '.json.enc';
+        built = { ...built, ...await syncBuildUpdateFiles(pack, built.context, filename, existingManifest), filename };
+        remote.archive.sourceFiles.forEach(name => obsolete.add(name));
+        for (const [name, update] of updates) expectedHashes.set(name, remote.archive.hashes.get(name) || await syncSha256Hex(update));
+        consolidated = true;
+      } else if (!unchanged) expectedHashes.set(built.filename, await syncSha256Hex(built.payload));
+
+      if (!unchanged || consolidated) {
+        for (const name of Object.keys(built.files)) {
+          if (name !== 'manifest.json' && gist.files?.[name]) throw new Error('Sync update name already exists. Retry; no remote file was changed.');
+        }
+        const staged = { ...gist.files, ...built.files };
+        const resulting = { ...staged };
+        obsolete.forEach(name => delete resulting[name]);
+        if (syncGistSize(resulting) > SYNC_ARCHIVE_MAX_BYTES || Object.keys(resulting).length >= 250 ||
+            syncGistSize(staged) > 2 * SYNC_ARCHIVE_MAX_BYTES || Object.keys(staged).length >= 300) {
+          throw new Error('The sync archive is still too large after consolidation. Export a backup before reducing stored data; the existing Gist was not changed.');
+        }
+        await fetchGistResponse(url, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ files: built.files })
+        }, cfg.token);
+        uploaded = true;
+        const verified = await fetchGist(url, { cache: 'no-store' }, cfg.token);
+        // Verify the recoverable source union, even if a concurrent consolidation already absorbed ours.
+        const recovered = await syncReadArchiveUpdates(verified, cfg.passphrase);
+        for (const [name, hash] of expectedHashes) {
+          if (recovered.hashes.get(name) !== hash) throw new Error('The uploaded update could not be verified. Previous files were retained; retry safely.');
+        }
+        if (obsolete.size) {
+          // Separate cleanup: a failed or interrupted upload must never remove its source copies.
+          // Only delete immutable files captured before building, never newly discovered peer updates.
+          const removals = Object.fromEntries([...obsolete].filter(name => verified.files?.[name]).map(name => [name, null]));
+          if (Object.keys(removals).length) {
+            try {
+              await fetchGistResponse(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: removals }) }, cfg.token);
+            } catch (error) { cleanupPending = true; console.warn('Sync saved; old update cleanup will be retried:', error); }
+          }
+        }
       }
-      const size = Object.values(gist.files || {}).reduce((sum, file) => sum + (Number(file?.size) || new TextEncoder().encode(file?.content || '').byteLength), 0);
-      if (gist.files?.[built.filename]) throw new Error('Sync update name already exists. Retry; no remote file was changed.');
-      await fetchGistResponse(url, {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ files: built.files })
-      }, cfg.token);
-      uploaded = true;
-      const verified = await fetchGist(url, { cache: 'no-store' }, cfg.token);
-      if (await syncGetGistFileContent(verified, built.filename) !== built.files[built.filename].content) throw new Error('The uploaded update could not be verified. Retrying will not overwrite it.');
     } else {
       built = await syncBuildGistFiles(cfg.passphrase, null, local);
       const gist = await fetchGist(SYNC_GIST_API_URL, {
@@ -12508,13 +12633,16 @@ async function syncPushToGist(options = {}) {
       if (gistEl) gistEl.value = cfg.gistId;
       localStorage.setItem('assistantSyncGistId', cfg.gistId);
       localStorage.setItem(SYNC_STATE_GIST_KEY, cfg.gistId);
+      const verified = await syncReadArchiveUpdates(await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token), cfg.passphrase);
+      if (verified.hashes.get(built.filename) !== await syncSha256Hex(built.payload)) throw new Error('The new sync Gist could not be verified. Keep its ID and retry.');
     }
 
     localStorage.setItem('assistantSyncSalt', built.manifest.salt);
     localStorage.setItem('assistantSyncLastPushAt', String(Date.now()));
     localStorage.setItem('assistantSyncLastHash', built.hash);
     renderSyncSettings();
-    syncSetStatus('current', 'Pushed', 'Saved a separate encrypted update with ' + built.conversationCount + ' conversations. Remote changes are applied only by Pull now.');
+    syncSetStatus('current', cleanupPending ? 'Saved; cleanup pending' : unchanged && !consolidated ? 'Already saved' : 'Pushed',
+      (cleanupPending ? 'Data is verified. Old copies were retained because cleanup failed; push again to retry. ' : consolidated ? 'Consolidated the archive without discarding past updates. ' : unchanged ? 'Local data is already in this Gist. ' : 'Saved an encrypted update with ' + built.conversationCount + ' conversations. ') + 'Remote changes are applied only by Pull now.');
     succeeded = true;
     if (!auto) showToast('Sync push complete.', 'success');
     return true;
