@@ -15384,9 +15384,16 @@ function syncMergeConversationRecords(records) {
   const versions = {};
   normalized.forEach(record => {
     Object.entries(record.syncVersion || {}).forEach(([writer, count]) => { versions[writer] = Math.max(Number(versions[writer]) || 0, Number(count) || 0); });
+    // Effective time walks each record in array order: a real timestamp anchors,
+    // a missing one inherits the previous anchor so in-record order can never invert.
+    // Array.sort is stable, so ties below keep first-appearance order (local first).
+    let lastTs = Number.NEGATIVE_INFINITY;
     record.messages.forEach((message, position) => {
       const id = message.id || syncMessageId(record.id, message, position);
-      const candidate = { message: { ...syncCloneJson(message), id }, position, conversationUpdatedAt: Number(record.updatedAt) || 0 };
+      const realTs = Number(message.timestamp);
+      const effTs = realTs > 0 ? realTs : lastTs;
+      if (realTs > 0) lastTs = realTs;
+      const candidate = { message: { ...syncCloneJson(message), id }, effTs, conversationUpdatedAt: Number(record.updatedAt) || 0 };
       const previous = messagesById.get(id);
       const candidateTime = Math.max(Number(message.updatedAt) || 0, Number(message.timestamp) || 0, candidate.conversationUpdatedAt);
       const previousTime = previous && Math.max(Number(previous.message.updatedAt) || 0, Number(previous.message.timestamp) || 0, previous.conversationUpdatedAt);
@@ -15396,9 +15403,8 @@ function syncMergeConversationRecords(records) {
     });
   });
   merged.messages = [...messagesById.values()].sort((left, right) => {
-    const leftTime = Number(left.message.timestamp) || Number(merged.createdAt) + left.position;
-    const rightTime = Number(right.message.timestamp) || Number(merged.createdAt) + right.position;
-    return leftTime - rightTime || left.position - right.position || left.message.id.localeCompare(right.message.id);
+    if (left.effTs === right.effTs) return 0;
+    return left.effTs < right.effTs ? -1 : 1;
   }).map(entry => entry.message);
   merged.syncVersion = versions;
   delete merged.conflictOf;
