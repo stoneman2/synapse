@@ -3286,10 +3286,7 @@ function beginLocalDataOperation() {
 
 function endLocalDataOperation() {
   localDataOperationsInFlight = Math.max(0, localDataOperationsInFlight - 1);
-  syncResumeDeferredPull();
-  if (localDataOperationsInFlight === 0 && !_syncPullInFlight &&
-      localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
-      localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
+  syncResumeDeferredSync();
 }
 
 const TEMPORARY_CHAT_NOTICE = 'This chat stays in this tab. It does not use saved memories or project context. Messages are still sent to your selected provider.';
@@ -13681,7 +13678,7 @@ function endSendingAction() {
   foregroundAction = null;
   document.getElementById('sendBtn')?.classList.remove('streaming');
   updateSendBtnState();
-  syncResumeDeferredPull();
+  syncResumeDeferredSync();
   if (action?.conv) {
     if (status !== 'complete') armedFollowUpConversationIds.delete(action.conv.id);
     else if (armedFollowUpConversationIds.has(action.conv.id)) setTimeout(() => processQueuedFollowUps(action.conv.id), 0);
@@ -14924,7 +14921,13 @@ let _syncPullInFlight = false;
 let _syncPullPending = false;
 const SYNC_AUTO_PULL_COOLDOWN = 15000;
 
-function syncResumeDeferredPull() {
+function syncResumeDeferredSync() {
+  if (localDataOperationsInFlight === 0 && !_syncPullInFlight) {
+    try {
+      if (localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
+          localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
+    } catch (error) { console.warn('Could not schedule pending sync push:', error); }
+  }
   if (!_syncPullPending || _syncOperationInFlight || sending || streaming || queueingFollowUp ||
       pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) return;
   _syncPullPending = false;
@@ -14991,6 +14994,9 @@ async function syncRunAutoPush() {
   if (readOnlyShare || localStorage.getItem(SYNC_AUTO_PUSH_KEY) !== 'true' ||
       localStorage.getItem(SYNC_AUTO_PENDING_KEY) !== 'true' || navigator.onLine === false) return false;
   if (_syncOperationInFlight) return false;
+  // Never snapshot mid-generation: a push would upload a half-streamed reply.
+  // Pending stays set and syncResumeDeferredSync picks it up when idle.
+  if (sending || streaming || queueingFollowUp || pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) return false;
   const cfg = syncGetStoredConfig();
   if (!syncAutoPushIsConfigured(cfg)) {
     localStorage.setItem(SYNC_AUTO_PUSH_KEY, 'false');
@@ -15013,9 +15019,15 @@ async function syncRunAutoPush() {
 }
 
 async function syncRunAutoPull(force = false) {
-  if (readOnlyShare || navigator.onLine === false || _syncOperationInFlight || _syncPullInFlight) return false;
+  if (readOnlyShare || navigator.onLine === false) return false;
+  if (_syncOperationInFlight || _syncPullInFlight) { _syncPullPending = true; return false; }
   const cfg = syncGetStoredConfig();
   if (!syncAutoPushIsConfigured(cfg)) return false;
+  // Not even the fetch runs mid-generation; pend it for when the app goes idle.
+  if (sending || streaming || queueingFollowUp || pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) {
+    _syncPullPending = true;
+    return false;
+  }
   const now = Date.now();
   if (!force && now - _syncLastAutoPullAt < SYNC_AUTO_PULL_COOLDOWN) return false;
   _syncLastAutoPullAt = now;
@@ -16298,7 +16310,7 @@ async function syncPullFromGist(options = {}) {
     _syncOperationInFlight = false;
     _syncPullInFlight = false;
     setSyncBusy(false);
-    syncResumeDeferredPull();
+    syncResumeDeferredSync();
     try {
       if (localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
           localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
@@ -17520,7 +17532,7 @@ async function readAttachmentFile(file, options = {}) {
   } finally {
     pendingAttachmentReads = Math.max(0, pendingAttachmentReads - 1);
     renderPreviews();
-    syncResumeDeferredPull();
+    syncResumeDeferredSync();
   }
 }
 
