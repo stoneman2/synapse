@@ -3278,10 +3278,6 @@ let debugLogBuffer = [];
 let localUpdateState = { status: 'idle', message: 'Not checked', details: '' };
 
 function beginLocalDataOperation() {
-  if (_syncPullInFlight) {
-    showToast('Wait for sync pull to finish.', 'info');
-    return false;
-  }
   localDataOperationsInFlight++;
   // Invalidate before an import/deletion can yield to storage.
   memoryEpoch++;
@@ -3290,6 +3286,7 @@ function beginLocalDataOperation() {
 
 function endLocalDataOperation() {
   localDataOperationsInFlight = Math.max(0, localDataOperationsInFlight - 1);
+  syncResumeDeferredPull();
   if (localDataOperationsInFlight === 0 && !_syncPullInFlight &&
       localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
       localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
@@ -3319,7 +3316,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-09-07T05:38:00+08:00',
+  buildDate: '2026-09-07T12:00:00+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -3333,6 +3330,7 @@ const SYNC_AUTO_PENDING_KEY = 'assistantSyncAutoPushPending';
 const SYNC_TOMBSTONES_KEY = 'assistantSyncTombstones';
 const SYNC_SETTINGS_STATE_KEY = 'assistantSyncSettingsState';
 const SYNC_STATE_GIST_KEY = 'assistantSyncStateGistId';
+const SYNC_CONV_HASHES_KEY = 'assistantSyncConvHashes';
 const SYNC_AUTO_PUSH_DELAY = 1200;
 const SYNC_SETTINGS_KEYS = [
   'llmStreaming', 'llmEnterSend', 'llmTemperature',
@@ -3624,10 +3622,6 @@ function openModal(modalOrId, focusSelector) {
 function closeModal(modalOrId, restoreFocus = true) {
   const modal = typeof modalOrId === 'string' ? document.getElementById(modalOrId) : modalOrId;
   if (!modal) return;
-  if (modal.id === 'settingsModal' && _syncPullInFlight) {
-    showToast('Wait for sync pull to finish.', 'info');
-    return;
-  }
   if (modal.id === 'projectsModal') void flushProjectAutosave();
   if (modal.id === 'settingsModal') {
     flushSettingsAutosaves();
@@ -4009,7 +4003,7 @@ function normalizeConversationRecord(raw) {
   normalized.updatedAt = number(normalized.updatedAt) > 0 ? number(normalized.updatedAt) : normalized.createdAt;
   normalized.messages = (Array.isArray(normalized.messages) ? normalized.messages : [])
     .filter(message => message && (message.role === 'user' || message.role === 'assistant' || message.role === 'system'))
-    .map(source => {
+    .map((source, messageIndex) => {
       const message = { ...source };
       if (Array.isArray(message.content)) {
         message.content = message.content.map(part => {
@@ -4075,6 +4069,9 @@ function normalizeConversationRecord(raw) {
         message.content = message.swipes[message.swipeIndex];
       } else delete message.comparison;
       if (message.includeInContext !== false) message.includeInContext = true;
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(String(message.id || ''))) {
+        message.id = syncMessageId(normalized.id, message, messageIndex);
+      }
       return message;
     });
   if (normalized.characterAvatar) normalized.characterAvatar = safeMediaUrl(text(normalized.characterAvatar));
@@ -6009,10 +6006,10 @@ function openCompareModels() {
 }
 
 async function extractMemories(conversationMessages, conv = getActiveConv(), target = null) {
-  if (!conv || !isMemoryEnabled() || isTemporaryConversation(conv) || localDataOperationsInFlight || _syncPullInFlight) return;
+  if (!conv || !isMemoryEnabled() || isTemporaryConversation(conv) || localDataOperationsInFlight) return;
   const sourceValid = captureContextSource(conv);
   const epoch = memoryEpoch;
-  const valid = () => isMemoryEnabled() && epoch === memoryEpoch && sourceValid() && !localDataOperationsInFlight && !_syncPullInFlight;
+  const valid = () => isMemoryEnabled() && epoch === memoryEpoch && sourceValid() && !localDataOperationsInFlight;
   try {
     target = target || getActiveRequestTarget();
     const existing = await loadMemories();
@@ -6052,7 +6049,7 @@ let memoryCleanupRunning = false;
 async function cleanupMemories(conv = getActiveConv(), target = null, sourceValid = captureContextSource(conv)) {
   if (!conv || !isMemoryEnabled() || isTemporaryConversation(conv) || memoryCleanupRunning || Date.now() - _lastCleanup < 300000) return;
   const epoch = memoryEpoch;
-  const valid = () => isMemoryEnabled() && epoch === memoryEpoch && sourceValid() && !localDataOperationsInFlight && !_syncPullInFlight;
+  const valid = () => isMemoryEnabled() && epoch === memoryEpoch && sourceValid() && !localDataOperationsInFlight;
   memoryCleanupRunning = true;
   try {
     target = target || getActiveRequestTarget();
@@ -6956,7 +6953,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   const shareId = new URLSearchParams(location.search).get('share');
   readOnlyShare = !!shareId;
   if (readOnlyShare) document.body.classList.add('share-view');
-  if (!readOnlyShare) window.addEventListener('online', () => syncRunAutoPush());
+  if (!readOnlyShare) {
+    window.addEventListener('online', () => syncScheduleAutoPull(true));
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') syncScheduleAutoPull();
+    });
+    window.addEventListener('focus', () => syncScheduleAutoPull());
+  }
 
   if (!readOnlyShare) {
     // Migration: strip endpoint suffix from proxy URL
@@ -6992,7 +6995,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     migrateToPromptEntries();
     await loadConversations();
     initConversationChannel();
-    void syncRunAutoPush();
+    void syncRunAutoPull(true).then(() => syncRunAutoPush());
   }
   loadTheme();
   loadCustomFont(localStorage.getItem('assistantFont') || '');
@@ -8405,6 +8408,7 @@ function getConversationChanges() {
   const current = new Map();
   const changed = [];
   getPersistentConversations().forEach(record => {
+    syncEnsureMessageIds(record);
     if (!conversationBaseline.has(record.id) && record.conflictOf && !record.id.startsWith('conflict_')) {
       // Duplicating or forking a conflict copy creates an independent chat.
       delete record.conflictOf;
@@ -8752,7 +8756,7 @@ function notifyConversationConflicts(ids) {
         button.className = 'btn btn-secondary';
         button.textContent = conv.title + ' (' + conv.messages.length + ' messages' + (conv.draft?.text ? ', draft saved' : '') + ')';
         button.onclick = () => {
-          if (sending || streaming || _syncPullInFlight) { showToast('Finish the current operation before switching chats.', 'info'); return; }
+           if (sending || streaming) { showToast('Finish the current response before switching chats.', 'info'); return; }
           close();
           setConversationView(conv.archivedAt ? 'archived' : 'active');
           switchConversation(conv.id);
@@ -9080,7 +9084,6 @@ function getActiveConv() { return conversations.find(c => c.id === activeConvId)
 
 function prepareConversationTransition() {
   if (readOnlyShare) return false;
-  if (_syncPullInFlight) { showToast('Wait for sync pull to finish.', 'info'); return false; }
   if (sending || streaming || queueingFollowUp) {
     showToast('Stop the current request before changing chats.', 'info');
     return false;
@@ -13645,7 +13648,7 @@ function updateSendBtnState() {
   const hasInput = Boolean(input.value.trim() || pendingAttachments.length > 0);
   const lastMsg = messages[messages.length - 1];
   const canRegenerate = !hasInput && lastMsg?.role === 'user';
-  btn.disabled = readOnlyShare || _syncPullInFlight || !conv || pendingAttachmentReads > 0 || (!hasInput && !canRegenerate);
+  btn.disabled = readOnlyShare || !conv || pendingAttachmentReads > 0 || (!hasInput && !canRegenerate);
   if (canRegenerate) {
     // ponytail: the word does not fit beside the other controls on a phone.
     btn.textContent = window.innerWidth <= 768 ? '↻' : 'Regenerate';
@@ -13657,7 +13660,7 @@ function updateSendBtnState() {
 }
 
 function beginSendingAction() {
-  if (_syncPullInFlight || localDataOperationsInFlight) {
+  if (localDataOperationsInFlight) {
     showToast('Wait for the current data operation to finish.', 'info');
     return false;
   }
@@ -13678,6 +13681,7 @@ function endSendingAction() {
   foregroundAction = null;
   document.getElementById('sendBtn')?.classList.remove('streaming');
   updateSendBtnState();
+  syncResumeDeferredPull();
   if (action?.conv) {
     if (status !== 'complete') armedFollowUpConversationIds.delete(action.conv.id);
     else if (armedFollowUpConversationIds.has(action.conv.id)) setTimeout(() => processQueuedFollowUps(action.conv.id), 0);
@@ -14708,7 +14712,7 @@ async function clearDataCategory(category) {
     await saveMemories([]);
   } else if (category === 'credentials') {
     ['llmApiKey', 'llmSearchApiKey'].forEach(key => { localStorage.removeItem(key); sessionStorage.removeItem(key); });
-    ['assistantSyncGistToken', 'assistantSyncPassphrase', 'assistantSyncGistId', 'assistantSyncSalt', 'assistantSyncLastHash', 'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, SYNC_STATE_GIST_KEY, SYNC_AUTO_PUSH_KEY, SYNC_AUTO_PENDING_KEY].forEach(key => localStorage.removeItem(key));
+    ['assistantSyncGistToken', 'assistantSyncPassphrase', 'assistantSyncGistId', 'assistantSyncSalt', 'assistantSyncLastHash', 'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, SYNC_STATE_GIST_KEY, SYNC_AUTO_PUSH_KEY, SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY].forEach(key => localStorage.removeItem(key));
     ['setKey', 'setSearchApiKey', 'setupKey', 'setSyncToken', 'setSyncGistId', 'setSyncPassphrase', 'syncPairingText', 'syncPairingCode'].forEach(id => {
       const input = document.getElementById(id);
       if (input) input.value = '';
@@ -14830,6 +14834,14 @@ function synapseSelfTest() {
     const legacySettings = syncNormalizeSettingsPayload({ exportedAt: '2026-01-01T00:00:00Z', settings: { assistantTheme: 'dark' } });
     assert(legacySettings.settings.assistantTheme === 'dark' && !Object.prototype.hasOwnProperty.call(legacySettings.settings, 'llmPromptEntries'), 'legacy settings presence');
     assert(syncConversationFileName('a.b') !== syncConversationFileName('a:b'), 'sync filename uniqueness');
+    const unionBase = normalizeConversationRecord({ id: 'union-probe', messages: [{ role: 'user', content: 'shared', timestamp: 1 }] });
+    const unionBranch = syncCloneJson(unionBase);
+    unionBranch.messages.push({ role: 'user', content: 'appended', timestamp: 2 });
+    const unioned = syncMergeConversationRecords([unionBase, unionBranch]);
+    assert(unioned && unioned.messages.length === 2 && unioned.messages[0].content === 'shared' && unioned.messages[1].content === 'appended' && !unioned.conflictOf, 'time-based message union');
+    const idProbeA = normalizeConversationRecord({ id: 'id-probe', messages: [{ role: 'user', content: 'same', timestamp: 3 }] });
+    const idProbeB = normalizeConversationRecord({ id: 'id-probe', messages: [{ role: 'user', content: 'same', timestamp: 3 }] });
+    assert(idProbeA.messages[0].id === idProbeB.messages[0].id && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(idProbeA.messages[0].id || ''), 'stable message ids');
     assert(chooseConversationWinner({ id: 'same', updatedAt: 2, messages: [{ role: 'user', content: 'newer' }] }, { id: 'same', updatedAt: 1, messages: [] }) === null, 'unknown divergent history needs a copy');
     const storedConversation = { id: 'persist', updatedAt: 1, messages: [] };
     const appendedConversation = { id: 'persist', updatedAt: 1, messages: [{ role: 'assistant', content: 'reply' }] };
@@ -14873,7 +14885,7 @@ function synapseSelfTest() {
         assert(EMOTION_SPRITE_NAMES[name] === prefix && EMOTION_SPRITE_TAG_RE.test('<' + name + ' />'), 'expression tag: ' + name);
       }
     }
-    const result = { ok: true, checks: ['normalization', 'goal and queue', 'fork lineage', 'context filtering', 'source numbering', 'legacy import', 'legacy branches', 'legacy settings', 'trust boundaries', 'request targets', 'manual AI parsing', 'comparison alignment', 'sync filenames', 'persistence arbitration', 'tombstones', 'temporary chat isolation', 'updatedAt merge', 'auto-push configuration', 'auto-push stored configuration', 'emotion sprite tag'] };
+    const result = { ok: true, checks: ['normalization', 'goal and queue', 'fork lineage', 'context filtering', 'source numbering', 'legacy import', 'legacy branches', 'legacy settings', 'trust boundaries', 'request targets', 'manual AI parsing', 'comparison alignment', 'sync filenames', 'message union', 'stable ids', 'persistence arbitration', 'tombstones', 'temporary chat isolation', 'updatedAt merge', 'auto-push configuration', 'auto-push stored configuration', 'emotion sprite tag'] };
     console.info('Synapse self-test passed', result);
     return result;
   } catch (error) {
@@ -14902,11 +14914,22 @@ function syncGetDeviceId() {
 
 let _syncInputsLoaded = false;
 let _syncAutoPushTimer;
+let _syncAutoPullTimer;
+let _syncLastAutoPullAt = 0;
 let _syncOperationInFlight = false;
-// Pull replaces all local state, so it alone must lock the UI. Push only
-// snapshots local data into the Gist; anything changed mid-push is picked up
-// by the next auto-push, so the app stays usable while a push runs.
+// Set while a pull is applying to the local database. The network and decrypt
+// phases run without locking the UI; only the final commit is protected, and a
+// pull that arrives mid-stream defers and retries instead of blocking input.
 let _syncPullInFlight = false;
+let _syncPullPending = false;
+const SYNC_AUTO_PULL_COOLDOWN = 15000;
+
+function syncResumeDeferredPull() {
+  if (!_syncPullPending || _syncOperationInFlight || sending || streaming || queueingFollowUp ||
+      pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) return;
+  _syncPullPending = false;
+  syncScheduleAutoPull(true);
+}
 
 function syncAutoPushIsConfigured(cfg) {
   return !!(cfg?.token && cfg?.passphrase && cfg?.gistId);
@@ -14937,7 +14960,7 @@ function syncGetConfigFromInputs() {
 
 function syncResetScopedState() {
   [SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, 'assistantSyncSalt', 'assistantSyncLastHash',
-    'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_AUTO_PENDING_KEY]
+    'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY]
     .forEach(key => localStorage.removeItem(key));
 }
 
@@ -14989,6 +15012,29 @@ async function syncRunAutoPush() {
   }
 }
 
+async function syncRunAutoPull(force = false) {
+  if (readOnlyShare || navigator.onLine === false || _syncOperationInFlight || _syncPullInFlight) return false;
+  const cfg = syncGetStoredConfig();
+  if (!syncAutoPushIsConfigured(cfg)) return false;
+  const now = Date.now();
+  if (!force && now - _syncLastAutoPullAt < SYNC_AUTO_PULL_COOLDOWN) return false;
+  _syncLastAutoPullAt = now;
+  try {
+    return await syncPullFromGist({ auto: true });
+  } catch (error) {
+    console.warn('Automatic sync pull failed:', error);
+    return false;
+  }
+}
+
+function syncScheduleAutoPull(force = false) {
+  clearTimeout(_syncAutoPullTimer);
+  _syncAutoPullTimer = setTimeout(() => {
+    _syncAutoPullTimer = null;
+    void syncRunAutoPull(force);
+  }, force ? 0 : 250);
+}
+
 function syncToggleAutoPush(input) {
   if (!input?.checked) {
     syncSaveSettings(false);
@@ -15019,7 +15065,7 @@ function syncSaveSettings(showSavedToast = true, schedule = true) {
   };
   if ((scoped && scoped !== cfg.gistId) || (!scoped && previousGistId && previousGistId !== cfg.gistId)) {
     [SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, 'assistantSyncSalt', 'assistantSyncLastHash',
-      'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_AUTO_PENDING_KEY].forEach(key => { values[key] = null; });
+      'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY].forEach(key => { values[key] = null; });
   }
   if (!autoPush) values[SYNC_AUTO_PENDING_KEY] = null;
   Object.entries(values).sort((a, b) => Number(a[1] === null) - Number(b[1] === null)).forEach(([key, after]) => {
@@ -15077,25 +15123,8 @@ function syncSetStatus(state, message, details) {
 }
 
 function setSyncBusy(busy) {
-  if (busy) stopVoiceInput();
-  document.querySelectorAll('#settingsModal button, #settingsModal input, #settingsModal textarea, #settingsModal select').forEach(control => {
-    if (busy) {
-      if (!control.hasAttribute('data-sync-was-disabled')) control.dataset.syncWasDisabled = String(control.disabled);
-      control.disabled = true;
-    } else if (control.hasAttribute('data-sync-was-disabled')) {
-      control.disabled = control.dataset.syncWasDisabled === 'true';
-      delete control.dataset.syncWasDisabled;
-    }
-  });
   const panel = document.getElementById('settingsTab-sync');
   if (panel) panel.setAttribute('aria-busy', String(busy));
-  const composer = document.querySelector('.input-area');
-  if (composer) {
-    composer.inert = busy;
-    composer.setAttribute('aria-busy', String(busy));
-  }
-  try { updateSendBtnState(); }
-  catch (error) { console.warn('Could not refresh composer state:', error); }
 }
 
 function renderSyncSettings() {
@@ -15313,6 +15342,68 @@ async function syncReadManifest(gist, token) {
 
 function syncConversationFileName(id) {
   return 'conv_' + syncBytesToBase64Url(new TextEncoder().encode(String(id || 'unknown'))) + '.json.enc';
+}
+
+function syncStableHash(value) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value, (key, item) => {
+    if (key === '_editing' || key === 'id') return undefined;
+    return item && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(Object.keys(item).sort().map(name => [name, item[name]])) : item;
+  });
+  let first = 2166136261;
+  let second = 2246822519;
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    first = Math.imul(first ^ code, 16777619);
+    second = Math.imul(second ^ code, 3266489917);
+  }
+  return (first >>> 0).toString(16).padStart(8, '0') + (second >>> 0).toString(16).padStart(8, '0');
+}
+
+function syncMessageId(conversationId, message, index) {
+  const timestamp = Number(message?.timestamp) || 0;
+  return 'msg_' + timestamp + '_' + index + '_' + syncStableHash({ conversationId, message });
+}
+
+function syncEnsureMessageIds(conversation) {
+  if (!conversation || !Array.isArray(conversation.messages)) return conversation;
+  conversation.messages.forEach((message, index) => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(String(message?.id || ''))) {
+      message.id = syncMessageId(conversation.id, message, index);
+    }
+  });
+  return conversation;
+}
+
+function syncMergeConversationRecords(records) {
+  const normalized = (records || []).filter(Boolean).map(syncNormalizeConversation);
+  if (!normalized.length) return null;
+  normalized.sort((left, right) => (Number(left.updatedAt) || 0) - (Number(right.updatedAt) || 0) || serializeConversation(left).localeCompare(serializeConversation(right)));
+  const merged = syncCloneJson(normalized[normalized.length - 1]);
+  const messagesById = new Map();
+  const versions = {};
+  normalized.forEach(record => {
+    Object.entries(record.syncVersion || {}).forEach(([writer, count]) => { versions[writer] = Math.max(Number(versions[writer]) || 0, Number(count) || 0); });
+    record.messages.forEach((message, position) => {
+      const id = message.id || syncMessageId(record.id, message, position);
+      const candidate = { message: { ...syncCloneJson(message), id }, position, conversationUpdatedAt: Number(record.updatedAt) || 0 };
+      const previous = messagesById.get(id);
+      const candidateTime = Math.max(Number(message.updatedAt) || 0, Number(message.timestamp) || 0, candidate.conversationUpdatedAt);
+      const previousTime = previous && Math.max(Number(previous.message.updatedAt) || 0, Number(previous.message.timestamp) || 0, previous.conversationUpdatedAt);
+      if (!previous || candidateTime > previousTime || (candidateTime === previousTime && serializeConversation(candidate.message) > serializeConversation(previous.message))) {
+        messagesById.set(id, candidate);
+      }
+    });
+  });
+  merged.messages = [...messagesById.values()].sort((left, right) => {
+    const leftTime = Number(left.message.timestamp) || Number(merged.createdAt) + left.position;
+    const rightTime = Number(right.message.timestamp) || Number(merged.createdAt) + right.position;
+    return leftTime - rightTime || left.position - right.position || left.message.id.localeCompare(right.message.id);
+  }).map(entry => entry.message);
+  merged.syncVersion = versions;
+  delete merged.conflictOf;
+  delete merged.conflictTitle;
+  return merged;
 }
 
 function syncCloneJson(value) {
@@ -15736,6 +15827,31 @@ async function syncPushToGist(options = {}) {
     const settingsState = syncCollectSettingsState();
     const local = await syncCapturePullSnapshot();
     local.settingsState = settingsState;
+    let storedSyncHashes = { conversations: {}, metadata: '' };
+    try {
+      const rawSyncHashes = JSON.parse(localStorage.getItem(SYNC_CONV_HASHES_KEY) || 'null');
+      if (rawSyncHashes && typeof rawSyncHashes === 'object') {
+        if (rawSyncHashes.conversations && typeof rawSyncHashes.conversations === 'object') {
+          storedSyncHashes = { conversations: rawSyncHashes.conversations, metadata: typeof rawSyncHashes.metadata === 'string' ? rawSyncHashes.metadata : '' };
+        } else {
+          storedSyncHashes = { conversations: rawSyncHashes, metadata: '' };
+        }
+      }
+    } catch(e) {}
+    const nextConvHashes = {};
+    for (const conv of local.conversations || []) {
+      nextConvHashes[conv.id] = await syncSha256Hex(syncNormalizeConversation(conv));
+    }
+    const nextMetadataHash = await syncSha256Hex({ tombstones: local.tombstones, settings: settingsState, memories: local.memories, projects: local.projects });
+    const hasStoredSyncHashes = Object.keys(storedSyncHashes.conversations).length > 0 || storedSyncHashes.metadata !== '';
+    if (hasStoredSyncHashes) {
+      local.conversations = (local.conversations || []).filter(conv => storedSyncHashes.conversations[conv.id] !== nextConvHashes[conv.id]);
+      if (cfg.gistId && local.conversations.length === 0 && nextMetadataHash === storedSyncHashes.metadata) {
+        syncSetStatus('current', 'Already synced', 'No local changes need to be pushed.');
+        succeeded = true;
+        return true;
+      }
+    }
     let built;
     let unchanged = false;
     let consolidated = false;
@@ -15816,6 +15932,7 @@ async function syncPushToGist(options = {}) {
     localStorage.setItem('assistantSyncSalt', built.manifest.salt);
     localStorage.setItem('assistantSyncLastPushAt', String(Date.now()));
     localStorage.setItem('assistantSyncLastHash', built.hash);
+    localStorage.setItem(SYNC_CONV_HASHES_KEY, JSON.stringify({ v: 1, conversations: nextConvHashes, metadata: nextMetadataHash }));
     renderSyncSettings();
     syncSetStatus('current', cleanupPending ? 'Saved; cleanup pending' : unchanged && !consolidated ? 'Already saved' : 'Pushed',
       (cleanupPending ? 'Data is verified. Old copies were retained because cleanup failed; push again to retry. ' : consolidated ? 'Consolidated the archive without discarding past updates. ' : unchanged ? 'Local data is already in this Gist. ' : 'Saved an encrypted update with ' + built.conversationCount + ' conversations. ') + 'Remote changes are applied only by Pull now.');
@@ -15840,49 +15957,65 @@ async function syncPushToGist(options = {}) {
 }
 
 async function syncMergeConversationLists(localList, remoteList, tombstones = {}, deletionVersions = {}, deletionRoots = {}) {
-  const merged = new Map();
-  const inputs = [...(localList || []), ...(remoteList || [])];
-  const roots = new Map([...inputs.filter(record => record && typeof record === 'object').map(record => [record.id, record.conflictOf || record.id]), ...Object.entries(deletionRoots)]);
+  const groups = new Map();
+  const localById = new Map();
   let added = 0;
   let updated = 0;
-  let tied = 0;
-  const conflicts = [];
-  for (const [index, raw] of inputs.entries()) {
+  for (const [index, raw] of [...(localList || []), ...(remoteList || [])].entries()) {
     if (!raw || typeof raw !== 'object' || isTemporaryConversation(raw)) continue;
     let record;
     try { record = syncNormalizeConversation(raw); }
     catch (error) { console.warn('Unreadable sync chat skipped:', raw.id, error); continue; }
-    const conflictId = await conversationConflictId(record);
-    if (!Object.keys(record.syncVersion || {}).length) record.syncVersion = { ['legacy:' + conflictId]: 1 };
+    if (!Object.keys(record.syncVersion || {}).length) record.syncVersion = { ['legacy:' + await conversationConflictId(record)]: 1 };
     const root = record.conflictOf || record.id;
-    const deletions = Object.keys(tombstones).filter(id => id === record.id || id === root || roots.get(id) === root);
+    const relatedRoots = new Map([...Object.entries(deletionRoots || {})]);
+    if (!relatedRoots.has(record.id)) relatedRoots.set(record.id, root);
+    const deletions = Object.keys(tombstones || {}).filter(id => id === record.id || id === root || relatedRoots.get(id) === root);
     if (deletions.some(id => {
-      if (!Object.hasOwn(deletionVersions, id)) return false;
+      if (!Object.hasOwn(deletionVersions || {}, id)) return false;
       const order = compareConversationVersions({ syncVersion: deletionVersions[id] }, record);
       return order === 0 || order === 1;
     })) continue;
-    const previous = merged.get(record.id);
-    const size = merged.size;
-    const saved = reconcileConversationRecord(merged, record, conflictId);
-    if (index < (localList || []).length) continue;
-    if (merged.size > size) added++;
-    else if (previous && conversationContent(previous) !== conversationContent(saved)) updated++;
-    if (saved.id !== record.id && merged.size > size) { conflicts.push(saved.id); tied++; }
+    if (index < (localList || []).length) localById.set(record.id, record);
+    if (!groups.has(record.id)) groups.set(record.id, []);
+    groups.get(record.id).push(record);
   }
-  const visible = new Map();
-  for (const record of merged.values()) {
-    const deletedAt = Math.max(Number(tombstones[record.id]) || 0, Number(tombstones[record.conflictOf]) || 0);
-    if (!deletedAt || Number(record.updatedAt) > deletedAt) { visible.set(record.id, record); continue; }
-    const seen = Object.hasOwn(deletionVersions, record.id) ? deletionVersions[record.id] : null;
-    // Unknown deletion ancestry is recovered, not guessed from the clock.
-    const order = seen ? compareConversationVersions({ syncVersion: seen }, record) : null;
-    if (order === 0 || order === 1) continue;
-    const copy = makeConversationConflict(record, await conversationConflictId(record));
-    if (Number(tombstones[copy.id]) >= Number(copy.updatedAt)) continue;
-    visible.set(copy.id, copy);
-    conflicts.push(copy.id);
+  const conversations = [];
+  const conflicts = [];
+  for (const records of groups.values()) {
+    const tombId = records[0].id;
+    const tombRoot = records[0].conflictOf || tombId;
+    const deletedAt = Math.max(Number(tombstones?.[tombId]) || 0, Number(tombstones?.[tombRoot]) || 0);
+    const latestUpdatedAt = Math.max(...records.map(record => Number(record.updatedAt) || 0));
+    let selected = records;
+    let renamed = false;
+    if (deletedAt >= latestUpdatedAt) {
+      const seen = Object.hasOwn(deletionVersions || {}, tombId) ? deletionVersions[tombId] : null;
+      if (!seen) {
+        // Unknown deletion ancestry: keep a renamed recovery copy, never silently drop.
+        renamed = true;
+      } else {
+        selected = records.filter(record => {
+          const order = compareConversationVersions({ syncVersion: seen }, record);
+          return order !== 0 && order !== 1;
+        });
+        if (!selected.length) continue;
+      }
+    }
+    let merged = syncMergeConversationRecords(selected);
+    if (!merged) continue;
+    if (renamed) {
+      merged = makeConversationConflict(merged, await conversationConflictId(merged));
+      if (Number(tombstones?.[merged.id]) >= Number(merged.updatedAt)) continue;
+      conflicts.push(merged.id);
+    }
+    const local = localById.get(merged.id);
+    if (!local) added++;
+    else if (serializeConversationRecord(local) !== serializeConversationRecord(merged)) updated++;
+    conversations.push(merged);
   }
-  return { conversations: [...visible.values()], added, updated, tied, conflicts };
+  conversations.sort((left, right) => (Number(right.updatedAt) || 0) - (Number(left.updatedAt) || 0));
+  return { conversations, added, updated, tied: 0, conflicts };
 }
 
 function syncMergeProjectLists(localList, remoteList, tombstones = {}) {
@@ -16019,22 +16152,12 @@ async function syncCapturePullSnapshot() {
   };
 }
 
-async function syncPullFromGist() {
+async function syncPullFromGist(options = {}) {
+  const auto = options.auto === true;
   if (readOnlyShare) return false;
-  if (sending || streaming || queueingFollowUp) {
-    showToast('Stop the current response before pulling sync data.', 'info');
-    return false;
-  }
-  if (pendingAttachmentReads > 0) {
-    showToast('Wait for attachments to finish reading.', 'info');
-    return false;
-  }
-  if (localDataOperationsInFlight > 0) {
-    showToast('Wait for local data changes to finish.', 'info');
-    return false;
-  }
   if (_syncOperationInFlight) {
-    showToast('A sync operation is already in progress.', 'info');
+    _syncPullPending = true;
+    if (!auto) showToast('Sync is already running; pull is queued.', 'info');
     return false;
   }
   _syncOperationInFlight = true;
@@ -16048,11 +16171,6 @@ async function syncPullFromGist() {
     const cfg = syncSaveSettings(false, false);
     if (!cfg) throw new Error('Sync settings could not be saved. Free storage and retry.');
     syncValidateConfig(cfg, true);
-    persistDraftFromUI();
-    if (_projectAutosaveTimer && !await flushProjectAutosave()) throw new Error('Project changes could not be saved. Retry before pulling.');
-    if (!await saveProjects(true)) throw new Error('Project changes could not be saved. Retry before pulling.');
-    await saveConversationImmediately();
-    await loadMemories();
     syncSetStatus('checking', 'Pulling...', 'Fetching and decrypting sync files.');
     const headers = {};
     const lastEtag = localStorage.getItem('assistantSyncLastEtag') || '';
@@ -16063,10 +16181,19 @@ async function syncPullFromGist() {
       return true;
     }
     const gist = remoteResponse.data;
-    if (remoteResponse.etag) localStorage.setItem('assistantSyncLastEtag', remoteResponse.etag);
     const manifest = await syncReadManifest(gist, cfg.token);
     const remote = await syncReadRemoteData(gist, manifest, cfg.passphrase);
+    if (sending || streaming || queueingFollowUp || pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) {
+      _syncPullPending = true;
+      syncSetStatus('dirty', 'Update waiting', 'Remote changes were fetched and will merge after the active operation finishes.');
+      return false;
+    }
+    persistDraftFromUI();
+    if (_projectAutosaveTimer && !await flushProjectAutosave()) throw new Error('Project changes could not be saved. Retry before pulling.');
+    if (!await saveProjects(true)) throw new Error('Project changes could not be saved. Retry before pulling.');
     await saveConversationImmediately();
+    await loadMemories();
+    if (remoteResponse.etag) localStorage.setItem('assistantSyncLastEtag', remoteResponse.etag);
     const snapshot = await syncCapturePullSnapshot();
     const remoteTombstones = syncNormalizeTombstones(remote.tombstones);
     const incomingDeletionCount = (records, category, timestampKey) => records.filter(record => {
@@ -16093,8 +16220,11 @@ async function syncPullFromGist() {
         }
       }
     }
-    if (sending || streaming || queueingFollowUp) throw new Error('Stop the current response before applying pulled sync data.');
-    if (localDataOperationsInFlight > 0) throw new Error('Wait for local data changes to finish before applying pulled sync data.');
+    if (sending || streaming || queueingFollowUp || pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) {
+      _syncPullPending = true;
+      syncSetStatus('dirty', 'Update waiting', 'Remote changes will merge after the active operation finishes.');
+      return false;
+    }
 
     const liveTombstones = syncMergeTombstones(snapshot.tombstones, remoteTombstones);
     const liveSettingsState = syncMergeSettingsStates(syncCollectSettingsState(false, false), remote.settingsState);
@@ -16149,6 +16279,11 @@ async function syncPullFromGist() {
       syncSetStatus('current', 'Pull saved', 'The data was saved, but the display could not be refreshed. Reload this tab.');
       return true;
     }
+    if (/Local data changed while this operation was being prepared/.test(err.message || '')) {
+      _syncPullPending = true;
+      syncSetStatus('dirty', 'Update waiting', 'Remote changes will merge when local activity pauses.');
+      return false;
+    }
     const message = err.name === 'OperationError' ? 'Could not decrypt sync data. Check the passphrase.' : (err.message || 'Unable to pull sync data.');
     syncSetStatus('unknown', 'Pull failed', message);
     showToast('Sync pull failed: ' + message, 'error', 6000);
@@ -16157,6 +16292,7 @@ async function syncPullFromGist() {
     _syncOperationInFlight = false;
     _syncPullInFlight = false;
     setSyncBusy(false);
+    syncResumeDeferredPull();
     try {
       if (localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
           localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
@@ -17378,6 +17514,7 @@ async function readAttachmentFile(file, options = {}) {
   } finally {
     pendingAttachmentReads = Math.max(0, pendingAttachmentReads - 1);
     renderPreviews();
+    syncResumeDeferredPull();
   }
 }
 

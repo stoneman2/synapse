@@ -422,10 +422,11 @@ module.exports = async function(page) {
   }, encrypt({ app: 'Synapse', schema: 'gist-sync-update-v2', conversations: [unseenEdit], projects: [], memories: [], settingsState: {}, tombstones: {} }));
   assert.equal(await page.evaluate(() => syncPullFromGist()), true);
   const deletionConflict = await data();
-  assert.ok(deletionConflict.conversations.some(record => record.conflictOf === deletionBase.id && record.messages.some(message => message.content === 'edit unseen by deleting device')), 'deletion cannot discard a concurrent edit merely because its clock is earlier');
-  assert.ok(!deletionConflict.conversations.some(record => record.id === deletionBase.id));
+  assert.ok(deletionConflict.conversations.some(record => record.id === deletionBase.id && record.messages.some(message => message.content === 'edit unseen by deleting device')), 'deletion cannot discard a concurrent edit: both histories combine under one chat');
+  assert.ok(deletionConflict.conversations.some(record => record.id === deletionBase.id && record.messages.some(message => message.content === 'shared deletion base')), 'the deleted base messages still merge with the unseen edit');
+  assert.ok(!deletionConflict.conversations.some(record => record.conflictOf === deletionBase.id), 'no separate conflict copy is created for a versioned concurrent edit');
   assert.equal(await page.evaluate(() => syncPullFromGist()), true);
-  assert.equal((await data()).conversations.length, deletionConflict.conversations.length, 'deletion conflict recovery is idempotent');
+  assert.equal((await data()).conversations.length, deletionConflict.conversations.length, 'time-based union recovery is idempotent');
 
   for (const reversed of [false, true]) {
     const id = 'deleted-concurrent-' + reversed;
@@ -441,17 +442,17 @@ module.exports = async function(page) {
     assert.equal(family[0].messages[0].content, 'unseen B');
   }
 
-  const deletedCopy = await page.evaluate(async () => {
-    const copy = (await idbGetAll('conversations')).find(record => record.conflictOf === 'deleted-concurrent-false');
-    removeConversations([copy.id], false);
+  const deletedMerged = await page.evaluate(async () => {
+    const record = (await idbGetAll('conversations')).find(record => record.id === 'deleted-concurrent-false');
+    removeConversations([record.id], false);
     await saveConversations();
     const tombstones = (await idbGet('meta', 'syncTombstones')).value;
-    return { id: copy.id, root: tombstones.conversationRoots[copy.id], pushed: await syncPushToGist({ auto: true }) };
+    return { id: record.id, root: tombstones.conversationRoots[record.id], pushed: await syncPushToGist({ auto: true }) };
   });
-  assert.equal(deletedCopy.root, 'deleted-concurrent-false');
-  assert.equal(deletedCopy.pushed, true);
+  assert.equal(deletedMerged.root, 'deleted-concurrent-false');
+  assert.equal(deletedMerged.pushed, true);
   assert.equal(await page.evaluate(() => syncPullFromGist()), true);
-  assert.ok(!(await data()).conversations.some(record => record.id === deletedCopy.root || record.conflictOf === deletedCopy.root), 'deleting a conflict copy also removes its older original-name snapshots');
+  assert.ok(!(await data()).conversations.some(record => record.id === deletedMerged.root || record.conflictOf === deletedMerged.root), 'deleting the merged chat removes it everywhere once the deletion has seen every version');
 
   const stalePull = await page.evaluate(async () => {
     const original = IDBDatabase.prototype.transaction;

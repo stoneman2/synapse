@@ -327,7 +327,7 @@ module.exports = async function(page) {
       h.ok(h.bytes(h.gist.files) < h.MiB, 'Small snapshots remain below 1 MiB after 100 pushes');
     });
 
-    await browserCheck('order-sensitive C/B and X/Y, per-update memories, deletion roots, overlapping packs', async () => {
+    await browserCheck('time-based union of C/B and X/Y, per-update memories, deletion roots, overlapping packs', async () => {
       const h = window.__syncFixture;
       const originals = new Map([
         [h.name('a'), h.update({ conversations: [h.chat('CB', 'A', { a: 1 }), h.chat('XY', 'X', { a: 1 }), h.chat('deleted-root', 'Deleted through conflict-copy root', { d: 1 })], memories: [{ id: 'equal', text: 'first', createdAt: 1 }, { id: 'equal', text: 'same-update duplicate', createdAt: 1 }], future: { raw: '~synapse:0' } })],
@@ -336,11 +336,15 @@ module.exports = async function(page) {
       ]);
       for (const [name, payload] of originals) h.gist.files[name] = { content: await h.encrypt(payload) };
       const before = await h.remote();
-      const texts = (remote, root) => remote.conversations.filter(record => record.id === root || record.conflictOf === root).map(record => record.messages[0].content).sort();
-      h.eq(texts(before, 'CB'), ['B', 'C'], 'C does not erase the concurrent B branch');
-      h.eq(texts(before, 'XY'), ['X', 'Y'], 'Equal-content X snapshots must not be pre-merged across Y');
+      const family = (remote, root) => remote.conversations.filter(record => record.id === root);
+      const contents = (remote, root) => [...new Set(family(remote, root).flatMap(record => record.messages.map(message => message.content)))].sort();
+      h.eq(family(before, 'CB').length, 1, 'Concurrent branches combine into one chat instead of conflict copies');
+      h.eq(contents(before, 'CB'), ['A', 'B', 'C'], 'No branch content is lost when C meets the concurrent B branch');
+      h.eq(family(before, 'XY').length, 1, 'Snapshots of one chat stay one chat');
+      h.eq(contents(before, 'XY'), ['X', 'Y'], 'Identical X snapshots deduplicate by message id while Y is kept');
+      h.eq(before.conversations.some(record => record.conflictOf === 'CB' || record.conflictOf === 'XY'), false, 'Union never forks conflict copies');
       h.eq(before.memories.map(memory => memory.text).sort(), ['last', 'same-update duplicate'], 'Equal-time memory selection respects update boundaries');
-      h.eq(texts(before, 'deleted-root'), [], 'Conflict-copy deletion roots suppress original-name snapshots');
+      h.eq(family(before, 'deleted-root').length, 0, 'Version-covered deletions stay deleted through the union');
       const first = await h.pack(new Map([...[...originals].slice(0, 1), ...[...originals].slice(2)]), '000-physical');
       const second = await h.pack(new Map([...originals].slice(0, 2)), 'zzz-physical');
       h.gist.files = { ...second.files, ...first.files };
