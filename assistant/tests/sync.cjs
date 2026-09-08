@@ -243,44 +243,93 @@ module.exports = async function(page) {
       }
     });
 
-    await check('new-Gist POST above 8 MiB and a fresh-browser reader recover identical image data', async () => {
+    await check('new-Gist POST above 8 MiB and a fresh-browser reader recover identical text', async () => {
       const fixture = await page.evaluate(async () => {
         const h = window.__syncFixture;
         h.gist.files = {};
         h.configure('');
-        const image = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6ioAAAAASUVORK5CYII=' + 'A'.repeat(9 * h.MiB);
-        getActiveConv().messages = [{ role: 'user', content: [{ type: 'text', text: 'Large image fixture' }, { type: 'image_url', image_url: { url: image } }] }];
+        // Raw pixels stay local-only, so split coverage uses text: the chunking is content-agnostic.
+        const bigText = 'Large text fixture\n\n' + 'L'.repeat(9 * h.MiB);
+        getActiveConv().messages = [{ role: 'user', content: bigText }];
         await h.t.saveConversationImmediately();
         const record = await idbGet('conversations', getActiveConv().id);
         h.ok(await h.push(), h.status);
         h.eq(h.log.map(entry => entry.method), ['POST', 'GET'], 'New Gist is verified after POST');
         h.eq(h.log[0].public, false, 'New fixture Gist is private');
-        h.ok(h.bytes(h.gist.files) > 8 * h.MiB, 'Actual encrypted image exceeds one physical file');
+        h.ok(h.bytes(h.gist.files) > 8 * h.MiB, 'Actual encrypted text exceeds one physical file');
         const name = Object.keys(h.gist.files).find(name => /^synapse-update-.*\.json\.enc$/.test(name));
         const header = await h.t.syncDecryptPayload(h.gist.files[name].content, h.passphrase);
         h.eq(header.schema, 'gist-sync-parts-v3', 'Chunk header is encrypted and authenticated');
-        h.ok(header.parts >= 2, 'Image is physically split');
+        h.ok(header.parts >= 2, 'Text is physically split');
         const archive = await h.read();
         h.eq([...archive.sourceFiles].sort(), Object.keys(h.gist.files).filter(name => name !== 'manifest.json').sort(), 'Source files include header and every part');
         h.limits();
-        record.messages[0].content[1].image_url.url = await h.hash(image);
+        record.messages[0].content = await h.hash(bigText);
         return { gist: h.gist, record };
       });
-      // Reload after clearing both browser stores: no writer key cache or local image remains.
+      // Reload after clearing both browser stores: no writer key cache or local text remains.
       await reset();
       const recovered = await page.evaluate(async fixture => {
         const h = window.__syncFixture;
         h.gist = fixture.gist;
         h.configure();
         h.raw = true;
-        h.ok(!(await idbGet('conversations', fixture.record.id)), 'Fresh reader does not already have the image');
+        h.ok(!(await idbGet('conversations', fixture.record.id)), 'Fresh reader does not already have the text');
         h.ok(await syncPullFromGist(), document.getElementById('syncDetails').textContent);
         const record = await idbGet('conversations', fixture.record.id);
-        record.messages[0].content[1].image_url.url = await h.hash(record.messages[0].content[1].image_url.url);
+        record.messages[0].content = await h.hash(record.messages[0].content);
         h.ok(h.rawReads.some(name => name.endsWith('.part-0')), 'Truncated inline content uses fixture raw URLs');
         return record;
       }, fixture);
-      assert.deepEqual(recovered, fixture.record, 'Full conversation and image bytes are equal, independent of object property order');
+      assert.deepEqual(recovered, fixture.record, 'Full conversation and text bytes are equal, independent of object property order');
+    });
+
+    await browserCheck('heavy blobs stay local-only and a bloated archive rewrites into one checkpoint', async () => {
+      const h = window.__syncFixture;
+      const bigImage = 'data:image/png;base64,' + 'P'.repeat(h.MiB);
+      const originals = new Map();
+      h.gist.files = { 'manifest.json': { content: JSON.stringify(h.manifest) } };
+      for (let i = 0; i < 34; i++) {
+        const name = h.name('blob-' + String(i).padStart(3, '0'));
+        const payload = h.update({ conversations: [h.chat('blob-chat-' + i, 'Blob text ' + i)], memories: [], projects: [], settingsState: {}, tombstones: {} });
+        payload.conversations[0].messages.push({ role: 'user', content: [{ type: 'text', text: 'pixel ' + i }, { type: 'image_url', image_url: { url: bigImage + i } }] });
+        h.gist.files[name] = { content: await h.encrypt(payload) };
+        originals.set(name, payload);
+      }
+      h.ok(h.bytes(h.gist.files) > 32 * h.MiB, 'Blob-filled fixture really exceeds 32 MiB');
+      h.ok(await h.push(), h.status);
+      h.ok(h.status.includes('Archive rewritten'), 'Oversized archive triggers a checkpoint rewrite: ' + h.status);
+      h.ok(h.bytes(h.gist.files) < h.MiB, 'Checkpoint collapses the blob archive below 1 MiB');
+      h.limits();
+      const after = await h.remote();
+      for (let i = 0; i < 34; i++) {
+        const record = after.conversations.find(record => record.id === 'blob-chat-' + i);
+        h.ok(record, 'Checkpoint keeps chat: blob-chat-' + i);
+        h.eq(record.messages[0].content, 'Blob text ' + i, 'Checkpoint keeps text: blob-chat-' + i);
+        const pixels = record.messages[1].content.find(part => part.type === 'image_url');
+        h.eq(pixels?.image_url?.url || '', '', 'Remote copies stay stripped: blob-chat-' + i);
+      }
+      h.eq(after.conversations.length, 35, 'Checkpoint keeps every chat exactly once, including local');
+    });
+
+    await browserCheck('routine checkpoint collapses file count before limits bite', async () => {
+      const h = window.__syncFixture;
+      await h.seed(160);
+      h.ok(h.bytes(h.gist.files) < h.MiB, 'Count fixture stays small');
+      const activeId = getActiveConv().id;
+      h.ok(await h.push(), h.status);
+      h.ok(h.status.includes('Archive rewritten'), 'Routine rewrite triggers on file count: ' + h.status);
+      h.eq(Object.keys(h.gist.files).length, 2, 'One checkpoint plus manifest remain');
+      h.limits();
+      const after = await h.remote();
+      const ids = new Set(after.conversations.map(record => record.id));
+      h.ok(ids.has('remote-only'), 'Routine rewrite keeps remote chats');
+      h.ok(ids.has(activeId), 'Routine rewrite keeps the local chat');
+      h.eq(ids.size, 2, 'Routine rewrite keeps every chat exactly once');
+      getActiveConv().messages.push({ role: 'user', content: 'Steady change' });
+      await h.t.saveConversationImmediately();
+      h.ok(await h.push(), 'Push after a routine rewrite: ' + h.status);
+      h.eq(Object.keys(h.gist.files).length, 3, 'Steady state stays tiny: checkpoint plus one delta');
     });
 
     await browserCheck('compacting split sources cleans only their physical headers and parts', async () => {

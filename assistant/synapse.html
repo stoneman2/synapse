@@ -3313,7 +3313,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-09-07T12:00:00+08:00',
+  buildDate: '2026-09-07T22:00:00+08:00',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -3321,6 +3321,11 @@ const SYNC_GIST_API_URL = 'https://api.github.com/gists';
 const SYNC_KDF_ITERATIONS = 120000;
 const SYNC_FILE_MAX_BYTES = 8 * 1024 * 1024;
 const SYNC_ARCHIVE_MAX_BYTES = 32 * 1024 * 1024;
+// Routine rewrite well before the hard limits: the archive stays a checkpoint
+// plus a few deltas, so pushes and pulls stay small and the 32 MiB wall is
+// never reached in normal operation.
+const SYNC_ROUTINE_CHECKPOINT_BYTES = 16 * 1024 * 1024;
+const SYNC_ROUTINE_CHECKPOINT_FILES = 150;
 const SYNC_UPDATE_FILE = /^synapse-update-[A-Za-z0-9_-]+\.json\.enc$/;
 const SYNC_AUTO_PUSH_KEY = 'assistantSyncAutoPush';
 const SYNC_AUTO_PENDING_KEY = 'assistantSyncAutoPushPending';
@@ -12154,8 +12159,17 @@ function renderMessages({ preserveScroll = false } = {}) {
             bubble.appendChild(sp);
           } else if (part.type === 'image_url') {
             const img = document.createElement('img');
-            const safeUrl = safeMediaUrl(part.image_url.url);
-            if (!safeUrl) return;
+            const rawUrl = part.image_url.url;
+            const safeUrl = safeMediaUrl(rawUrl);
+            if (!safeUrl) {
+              if (rawUrl === '') {
+                const note = document.createElement('span');
+                note.className = 'msg-meta-pill';
+                note.textContent = '🖼 image stays on the sending device';
+                bubble.appendChild(note);
+              }
+              return;
+            }
             img.src = safeUrl;
             img.className = 'chat-inline-img';
             img.alt = 'User uploaded image';
@@ -12376,8 +12390,17 @@ function renderEditMode(area, msg, idx) {
       attachments.forEach(part => {
         if (part.type === 'image_url') {
           const img = document.createElement('img');
-          const safeUrl = safeMediaUrl(part.image_url.url);
-          if (!safeUrl) return;
+          const rawUrl = part.image_url.url;
+          const safeUrl = safeMediaUrl(rawUrl);
+          if (!safeUrl) {
+            if (rawUrl === '') {
+              const note = document.createElement('span');
+              note.className = 'msg-meta-pill';
+              note.textContent = '🖼 image stays on the sending device';
+              attPreview.appendChild(note);
+            }
+            return;
+          }
           img.src = safeUrl;
           img.className = 'chat-inline-img';
           img.style.cssText = 'max-width:80px;max-height:80px;border-radius:6px;opacity:0.8';
@@ -14839,6 +14862,15 @@ function synapseSelfTest() {
     const idProbeA = normalizeConversationRecord({ id: 'id-probe', messages: [{ role: 'user', content: 'same', timestamp: 3 }] });
     const idProbeB = normalizeConversationRecord({ id: 'id-probe', messages: [{ role: 'user', content: 'same', timestamp: 3 }] });
     assert(idProbeA.messages[0].id === idProbeB.messages[0].id && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(idProbeA.messages[0].id || ''), 'stable message ids');
+    const blobBody = 'data:image/png;base64,' + 'B'.repeat(300000);
+    const blobConv = normalizeConversationRecord({ id: 'blob-probe', characterAvatar: blobBody, messages: [{ role: 'user', content: [{ type: 'text', text: 'see' }, { type: 'image_url', image_url: { url: blobBody } }], images: [blobBody], timestamp: 4 }] });
+    const strippedProbe = syncStripHeavyBlobs(blobConv);
+    assert(strippedProbe.characterAvatar === '' && strippedProbe.messages[0].content[1].image_url.url === '' && strippedProbe.messages[0].images[0] === '' &&
+      blobConv.characterAvatar === blobBody && blobConv.messages[0].content[1].image_url.url === blobBody, 'heavy blobs strip from sync copies only');
+    syncRestoreStrippedBlobs(strippedProbe, blobConv);
+    assert(strippedProbe.characterAvatar === blobBody && strippedProbe.messages[0].content[1].image_url.url === blobBody && strippedProbe.messages[0].images[0] === blobBody, 'stripped blobs restore from local');
+    const smallBlob = normalizeConversationRecord({ id: 'small-probe', messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }], timestamp: 5 }] });
+    assert(syncStripHeavyBlobs(smallBlob).messages[0].content[0].image_url.url === 'data:image/png;base64,AAAA', 'small blobs still sync');
     assert(chooseConversationWinner({ id: 'same', updatedAt: 2, messages: [{ role: 'user', content: 'newer' }] }, { id: 'same', updatedAt: 1, messages: [] }) === null, 'unknown divergent history needs a copy');
     const storedConversation = { id: 'persist', updatedAt: 1, messages: [] };
     const appendedConversation = { id: 'persist', updatedAt: 1, messages: [{ role: 'assistant', content: 'reply' }] };
@@ -15432,6 +15464,122 @@ function syncNormalizeConversation(conv) {
   return normalizeConversationRecord(conv && typeof conv === 'object' ? syncCloneJson(conv) : {});
 }
 
+// Sync carries text, never raw pixels: data URLs larger than this stay on their
+// device. Extracted file text still syncs, and every pull restores local blobs
+// over stripped copies, so a device never wipes its own images.
+const SYNC_INLINE_BLOB_MAX_BYTES = 256 * 1024;
+
+function syncIsBlobString(value) {
+  return typeof value === 'string' && /^data:/i.test(value);
+}
+
+function syncStripBlobString(value) {
+  return typeof value === 'string' && value.length > SYNC_INLINE_BLOB_MAX_BYTES && syncIsBlobString(value) ? '' : value;
+}
+
+function syncStripHeavyBlobs(conv) {
+  const record = syncCloneJson(conv);
+  if (typeof record.characterAvatar === 'string') record.characterAvatar = syncStripBlobString(record.characterAvatar);
+  const stripAttachmentBlobs = list => {
+    if (!Array.isArray(list)) return;
+    list.forEach(att => {
+      if (att && typeof att === 'object' && typeof att.dataUrl === 'string') att.dataUrl = syncStripBlobString(att.dataUrl);
+    });
+  };
+  stripAttachmentBlobs(record.draft?.attachments);
+  (record.queuedFollowUps || []).forEach(item => stripAttachmentBlobs(item?.attachments));
+  (record.messages || []).forEach(message => {
+    if (!message || typeof message !== 'object') return;
+    if (Array.isArray(message.images)) message.images = message.images.map(syncStripBlobString);
+    if (Array.isArray(message.swipeImages)) message.swipeImages = message.swipeImages.map(group => Array.isArray(group) ? group.map(syncStripBlobString) : group);
+    if (Array.isArray(message.content)) message.content.forEach(part => {
+      if (!part || typeof part !== 'object') return;
+      if (part.type === 'image_url' && part.image_url && typeof part.image_url.url === 'string') part.image_url.url = syncStripBlobString(part.image_url.url);
+      if (part.type === 'file' && part.file && typeof part.file.url === 'string') part.file.url = syncStripBlobString(part.file.url);
+    });
+  });
+  return record;
+}
+
+// Same-id messages differ only in blob payloads, so the local template rebuilds
+// them exactly. Anything without a local counterpart stays stripped.
+function syncRestoreMessageBlobs(mergedMessage, localMessage) {
+  if (!mergedMessage || !localMessage || typeof mergedMessage !== 'object' || typeof localMessage !== 'object') return;
+  if (Array.isArray(localMessage.content) && Array.isArray(mergedMessage.content) && mergedMessage.id && mergedMessage.id === localMessage.id) {
+    const rebuilt = [];
+    let index = 0;
+    for (const localPart of localMessage.content) {
+      const mergedPart = mergedMessage.content[index];
+      if (localPart?.type === 'image_url' || localPart?.type === 'file') {
+        if (mergedPart?.type === localPart.type) {
+          const slot = localPart.type === 'image_url' ? mergedPart.image_url : mergedPart.file;
+          const source = localPart.type === 'image_url' ? localPart.image_url : localPart.file;
+          if (slot && source && !slot.url && syncIsBlobString(source.url)) slot.url = source.url;
+          rebuilt.push(mergedPart);
+          index++;
+        } else {
+          rebuilt.push(syncCloneJson(localPart));
+        }
+      } else if (mergedPart && mergedPart.type === localPart?.type) {
+        rebuilt.push(mergedPart);
+        index++;
+      } else {
+        rebuilt.push(syncCloneJson(localPart));
+      }
+    }
+    while (index < mergedMessage.content.length) rebuilt.push(mergedMessage.content[index++]);
+    mergedMessage.content = rebuilt;
+  }
+  const restoreUrlList = (target, source) => {
+    if (!Array.isArray(source)) return target;
+    const kept = Array.isArray(target) ? [...target] : [];
+    const have = new Set(kept.filter(item => typeof item === 'string' && item));
+    for (const item of source) {
+      if (typeof item === 'string' && item && !have.has(item)) { kept.push(item); have.add(item); }
+    }
+    return kept;
+  };
+  if (Array.isArray(localMessage.images)) mergedMessage.images = restoreUrlList(mergedMessage.images, localMessage.images);
+  if (Array.isArray(localMessage.swipeImages)) {
+    if (!Array.isArray(mergedMessage.swipeImages)) mergedMessage.swipeImages = [];
+    localMessage.swipeImages.forEach((group, groupIndex) => {
+      if (!Array.isArray(group)) return;
+      mergedMessage.swipeImages[groupIndex] = restoreUrlList(mergedMessage.swipeImages[groupIndex], group);
+    });
+  }
+}
+
+function syncRestoreStrippedBlobs(merged, local) {
+  if (!merged || !local || typeof merged !== 'object' || typeof local !== 'object') return merged;
+  if (merged.characterAvatar === '' && syncIsBlobString(local.characterAvatar)) {
+    merged.characterAvatar = local.characterAvatar;
+  }
+  const restoreAttachmentBlobs = (targetList, sourceList) => {
+    if (!Array.isArray(targetList) || !Array.isArray(sourceList)) return;
+    targetList.forEach((att, attIndex) => {
+      const source = sourceList[attIndex];
+      if (att && typeof att === 'object' && source && typeof source === 'object' &&
+          att.type === source.type && (att.name || '') === (source.name || '') &&
+          att.dataUrl === '' && syncIsBlobString(source.dataUrl)) att.dataUrl = source.dataUrl;
+    });
+  };
+  restoreAttachmentBlobs(merged.draft?.attachments, local.draft?.attachments);
+  (merged.queuedFollowUps || []).forEach(item => {
+    const source = (local.queuedFollowUps || []).find(entry => entry?.id && entry.id === item?.id);
+    if (source) restoreAttachmentBlobs(item?.attachments, source.attachments);
+  });
+  const localById = new Map();
+  (local.messages || []).forEach(message => {
+    if (message && typeof message === 'object' && message.id) localById.set(message.id, message);
+  });
+  (merged.messages || []).forEach(message => {
+    if (message && typeof message === 'object' && message.id && localById.has(message.id)) {
+      syncRestoreMessageBlobs(message, localById.get(message.id));
+    }
+  });
+  return merged;
+}
+
 function syncNormalizeTombstones(value) {
   const source = value && typeof value === 'object' ? value : {};
   const normalized = { conversations: {}, projects: {}, memories: {}, conversationVersions: {}, conversationRoots: {} };
@@ -15765,6 +15913,105 @@ async function syncReadArchiveUpdates(gist, passphrase, keyCache = {}) {
   return { updates, hashes, snapshotHashes, sourceFiles };
 }
 
+function syncIsLegacySyncFile(name) {
+  return name === 'manifest.json' || name === 'settings.json.enc' || name === 'memories.json.enc' ||
+    name === 'projects.json.enc' || name === 'tombstones.json.enc' || name === 'metadata.json.enc' ||
+    /^conv_.+\.json\.enc$/.test(name || '');
+}
+
+// Every id present before deletions must still resolve after them.
+function syncCheckpointCovers(later, earlier) {
+  const ids = list => new Set((list || []).map(record => record?.id).filter(Boolean));
+  for (const key of ['conversations', 'memories', 'projects']) {
+    for (const id of ids(earlier[key])) {
+      if (!ids(later[key]).has(id)) return false;
+    }
+  }
+  const laterMessages = new Map((later.conversations || []).map(conv => [conv.id, new Set((conv.messages || []).map(message => message?.id).filter(Boolean))]));
+  for (const conv of earlier.conversations || []) {
+    const known = laterMessages.get(conv.id);
+    if (!known) return false;
+    for (const message of conv.messages || []) {
+      if (message?.id && !known.has(message.id)) return false;
+    }
+  }
+  return true;
+}
+
+// Last-resort rewrite for archives packing cannot save: one checkpoint update
+// covering the full merged state, then delete only files proven covered, with a
+// re-read loop so a concurrent writer's files are absorbed, never removed.
+async function syncCheckpointArchive(url, cfg, manifest, remote, source) {
+  const context = await syncBuildCryptoContext(cfg.passphrase, manifest?.salt || localStorage.getItem('assistantSyncSalt') || null);
+  const initialSources = new Set(remote.archive.sourceFiles);
+  const checkpoints = [];
+  const isCheckpointFile = name => checkpoints.some(file => name === file || name.startsWith(file + '.part-'));
+  let current = remote;
+  for (let round = 0; round < 3; round++) {
+    const tombstones = syncMergeTombstones(current.tombstones, source.tombstones);
+    const settingsState = syncMergeSettingsStates(current.settingsState, source.settingsState);
+    const memories = syncMergeMemoryLists(current.memories, source.memories, tombstones.memories);
+    const projects = syncMergeProjectLists(current.projects, source.projects, tombstones.projects);
+    const merged = await syncMergeConversationLists([...current.conversations, ...source.conversations], [], tombstones.conversations, tombstones.conversationVersions, tombstones.conversationRoots);
+    const payload = {
+      app: 'Synapse', schema: 'gist-sync-update-v2', version: 2, updatedAt: Date.now(),
+      tombstones, settingsState, conversations: merged.conversations.map(syncStripHeavyBlobs), memories, projects
+    };
+    const unionHash = await syncSha256Hex({ ...payload, updatedAt: 0 });
+    if (current.archive.snapshotHashes.has(unionHash)) {
+      // The exact full state is already archived: nothing to upload, so succeed
+      // as a no-op instead of stacking duplicate checkpoints.
+      const measured = await fetchGist(url, { cache: 'no-store' }, cfg.token).catch(() => null);
+      const conversationHashes = {};
+      for (const conv of merged.conversations) {
+        conversationHashes[conv.id] = await syncSha256Hex(syncStripHeavyBlobs(syncNormalizeConversation(conv)));
+      }
+      const size = measured ? syncGistSize(measured.files || {}) : 0;
+      return {
+        manifest, filename: '', conversationCount: merged.conversations.length,
+        hash: unionHash, conversationHashes, removed: 0,
+        beforeBytes: size, afterBytes: size, alreadyArchived: true
+      };
+    }
+    const filename = 'synapse-update-checkpoint-' + syncBytesToBase64Url(syncRandomBytes(18)) + '.json.enc';
+    const builtFiles = await syncBuildUpdateFiles(payload, context, filename, manifest);
+    await fetchGistResponse(url, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files: builtFiles.files })
+    }, cfg.token);
+    const verified = await fetchGist(url, { cache: 'no-store' }, cfg.token);
+    const recovered = await syncReadArchiveUpdates(verified, cfg.passphrase);
+    const checkpointHash = await syncSha256Hex(payload);
+    if (recovered.hashes.get(filename) !== checkpointHash) throw new Error('The checkpoint update could not be verified. Previous files were retained; retry safely.');
+    checkpoints.push(filename);
+    const fresh = [...recovered.sourceFiles].filter(name =>
+      !initialSources.has(name) && !isCheckpointFile(name) && name !== 'manifest.json' && !syncIsLegacySyncFile(name));
+    if (!fresh.length) {
+      const before = await syncReadRemoteData(verified, await syncReadManifest(verified, cfg.token), cfg.passphrase);
+      const removals = Object.fromEntries([...recovered.sourceFiles]
+        .filter(name => !isCheckpointFile(name) && name !== 'manifest.json' && !syncIsLegacySyncFile(name) && verified.files?.[name])
+        .map(name => [name, null]));
+      if (Object.keys(removals).length) {
+        await fetchGistResponse(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: removals }) }, cfg.token);
+      }
+      const finalGist = await fetchGist(url, { cache: 'no-store' }, cfg.token);
+      const after = await syncReadRemoteData(finalGist, await syncReadManifest(finalGist, cfg.token), cfg.passphrase);
+      if (!syncCheckpointCovers(after, before)) throw new Error('The archive rewrite could not be verified. The checkpoint still holds every conversation; retry the push.');
+      const conversationHashes = {};
+      for (const conv of merged.conversations) {
+        conversationHashes[conv.id] = await syncSha256Hex(syncStripHeavyBlobs(syncNormalizeConversation(conv)));
+      }
+      return {
+        manifest: builtFiles.manifest, filename, conversationCount: merged.conversations.length,
+        hash: checkpointHash, conversationHashes, removed: Object.keys(removals).length,
+        beforeBytes: syncGistSize(verified.files), afterBytes: syncGistSize(finalGist.files)
+      };
+    }
+    current = await syncReadRemoteData(verified, await syncReadManifest(verified, cfg.token), cfg.passphrase);
+  }
+  throw new Error('Concurrent writers kept changing the archive; no files were deleted. Retry the push.');
+}
+
 // Fresh names keep concurrent writes discoverable. A v3 envelope also makes old v2 readers stop,
 // even those which fall back to filename discovery after rejecting a newer manifest.
 async function syncBuildUpdateFiles(payload, context, filename, existingManifest) {
@@ -15773,7 +16020,7 @@ async function syncBuildUpdateFiles(payload, context, filename, existingManifest
     payload = syncPackUpdates(new Map([[filename, payload]]));
     content = await syncEncryptPayloadWithKey(payload, context);
   }
-  if (content.length > SYNC_ARCHIVE_MAX_BYTES) throw new Error('The sync data still exceeds 32 MiB after consolidation. Export a backup before reducing stored data; the existing Gist was not changed.');
+  if (content.length > SYNC_ARCHIVE_MAX_BYTES) throw new Error('The sync data still exceeds 32 MiB after consolidation (images and files over 256 KB already stay on this device). Export a backup, then trim text, docs, or old chats; the existing Gist was not changed.');
   const files = {};
   const split = content.length > SYNC_FILE_MAX_BYTES;
   if (split) {
@@ -15799,7 +16046,7 @@ async function syncBuildGistFiles(passphrase, existingManifest = null, merged = 
   const payload = {
     app: 'Synapse', schema: 'gist-sync-update-v2', version: 2, updatedAt: now,
     tombstones, settingsState,
-    conversations: (await syncMergeConversationLists([], merged?.conversations || getPersistentConversations(), tombstones.conversations, tombstones.conversationVersions, tombstones.conversationRoots)).conversations,
+    conversations: (await syncMergeConversationLists([], merged?.conversations || getPersistentConversations(), tombstones.conversations, tombstones.conversationVersions, tombstones.conversationRoots)).conversations.map(syncStripHeavyBlobs),
     memories: syncFilterDeletedRecords(merged?.memories || await loadMemories(), tombstones.memories, 'createdAt'),
     projects: syncFilterDeletedRecords(normalizeProjectList(merged?.projects || projects), tombstones.projects, 'updatedAt')
   };
@@ -15857,11 +16104,17 @@ async function syncPushToGist(options = {}) {
       }
     } catch(e) {}
     const nextConvHashes = {};
+    const nextConvSizes = {};
+    const nextConvTitles = {};
     for (const conv of local.conversations || []) {
-      nextConvHashes[conv.id] = await syncSha256Hex(syncNormalizeConversation(conv));
+      const stripped = syncStripHeavyBlobs(syncNormalizeConversation(conv));
+      nextConvHashes[conv.id] = await syncSha256Hex(stripped);
+      nextConvSizes[conv.id] = new TextEncoder().encode(JSON.stringify(stripped)).byteLength;
+      nextConvTitles[conv.id] = conv.title || 'Chat';
     }
     const nextMetadataHash = await syncSha256Hex({ tombstones: local.tombstones, settings: settingsState, memories: local.memories, projects: local.projects });
     const hasStoredSyncHashes = Object.keys(storedSyncHashes.conversations).length > 0 || storedSyncHashes.metadata !== '';
+    const allLocalConversations = local.conversations || [];
     if (hasStoredSyncHashes) {
       local.conversations = (local.conversations || []).filter(conv => storedSyncHashes.conversations[conv.id] !== nextConvHashes[conv.id]);
       if (cfg.gistId && local.conversations.length === 0 && nextMetadataHash === storedSyncHashes.metadata) {
@@ -15874,6 +16127,11 @@ async function syncPushToGist(options = {}) {
     let unchanged = false;
     let consolidated = false;
     let cleanupPending = false;
+    let checkpointed = false;
+    let checkpointNoop = false;
+    let checkpointBeforeBytes = 0;
+    let checkpointAfterBytes = 0;
+    let checkpointRemoved = 0;
     if (cfg.gistId) {
       const url = SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId);
       const gist = await fetchGist(url, { cache: 'no-store' }, cfg.token);
@@ -15885,19 +16143,41 @@ async function syncPushToGist(options = {}) {
       const proposed = { ...gist.files, ...additions };
       const obsolete = new Set();
       const expectedHashes = new Map();
-      if (syncGistSize(proposed) > SYNC_ARCHIVE_MAX_BYTES || Object.keys(proposed).length >= 250) {
-        const updates = new Map(remote.archive.updates);
-        if (!unchanged) updates.set(built.filename, built.payload);
-        if (!updates.size) throw new Error('No complete sync updates are available to consolidate. The existing Gist was not changed.');
-        const pack = syncPackUpdates(updates);
-        const filename = 'synapse-update-' + syncBytesToBase64Url(syncRandomBytes(24)) + '.json.enc';
-        built = { ...built, ...await syncBuildUpdateFiles(pack, built.context, filename, existingManifest), filename };
-        remote.archive.sourceFiles.forEach(name => obsolete.add(name));
-        for (const [name, update] of updates) expectedHashes.set(name, remote.archive.hashes.get(name) || await syncSha256Hex(update));
-        consolidated = true;
+      const runCheckpoint = async () => {
+        const checkpoint = await syncCheckpointArchive(url, cfg, existingManifest, remote, { ...local, conversations: allLocalConversations });
+        built = { ...built, manifest: checkpoint.manifest, filename: checkpoint.filename, conversationCount: checkpoint.conversationCount, hash: checkpoint.hash };
+        Object.assign(nextConvHashes, checkpoint.conversationHashes);
+        uploaded = !checkpoint.alreadyArchived;
+        checkpointed = true;
+        checkpointNoop = !!checkpoint.alreadyArchived;
+        checkpointBeforeBytes = checkpoint.beforeBytes;
+        checkpointAfterBytes = checkpoint.afterBytes;
+        checkpointRemoved = checkpoint.removed;
+        obsolete.clear();
+        expectedHashes.clear();
+        consolidated = false;
+      };
+      const shrinkableUpdateFiles = Object.keys(gist.files || {}).filter(name => name.startsWith('synapse-update-')).length;
+      if (shrinkableUpdateFiles > 1 && (syncGistSize(gist.files || {}) > SYNC_ROUTINE_CHECKPOINT_BYTES || Object.keys(gist.files || {}).length >= SYNC_ROUTINE_CHECKPOINT_FILES)) {
+        await runCheckpoint();
+      } else if (syncGistSize(proposed) > SYNC_ARCHIVE_MAX_BYTES || Object.keys(proposed).length >= 250) {
+        try {
+          const updates = new Map(remote.archive.updates);
+          if (!unchanged) updates.set(built.filename, built.payload);
+          if (!updates.size) throw new Error('No complete sync updates are available to consolidate. The existing Gist was not changed.');
+          const pack = syncPackUpdates(updates);
+          const filename = 'synapse-update-' + syncBytesToBase64Url(syncRandomBytes(24)) + '.json.enc';
+          built = { ...built, ...await syncBuildUpdateFiles(pack, built.context, filename, existingManifest), filename };
+          remote.archive.sourceFiles.forEach(name => obsolete.add(name));
+          for (const [name, update] of updates) expectedHashes.set(name, remote.archive.hashes.get(name) || await syncSha256Hex(update));
+          consolidated = true;
+        } catch (error) {
+          if (!/consolidation/.test(error?.message || '')) throw error;
+          await runCheckpoint();
+        }
       } else if (!unchanged) expectedHashes.set(built.filename, await syncSha256Hex(built.payload));
 
-      if (!unchanged || consolidated) {
+      if (!checkpointed && (!unchanged || consolidated)) {
         for (const name of Object.keys(built.files)) {
           if (name !== 'manifest.json' && gist.files?.[name]) throw new Error('Sync update name already exists. Retry; no remote file was changed.');
         }
@@ -15906,8 +16186,22 @@ async function syncPushToGist(options = {}) {
         obsolete.forEach(name => delete resulting[name]);
         if (syncGistSize(resulting) > SYNC_ARCHIVE_MAX_BYTES || Object.keys(resulting).length >= 250 ||
             syncGistSize(staged) > 2 * SYNC_ARCHIVE_MAX_BYTES || Object.keys(staged).length >= 300) {
-          throw new Error('The sync archive is still too large after consolidation. Export a backup before reducing stored data; the existing Gist was not changed.');
+          const checkpoint = await syncCheckpointArchive(url, cfg, existingManifest, remote, { ...local, conversations: allLocalConversations });
+          if (checkpoint.afterBytes > SYNC_ARCHIVE_MAX_BYTES && !checkpoint.removed) {
+            throw new Error('The sync archive is still too large after consolidation. Export a backup before reducing stored data; the existing Gist was not changed.');
+          }
+          built = { ...built, manifest: checkpoint.manifest, filename: checkpoint.filename, conversationCount: checkpoint.conversationCount, hash: checkpoint.hash, files: {} };
+          Object.assign(nextConvHashes, checkpoint.conversationHashes);
+          uploaded = true;
+          checkpointed = true;
+          checkpointBeforeBytes = checkpoint.beforeBytes;
+          checkpointAfterBytes = checkpoint.afterBytes;
+          checkpointRemoved = checkpoint.removed;
+          obsolete.clear();
+          expectedHashes.clear();
         }
+        // Checkpoint path already uploaded and cleaned up; only stage real update files.
+        if (Object.keys(built.files).length) {
         await fetchGistResponse(url, {
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ files: built.files })
@@ -15928,6 +16222,7 @@ async function syncPushToGist(options = {}) {
               await fetchGistResponse(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: removals }) }, cfg.token);
             } catch (error) { cleanupPending = true; console.warn('Sync saved; old update cleanup will be retried:', error); }
           }
+        }
         }
       }
     } else {
@@ -15952,8 +16247,33 @@ async function syncPushToGist(options = {}) {
     localStorage.setItem('assistantSyncLastHash', built.hash);
     localStorage.setItem(SYNC_CONV_HASHES_KEY, JSON.stringify({ v: 1, conversations: nextConvHashes, metadata: nextMetadataHash }));
     renderSyncSettings();
-    syncSetStatus('current', cleanupPending ? 'Saved; cleanup pending' : unchanged && !consolidated ? 'Already saved' : 'Pushed',
-      (cleanupPending ? 'Data is verified. Old copies were retained because cleanup failed; push again to retry. ' : consolidated ? 'Consolidated the archive without discarding past updates. ' : unchanged ? 'Local data is already in this Gist. ' : 'Saved an encrypted update with ' + built.conversationCount + ' conversations. ') + 'Remote changes are applied only by Pull now.');
+    const sentBytes = checkpointed ? 0 : Object.values(built.files || {}).reduce((sum, file) => sum + (file?.content ? new TextEncoder().encode(file.content).byteLength : 0), 0);
+    const largestChats = allLocalConversations
+      .map(conv => ({ title: String(nextConvTitles[conv.id] || conv.title || 'Chat').slice(0, 28), bytes: nextConvSizes[conv.id] || 0 }))
+      .sort((a, b) => b.bytes - a.bytes).slice(0, 3).filter(entry => entry.bytes > 0)
+      .map(entry => '"' + entry.title + '" ' + formatCacheBytes(entry.bytes)).join(', ');
+    const sentSummary = sentBytes ? ' (' + formatCacheBytes(sentBytes) + ' uploaded' + (largestChats ? '; largest: ' + largestChats : '') + ')' : '';
+    let statusMessage = 'Pushed';
+    let statusDetails = 'Saved an encrypted update with ' + built.conversationCount + ' conversations' + sentSummary + '. Remote changes are applied only by Pull now.';
+    if (checkpointed && !checkpointNoop) {
+      statusMessage = 'Archive rewritten';
+      statusDetails = 'Rewrote the bloated archive into one checkpoint (' + formatCacheBytes(checkpointBeforeBytes) + ' → ' + formatCacheBytes(checkpointAfterBytes) + ', removed ' + checkpointRemoved + ' old files). Remote changes are applied only by Pull now.';
+    } else if (checkpointNoop) {
+      statusMessage = 'Already saved';
+      statusDetails = 'The full state is already archived, so nothing was uploaded' +
+        (checkpointAfterBytes > SYNC_ARCHIVE_MAX_BYTES ? ' (archive still oversized at ' + formatCacheBytes(checkpointAfterBytes) + ': export a backup and start a fresh sync Gist).' : '.') +
+        ' Remote changes are applied only by Pull now.';
+    } else if (cleanupPending) {
+      statusMessage = 'Saved; cleanup pending';
+      statusDetails = 'Data is verified. Old copies were retained because cleanup failed; push again to retry. Remote changes are applied only by Pull now.';
+    } else if (unchanged && !consolidated) {
+      statusMessage = 'Already saved';
+      statusDetails = 'Local data is already in this Gist. Remote changes are applied only by Pull now.';
+    } else if (consolidated) {
+      statusMessage = 'Pushed';
+      statusDetails = 'Consolidated the archive without discarding past updates' + sentSummary + '. Remote changes are applied only by Pull now.';
+    }
+    syncSetStatus('current', statusMessage, statusDetails);
     succeeded = true;
     if (!auto) showToast('Sync push complete.', 'success');
     return true;
@@ -16249,6 +16569,12 @@ async function syncPullFromGist(options = {}) {
     const liveMemories = syncMergeMemoryLists(snapshot.memories, remote.memories, liveTombstones.memories);
     const liveProjects = syncMergeProjectLists(snapshot.projects, remote.projects, liveTombstones.projects);
     const liveMerged = await syncMergeConversationLists(snapshot.conversations, remote.conversations, liveTombstones.conversations, liveTombstones.conversationVersions, liveTombstones.conversationRoots);
+    // Stripped remote copies must never wipe local blobs: restore them before persist.
+    const localConvById = new Map((snapshot.conversations || []).map(record => [record.id, record]));
+    for (const record of liveMerged.conversations) {
+      const base = localConvById.get(record.id);
+      if (base) syncRestoreStrippedBlobs(record, base);
+    }
     const temporaryActive = conversations.find(conv => conv.id === snapshot.activeConvId && isTemporaryConversation(conv));
     const nextActiveId = temporaryActive?.id ||
       (liveMerged.conversations.some(conv => conv.id === snapshot.activeConvId) ? snapshot.activeConvId : (liveMerged.conversations[0]?.id || null));
@@ -16287,7 +16613,7 @@ async function syncPullFromGist(options = {}) {
     } catch (renderError) {
       console.error('Sync pull render refresh failed:', renderError);
     }
-    syncSetStatus('current', 'Pulled', 'Merged ' + remote.conversations.length + ' remote conversations. Added ' + liveMerged.added + ', updated ' + liveMerged.updated + '.');
+    syncSetStatus('current', 'Pulled', 'Merged ' + remote.conversations.length + ' remote conversations. Added ' + liveMerged.added + ', updated ' + liveMerged.updated + '. Archive ' + formatCacheBytes(syncGistSize(gist.files || {})) + '.');
     showToast('Sync pull complete.', 'success');
     notifyConversationConflicts(saved.conversations.filter(conv => conv.conflictOf).map(conv => conv.id));
     return true;
