@@ -3747,13 +3747,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   const shareId = new URLSearchParams(location.search).get('share');
   readOnlyShare = !!shareId;
   if (readOnlyShare) document.body.classList.add('share-view');
-  if (!readOnlyShare) {
-    window.addEventListener('online', () => syncScheduleAutoPull(true));
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') syncScheduleAutoPull();
-    });
-    window.addEventListener('focus', () => syncScheduleAutoPull());
-  }
 
   if (!readOnlyShare) {
     // Migration: strip endpoint suffix from proxy URL
@@ -3789,7 +3782,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     migrateToPromptEntries();
     await loadConversations();
     initConversationChannel();
-    void syncRunAutoPull(true).then(() => syncRunAutoPush());
+    void syncRunAutoPush();
   }
   loadTheme();
   loadCustomFont(localStorage.getItem('assistantFont') || '');
@@ -11735,15 +11728,9 @@ function syncGetDeviceId() {
 
 let _syncInputsLoaded = false;
 let _syncAutoPushTimer;
-let _syncAutoPullTimer;
-let _syncLastAutoPullAt = 0;
 let _syncOperationInFlight = false;
-// Set while a pull is applying to the local database. The network and decrypt
-// phases run without locking the UI; only the final commit is protected, and a
-// pull that arrives mid-stream defers and retries instead of blocking input.
+// Manual pulls cancel if local activity makes applying remote data unsafe.
 let _syncPullInFlight = false;
-let _syncPullPending = false;
-const SYNC_AUTO_PULL_COOLDOWN = 15000;
 
 function syncResumeDeferredSync() {
   if (localDataOperationsInFlight === 0 && !_syncPullInFlight) {
@@ -11752,10 +11739,6 @@ function syncResumeDeferredSync() {
           localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true') syncScheduleAutoPush();
     } catch (error) { console.warn('Could not schedule pending sync push:', error); }
   }
-  if (!_syncPullPending || _syncOperationInFlight || sending || streaming || queueingFollowUp ||
-      pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) return;
-  _syncPullPending = false;
-  syncScheduleAutoPull(true);
 }
 
 function syncAutoPushIsConfigured(cfg) {
@@ -11840,35 +11823,6 @@ async function syncRunAutoPush() {
     syncSetStatus('unknown', 'Auto-push unavailable', 'Browser storage failed. Free storage and retry.');
     return false;
   }
-}
-
-async function syncRunAutoPull(force = false) {
-  if (readOnlyShare || navigator.onLine === false) return false;
-  if (_syncOperationInFlight || _syncPullInFlight) { _syncPullPending = true; return false; }
-  const cfg = syncGetStoredConfig();
-  if (!syncAutoPushIsConfigured(cfg)) return false;
-  // Not even the fetch runs mid-generation; pend it for when the app goes idle.
-  if (sending || streaming || queueingFollowUp || pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) {
-    _syncPullPending = true;
-    return false;
-  }
-  const now = Date.now();
-  if (!force && now - _syncLastAutoPullAt < SYNC_AUTO_PULL_COOLDOWN) return false;
-  _syncLastAutoPullAt = now;
-  try {
-    return await syncPullFromGist({ auto: true });
-  } catch (error) {
-    console.warn('Automatic sync pull failed:', error);
-    return false;
-  }
-}
-
-function syncScheduleAutoPull(force = false) {
-  clearTimeout(_syncAutoPullTimer);
-  _syncAutoPullTimer = setTimeout(() => {
-    _syncAutoPullTimer = null;
-    void syncRunAutoPull(force);
-  }, force ? 0 : 250);
 }
 
 function syncToggleAutoPush(input) {
@@ -13283,11 +13237,13 @@ async function syncCapturePullSnapshot() {
 }
 
 async function syncPullFromGist(options = {}) {
-  const auto = options.auto === true;
   if (readOnlyShare) return false;
   if (_syncOperationInFlight) {
-    _syncPullPending = true;
-    if (!auto) showToast('Sync is already running; pull is queued.', 'info');
+    showToast('Sync is already running. Press Pull now again when it finishes.', 'info');
+    return false;
+  }
+  if (sending || streaming || queueingFollowUp || pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) {
+    showToast('Wait for local activity to finish, then press Pull now.', 'info');
     return false;
   }
   _syncOperationInFlight = true;
@@ -13314,8 +13270,7 @@ async function syncPullFromGist(options = {}) {
     const manifest = await syncReadManifest(gist, cfg.token);
     const remote = await syncReadRemoteData(gist, manifest, cfg.passphrase);
     if (sending || streaming || queueingFollowUp || pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) {
-      _syncPullPending = true;
-      syncSetStatus('dirty', 'Update waiting', 'Remote changes were fetched and will merge after the active operation finishes.');
+      syncSetStatus('dirty', 'Pull cancelled', 'Local activity started. Press Pull now again when it finishes.');
       return false;
     }
     persistDraftFromUI();
@@ -13323,7 +13278,6 @@ async function syncPullFromGist(options = {}) {
     if (!await saveProjects(true)) throw new Error('Project changes could not be saved. Retry before pulling.');
     await saveConversationImmediately();
     await loadMemories();
-    if (remoteResponse.etag) localStorage.setItem('assistantSyncLastEtag', remoteResponse.etag);
     const snapshot = await syncCapturePullSnapshot();
     const remoteTombstones = syncNormalizeTombstones(remote.tombstones);
     const incomingDeletionCount = (records, category, timestampKey) => records.filter(record => {
@@ -13351,8 +13305,7 @@ async function syncPullFromGist(options = {}) {
       }
     }
     if (sending || streaming || queueingFollowUp || pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) {
-      _syncPullPending = true;
-      syncSetStatus('dirty', 'Update waiting', 'Remote changes will merge after the active operation finishes.');
+      syncSetStatus('dirty', 'Pull cancelled', 'Local activity started. Press Pull now again when it finishes.');
       return false;
     }
 
@@ -13386,6 +13339,7 @@ async function syncPullFromGist(options = {}) {
       persistentActiveId: nextPersistentActiveId, settingsValues
     }, snapshot);
     committed = true;
+    if (remoteResponse.etag) localStorage.setItem('assistantSyncLastEtag', remoteResponse.etag);
     projects = saved.projects;
     projectBaseline = new Map(projects.map(project => [project.id, serializeConversation(project)]));
     armedFollowUpConversationIds.clear();
@@ -13416,8 +13370,7 @@ async function syncPullFromGist(options = {}) {
       return true;
     }
     if (/Local data changed while this operation was being prepared/.test(err.message || '')) {
-      _syncPullPending = true;
-      syncSetStatus('dirty', 'Update waiting', 'Remote changes will merge when local activity pauses.');
+      syncSetStatus('dirty', 'Pull cancelled', 'Local data changed. Please press Pull now again.');
       return false;
     }
     const message = err.name === 'OperationError' ? 'Could not decrypt sync data. Check the passphrase.' : (err.message || 'Unable to pull sync data.');
