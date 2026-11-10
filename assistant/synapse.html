@@ -15098,7 +15098,11 @@ function syncSaveSettings(showSavedToast = true, schedule = true) {
   }
 }
 
+let _syncStatus = null;
+
 function syncSetStatus(state, message, details) {
+  const cfg = syncGetStoredConfig();
+  _syncStatus = { state, message, details, gistId: cfg.gistId };
   const status = document.getElementById('syncStatus');
   const detailsEl = document.getElementById('syncDetails');
   if (status) {
@@ -15110,7 +15114,6 @@ function syncSetStatus(state, message, details) {
   const indicator = document.getElementById('syncIndicator');
   const quick = document.getElementById('syncQuickStatus');
   const button = document.getElementById('syncQuickButton');
-  const cfg = syncGetStoredConfig();
   if (indicator) {
     indicator.hidden = readOnlyShare || !cfg.token || !cfg.passphrase;
     indicator.className = 'sync-indicator ' + (state || 'unknown');
@@ -15150,9 +15153,11 @@ function renderSyncSettings() {
   if (!token || !passphrase) {
     syncSetStatus('unknown', 'Not configured', 'Add a GitHub token and sync passphrase before pushing or pulling.');
   } else if (!gistId) {
-    syncSetStatus('checking', 'Ready to create', 'Push now will create a private encrypted Gist.');
+    syncSetStatus('unknown', 'Ready to create', 'Push now will create a private encrypted Gist.');
+  } else if (_syncStatus && _syncStatus.gistId === gistId && _syncStatus.message !== 'Not configured') {
+    syncSetStatus(_syncStatus.state, _syncStatus.message, _syncStatus.details);
   } else {
-    syncSetStatus('current', 'Configured', 'Gist ' + gistId + (lastParts.length ? ' | ' + lastParts.join(' | ') : ''));
+    syncSetStatus('unknown', 'Backup ready', 'Gist ' + gistId + (lastParts.length ? ' | ' + lastParts.join(' | ') : '') + '. Remote changes are applied only by Pull now.');
   }
 }
 
@@ -16042,7 +16047,6 @@ async function syncPushToGist(options = {}) {
     if (!await saveProjects(true)) throw new Error('Project changes could not be saved. Retry before pushing.');
     await saveConversationImmediately();
     await loadMemories();
-    syncSetStatus('checking', 'Pushing...', 'Encrypting local data and writing Gist files.');
     const settingsState = syncCollectSettingsState();
     const local = await syncCapturePullSnapshot();
     local.settingsState = settingsState;
@@ -16072,11 +16076,15 @@ async function syncPushToGist(options = {}) {
     if (hasStoredSyncHashes) {
       local.conversations = (local.conversations || []).filter(conv => storedSyncHashes.conversations[conv.id] !== nextConvHashes[conv.id]);
       if (cfg.gistId && local.conversations.length === 0 && nextMetadataHash === storedSyncHashes.metadata) {
-        syncSetStatus('current', 'Already synced', 'No local changes need to be pushed.');
+        if (!auto) syncSetStatus('current', 'No local changes', 'No local changes to upload. Remote changes are applied only by Pull now.');
+        else if (_syncStatus?.message === 'Backup pending' && localStorage.getItem(SYNC_AUTO_PENDING_KEY) !== 'true') {
+          syncSetStatus('current', 'Backed up', 'No local changes to upload. Remote changes are applied only by Pull now.');
+        }
         succeeded = true;
         return true;
       }
     }
+    syncSetStatus('checking', 'Backing up…', 'Encrypting local data and writing Gist files.');
     let built;
     let unchanged = false;
     let consolidated = false;
@@ -16207,27 +16215,24 @@ async function syncPushToGist(options = {}) {
       .sort((a, b) => b.bytes - a.bytes).slice(0, 3).filter(entry => entry.bytes > 0)
       .map(entry => '"' + entry.title + '" ' + formatCacheBytes(entry.bytes)).join(', ');
     const sentSummary = sentBytes ? ' (' + formatCacheBytes(sentBytes) + ' uploaded' + (largestChats ? '; largest: ' + largestChats : '') + ')' : '';
-    let statusMessage = 'Pushed';
+    const statusMessage = 'Backed up';
     let statusDetails = 'Saved an encrypted update with ' + built.conversationCount + ' conversations' + sentSummary + '. Remote changes are applied only by Pull now.';
     if (checkpointed && !checkpointNoop) {
-      statusMessage = 'Archive rewritten';
       statusDetails = 'Rewrote the bloated archive into one checkpoint (' + formatCacheBytes(checkpointBeforeBytes) + ' → ' + formatCacheBytes(checkpointAfterBytes) + ', removed ' + checkpointRemoved + ' old files). Remote changes are applied only by Pull now.';
     } else if (checkpointNoop) {
-      statusMessage = 'Already saved';
       statusDetails = 'The full state is already archived, so nothing was uploaded' +
         (checkpointAfterBytes > SYNC_ARCHIVE_MAX_BYTES ? ' (archive still oversized at ' + formatCacheBytes(checkpointAfterBytes) + ': export a backup and start a fresh sync Gist).' : '.') +
         ' Remote changes are applied only by Pull now.';
     } else if (cleanupPending) {
-      statusMessage = 'Saved; cleanup pending';
       statusDetails = 'Data is verified. Old copies were retained because cleanup failed; push again to retry. Remote changes are applied only by Pull now.';
     } else if (unchanged && !consolidated) {
-      statusMessage = 'Already saved';
       statusDetails = 'Local data is already in this Gist. Remote changes are applied only by Pull now.';
     } else if (consolidated) {
-      statusMessage = 'Pushed';
       statusDetails = 'Consolidated the archive without discarding past updates' + sentSummary + '. Remote changes are applied only by Pull now.';
     }
-    syncSetStatus('current', statusMessage, statusDetails);
+    const backupPending = localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true';
+    syncSetStatus(backupPending ? 'dirty' : 'current', backupPending ? 'Backup pending' : statusMessage,
+      backupPending ? 'The captured data was backed up. Newer local changes are waiting to be uploaded.' : statusDetails);
     succeeded = true;
     if (!auto) showToast('Sync push complete.', 'success');
     return true;
@@ -16235,7 +16240,7 @@ async function syncPushToGist(options = {}) {
     console.error('Sync push failed:', err);
     const message = err.name === 'OperationError' ? 'Could not decrypt the existing sync Gist. Check the passphrase.' :
       (uploaded ? 'An update was uploaded to Gist ' + cfg.gistId + ', but confirmation or local storage failed. Keep that Gist ID. ' : '') + (err.message || 'Unable to push sync data.');
-    syncSetStatus('unknown', 'Push failed', message);
+    syncSetStatus('unknown', 'Backup failed', message);
     if (!auto) showToast('Sync push failed: ' + message, 'error', 6000);
     return false;
   } finally {
@@ -16465,13 +16470,13 @@ async function syncPullFromGist(options = {}) {
     const cfg = syncSaveSettings(false, false);
     if (!cfg) throw new Error('Sync settings could not be saved. Free storage and retry.');
     syncValidateConfig(cfg, true);
-    syncSetStatus('checking', 'Pulling...', 'Fetching and decrypting sync files.');
+    syncSetStatus('checking', 'Pulling…', 'Fetching and decrypting sync files.');
     const headers = {};
     const lastEtag = localStorage.getItem('assistantSyncLastEtag') || '';
     if (!options.force && lastEtag) headers['If-None-Match'] = lastEtag;
     const remoteResponse = await fetchGistResponse(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store', headers }, cfg.token);
     if (remoteResponse.notModified) {
-      syncSetStatus('current', 'Already synced', 'No remote changes were found.');
+      syncSetStatus('current', 'No remote updates', 'The Gist has not changed since the last applied pull.');
       return true;
     }
     const gist = remoteResponse.data;
@@ -16567,7 +16572,7 @@ async function syncPullFromGist(options = {}) {
     } catch (renderError) {
       console.error('Sync pull render refresh failed:', renderError);
     }
-    syncSetStatus('current', 'Pulled', 'Merged ' + remote.conversations.length + ' remote conversations. Added ' + liveMerged.added + ', updated ' + liveMerged.updated + '. Archive ' + formatCacheBytes(syncGistSize(gist.files || {})) + '.');
+    syncSetStatus('current', 'Pull complete', 'Merged ' + remote.conversations.length + ' remote conversations. Added ' + liveMerged.added + ', updated ' + liveMerged.updated + '. Archive ' + formatCacheBytes(syncGistSize(gist.files || {})) + '.');
     showToast('Sync pull complete.', 'success');
     notifyConversationConflicts(saved.conversations.filter(conv => conv.conflictOf).map(conv => conv.id));
     return true;
