@@ -2943,6 +2943,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
         <button class="btn btn-secondary debug-inline-btn" type="button" onclick="syncSaveSettings()">Save</button>
       </div>
       <div class="settings-note" id="syncDetails">Add a GitHub token and passphrase, then push to create or update your private sync Gist.</div>
+      <div class="settings-note" id="syncTimes"></div>
       <label class="toggle-row">
         <input type="checkbox" id="setSyncAutoPush" onchange="syncToggleAutoPush(this)">
         Automatically push local changes
@@ -15099,10 +15100,25 @@ function syncSaveSettings(showSavedToast = true, schedule = true) {
 }
 
 let _syncStatus = null;
+let _syncBackupStatus = null;
+let _syncIndicatorStatus = null;
 
-function syncSetStatus(state, message, details) {
+function syncSetStatus(state, message, details, operation = '') {
   const cfg = syncGetStoredConfig();
   _syncStatus = { state, message, details, gistId: cfg.gistId };
+  if (_syncBackupStatus?.gistId !== cfg.gistId) _syncBackupStatus = null;
+  if (operation === 'push') _syncBackupStatus = _syncStatus;
+  if (operation === 'pull' && state === 'current' && message !== 'Pull cancelled' && message !== 'Pull saved') {
+    _syncIndicatorStatus = _syncBackupStatus || { state: 'unknown', message: 'Backup ready', details: 'Remote changes were checked. Local backup status is separate.', gistId: cfg.gistId };
+  } else if (operation !== 'pairing') {
+    _syncIndicatorStatus = _syncStatus;
+  }
+  syncRenderStatus();
+}
+
+function syncRenderStatus() {
+  if (!_syncStatus) return;
+  const { state, message, details } = _syncStatus;
   const status = document.getElementById('syncStatus');
   const detailsEl = document.getElementById('syncDetails');
   if (status) {
@@ -15111,6 +15127,20 @@ function syncSetStatus(state, message, details) {
     status.setAttribute('aria-live', 'polite');
   }
   if (detailsEl) detailsEl.textContent = details || '';
+  const times = document.getElementById('syncTimes');
+  if (times) {
+    const lastPush = Number(localStorage.getItem('assistantSyncLastPushAt') || 0);
+    const lastPull = Number(localStorage.getItem('assistantSyncLastPullAt') || 0);
+    times.textContent = 'Last backup: ' + (lastPush ? formatRelativeTime(lastPush) : 'never') +
+      ' · Last applied pull: ' + (lastPull ? formatRelativeTime(lastPull) : 'never');
+  }
+  syncRenderIndicator();
+}
+
+function syncRenderIndicator() {
+  const cfg = syncGetStoredConfig();
+  const { state, message, details } = _syncIndicatorStatus?.gistId === cfg.gistId
+    ? _syncIndicatorStatus : { state: 'unknown', message: 'Backup ready' };
   const indicator = document.getElementById('syncIndicator');
   const quick = document.getElementById('syncQuickStatus');
   const button = document.getElementById('syncQuickButton');
@@ -15120,12 +15150,16 @@ function syncSetStatus(state, message, details) {
     indicator.title = details || message || 'Sync status';
   }
   if (quick) quick.textContent = message || 'Sync status';
-  if (button) button.disabled = state === 'checking';
+  if (button) button.disabled = _syncOperationInFlight;
 }
 
 function setSyncBusy(busy) {
   const panel = document.getElementById('settingsTab-sync');
   if (panel) panel.setAttribute('aria-busy', String(busy));
+  for (const id of ['syncQuickButton', 'syncPullBtn', 'syncPushBtn']) {
+    const button = document.getElementById(id);
+    if (button) button.disabled = busy;
+  }
 }
 
 function renderSyncSettings() {
@@ -15137,7 +15171,7 @@ function renderSyncSettings() {
   if (gistEl) gistEl.value = localStorage.getItem('assistantSyncGistId') || '';
   if (passEl) passEl.value = localStorage.getItem('assistantSyncPassphrase') || '';
   if (autoEl) autoEl.checked = localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true';
-  setSyncBusy(_syncPullInFlight);
+  setSyncBusy(_syncOperationInFlight);
   _syncInputsLoaded = true;
 
   const token = localStorage.getItem('assistantSyncGistToken') || '';
@@ -15152,10 +15186,10 @@ function renderSyncSettings() {
 
   if (!token || !passphrase) {
     syncSetStatus('unknown', 'Not configured', 'Add a GitHub token and sync passphrase before pushing or pulling.');
+  } else if (_syncStatus && _syncStatus.gistId === gistId && _syncStatus.message !== 'Not configured') {
+    syncRenderStatus();
   } else if (!gistId) {
     syncSetStatus('unknown', 'Ready to create', 'Push now will create a private encrypted Gist.');
-  } else if (_syncStatus && _syncStatus.gistId === gistId && _syncStatus.message !== 'Not configured') {
-    syncSetStatus(_syncStatus.state, _syncStatus.message, _syncStatus.details);
   } else {
     syncSetStatus('unknown', 'Backup ready', 'Gist ' + gistId + (lastParts.length ? ' | ' + lastParts.join(' | ') : '') + '. Remote changes are applied only by Pull now.');
   }
@@ -16030,6 +16064,7 @@ async function syncPushToGist(options = {}) {
     return false;
   }
   _syncOperationInFlight = true;
+  setSyncBusy(true);
   let pendingAtStart = false;
   let cfg;
   let succeeded = false;
@@ -16076,15 +16111,15 @@ async function syncPushToGist(options = {}) {
     if (hasStoredSyncHashes) {
       local.conversations = (local.conversations || []).filter(conv => storedSyncHashes.conversations[conv.id] !== nextConvHashes[conv.id]);
       if (cfg.gistId && local.conversations.length === 0 && nextMetadataHash === storedSyncHashes.metadata) {
-        if (!auto) syncSetStatus('current', 'No local changes', 'No local changes to upload. Remote changes are applied only by Pull now.');
+        if (!auto) syncSetStatus('current', 'No local changes', 'No local changes to upload. Remote changes are applied only by Pull now.', 'push');
         else if (_syncStatus?.message === 'Backup pending' && localStorage.getItem(SYNC_AUTO_PENDING_KEY) !== 'true') {
-          syncSetStatus('current', 'Backed up', 'No local changes to upload. Remote changes are applied only by Pull now.');
+          syncSetStatus('current', 'Backed up', 'No local changes to upload. Remote changes are applied only by Pull now.', 'push');
         }
         succeeded = true;
         return true;
       }
     }
-    syncSetStatus('checking', 'Backing up…', 'Encrypting local data and writing Gist files.');
+    syncSetStatus('checking', 'Backing up…', 'Encrypting local data and writing Gist files.', 'push');
     let built;
     let unchanged = false;
     let consolidated = false;
@@ -16232,7 +16267,7 @@ async function syncPushToGist(options = {}) {
     }
     const backupPending = localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true';
     syncSetStatus(backupPending ? 'dirty' : 'current', backupPending ? 'Backup pending' : statusMessage,
-      backupPending ? 'The captured data was backed up. Newer local changes are waiting to be uploaded.' : statusDetails);
+      backupPending ? 'The captured data was backed up. Newer local changes are waiting to be uploaded.' : statusDetails, 'push');
     succeeded = true;
     if (!auto) showToast('Sync push complete.', 'success');
     return true;
@@ -16240,11 +16275,12 @@ async function syncPushToGist(options = {}) {
     console.error('Sync push failed:', err);
     const message = err.name === 'OperationError' ? 'Could not decrypt the existing sync Gist. Check the passphrase.' :
       (uploaded ? 'An update was uploaded to Gist ' + cfg.gistId + ', but confirmation or local storage failed. Keep that Gist ID. ' : '') + (err.message || 'Unable to push sync data.');
-    syncSetStatus('unknown', 'Backup failed', message);
+    syncSetStatus('unknown', 'Backup failed', message, 'push');
     if (!auto) showToast('Sync push failed: ' + message, 'error', 6000);
     return false;
   } finally {
     _syncOperationInFlight = false;
+    setSyncBusy(false);
     try {
       if (!succeeded && syncAutoPushIsConfigured(cfg) && (auto || pendingAtStart)) localStorage.setItem(SYNC_AUTO_PENDING_KEY, 'true');
       if (succeeded && localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true' &&
@@ -16476,7 +16512,7 @@ async function syncPullFromGist(options = {}) {
     if (!options.force && lastEtag) headers['If-None-Match'] = lastEtag;
     const remoteResponse = await fetchGistResponse(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store', headers }, cfg.token);
     if (remoteResponse.notModified) {
-      syncSetStatus('current', 'No remote updates', 'The Gist has not changed since the last applied pull.');
+      syncSetStatus('current', 'No remote updates', 'The Gist has not changed since the last applied pull.', 'pull');
       return true;
     }
     const gist = remoteResponse.data;
@@ -16572,7 +16608,7 @@ async function syncPullFromGist(options = {}) {
     } catch (renderError) {
       console.error('Sync pull render refresh failed:', renderError);
     }
-    syncSetStatus('current', 'Pull complete', 'Merged ' + remote.conversations.length + ' remote conversations. Added ' + liveMerged.added + ', updated ' + liveMerged.updated + '. Archive ' + formatCacheBytes(syncGistSize(gist.files || {})) + '.');
+    syncSetStatus('current', 'Pull complete', 'Merged ' + remote.conversations.length + ' remote conversations. Added ' + liveMerged.added + ', updated ' + liveMerged.updated + '. Archive ' + formatCacheBytes(syncGistSize(gist.files || {})) + '.', 'pull');
     showToast('Sync pull complete.', 'success');
     notifyConversationConflicts(saved.conversations.filter(conv => conv.conflictOf).map(conv => conv.id));
     return true;
@@ -16777,7 +16813,7 @@ async function syncImportPairingQr(event) {
   if (!file) return;
   if (!beginLocalDataOperation()) return;
   try {
-    syncSetStatus('checking', 'Reading QR...', 'Decoding selected pairing image.');
+    syncSetStatus('checking', 'Reading QR...', 'Decoding selected pairing image.', 'pairing');
     await syncLoadScriptOnce('syncJsQrScript', 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js', 'jsQR');
     const img = await syncLoadImageFromFile(file);
     const canvas = document.createElement('canvas');
@@ -16792,7 +16828,7 @@ async function syncImportPairingQr(event) {
     if (codeEl) codeEl.value = result.data;
     if (!syncApplyPairingText(result.data, true)) throw new Error('Invalid Synapse pairing code.');
   } catch (err) {
-    syncSetStatus('unknown', 'QR failed', err.message || 'Could not decode QR image.');
+    syncSetStatus('unknown', 'QR failed', err.message || 'Could not decode QR image.', 'pairing');
     showToast('QR import failed: ' + (err.message || err), 'error', 6000);
   } finally {
     endLocalDataOperation();
