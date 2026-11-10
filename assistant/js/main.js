@@ -133,9 +133,9 @@ const SYNC_SETTINGS_KEYS = [
   'llmEnableStMacros', 'llmRpUserName', 'llmInputCost', 'llmOutputCost',
   'llmWebSearch', 'llmForceSearch', 'llmMemoryEnabled', 'llmHoldScreenshot',
   'llmEmotionSprites', 'llmEmotionSpriteSet',
-  'llmPromptEntries', 'assistantPresets', 'assistantProfiles', 'assistantTheme',
+  'llmPromptEntries', 'assistantPresets', 'assistantProfiles',
   'assistantStarterPrompts', 'assistantStarterPromptsHidden',
-  'assistantCustomTheme', 'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth',
+  'assistantFont', 'assistantMsgFontSize', 'assistantMsgMaxWidth',
   'llmContextWindow', 'llmUrlFetch', 'llmToolConfirm'
 ];
 const SYNC_PROFILE_SECRET_KEYS = [
@@ -11636,8 +11636,9 @@ function synapseSelfTest() {
       { role: 'user', content: 'root', branches: [[{ role: 'user', content: 'old' }], [{ role: 'user', content: 'current' }]], branchIndex: 1 }
     ] }]);
     assert(legacyBranches.conversations.length === 2 && legacyBranches.conversations.every(conv => !conv.messages.some(message => message.branches)), 'legacy branch migration');
-    const legacySettings = syncNormalizeSettingsPayload({ exportedAt: '2026-01-01T00:00:00Z', settings: { assistantTheme: 'dark' } });
-    assert(legacySettings.settings.assistantTheme === 'dark' && !Object.prototype.hasOwnProperty.call(legacySettings.settings, 'llmPromptEntries'), 'legacy settings presence');
+    const legacySettings = syncNormalizeSettingsPayload({ exportedAt: '2026-01-01T00:00:00Z', settings: { llmStreaming: 'false', assistantTheme: 'custom', assistantCustomTheme: '{"appBg":"#000000"}' } });
+    assert(legacySettings.settings.llmStreaming === 'false' && !Object.prototype.hasOwnProperty.call(legacySettings.settings, 'llmPromptEntries'), 'legacy settings presence');
+    assert(!Object.prototype.hasOwnProperty.call(legacySettings.settings, 'assistantTheme') && !Object.prototype.hasOwnProperty.call(legacySettings.settings, 'assistantCustomTheme'), 'synced themes excluded');
     assert(syncConversationFileName('a.b') !== syncConversationFileName('a:b'), 'sync filename uniqueness');
     const unionBase = normalizeConversationRecord({ id: 'union-probe', messages: [{ role: 'user', content: 'shared', timestamp: 1 }] });
     const unionBranch = syncCloneJson(unionBase);
