@@ -2347,3 +2347,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .msg-action-btn, .swipe-controls button { min-width: 44px; min-height: 44px; }
   .tag-filter-btn, .project-collapse-btn, .project-add-btn { min-height: 44px; }
 }
+.image-attachment-status {
+  display: block;
+  margin: 0.75em 0;
+  padding: 0.75em;
+  border-radius: 8px;
+  background: var(--hover);
+  overflow-wrap: anywhere;
+}
+.image-attachment-status button { margin: 0.4em 0 0; }

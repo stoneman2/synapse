@@ -314,6 +314,7 @@
       <button class="settings-tab" id="settingsTabButton-prompts" role="tab" aria-selected="false" aria-controls="settingsTab-prompts" tabindex="-1" onclick="switchSettingsTab('prompts', this)">Prompts</button>
       <button class="settings-tab" id="settingsTabButton-appearance" role="tab" aria-selected="false" aria-controls="settingsTab-appearance" tabindex="-1" onclick="switchSettingsTab('appearance', this)">Appearance</button>
       <button class="settings-tab" id="settingsTabButton-tools" role="tab" aria-selected="false" aria-controls="settingsTab-tools" tabindex="-1" onclick="switchSettingsTab('tools', this)">Tools</button>
+      <button class="settings-tab" id="settingsTabButton-images" role="tab" aria-selected="false" aria-controls="settingsTab-images" tabindex="-1" onclick="switchSettingsTab('images', this)">Images</button>
       <button class="settings-tab" id="settingsTabButton-sync" role="tab" aria-selected="false" aria-controls="settingsTab-sync" tabindex="-1" onclick="switchSettingsTab('sync', this)">Sync</button>
       <button class="settings-tab" id="settingsTabButton-data" role="tab" aria-selected="false" aria-controls="settingsTab-data" tabindex="-1" onclick="switchSettingsTab('data', this)">Data</button>
       <button class="settings-tab" id="settingsTabButton-debug" role="tab" aria-selected="false" aria-controls="settingsTab-debug" tabindex="-1" onclick="switchSettingsTab('debug', this)">Debug</button>
@@ -536,6 +537,21 @@
     </select>
     </div>
 
+    <div class="settings-tab-content" id="settingsTab-images" role="tabpanel" aria-labelledby="settingsTabButton-images" hidden>
+      <label for="setImageBaseUrl">Image API base URL</label>
+      <input type="url" id="setImageBaseUrl" placeholder="https://your-api.example/v1" autocomplete="off">
+      <div class="setting-hint">OpenAI-compatible API. Synapse sends POST /images/generations to this base URL.</div>
+      <label for="setImageModel">Image model</label>
+      <input type="text" id="setImageModel" placeholder="Your image model name" autocomplete="off">
+      <label for="setImageApiKey">Image API key</label>
+      <input type="password" id="setImageApiKey" autocomplete="off" placeholder="Optional if your server does not require a key">
+      <label class="toggle-row"><input type="checkbox" id="setImageEnabled"> Allow the assistant to generate images on this device</label>
+      <label class="toggle-row"><input type="checkbox" id="setImageAutoApprove"> Auto-approve images</label>
+      <div class="setting-hint">Auto-approve skips image confirmations on this device, including Retry image. Requests may cost money. When off, each request asks for approval. One image per call; failures are never retried automatically. The chat model needs tool calling, not image generation.</div>
+      <div class="setting-hint">Connection settings, API key, and permission stay on this device, outside profiles, exports, and sync. Browser storage is not an encrypted vault. Generated images and inline references are saved with the conversation and included in exports and encrypted backups. Public chat shares omit images.</div>
+      <div class="setting-hint">Your API and returned image URLs must allow browser access (CORS). Use HTTPS or a local server; a trusted Tools CORS proxy can handle non-local HTTP APIs.</div>
+    </div>
+
     <div class="settings-tab-content" id="settingsTab-tools" role="tabpanel" aria-labelledby="settingsTabButton-tools" hidden>
     <label class="toggle-row">
       <input type="checkbox" id="setWebSearch"> Web Search
@@ -582,7 +598,7 @@
 
     <div class="settings-tab-content" id="settingsTab-sync" role="tabpanel" aria-labelledby="settingsTabButton-sync" hidden>
       <div class="modal-section">GitHub Gist</div>
-      <div class="settings-note">Push backs up the selected data to an encrypted secret Gist. Pull applies the selected remote data only when clicked. Theme selection, custom theme colors, API keys, provider URLs, search keys, and proxy settings stay on this device.</div>
+      <div class="settings-note">Push backs up the selected data to an encrypted secret Gist. Pull applies the selected remote data only when clicked. Theme selection, custom theme colors, API keys, provider URLs, search keys, proxy settings, and image connection settings and permission stay on this device.</div>
       <form class="password-field-form" onsubmit="return false">
         <input class="sr-only" type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true">
         <label for="setSyncToken">GitHub token</label>

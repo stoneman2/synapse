@@ -149,7 +149,7 @@ const SYNC_SETTINGS_KEYS = [
   'llmContextWindow', 'llmUrlFetch', 'llmToolConfirm'
 ];
 const SYNC_PROFILE_SECRET_KEYS = [
-  'llmApiKey', 'llmSearchApiKey', 'assistantSyncGistToken', 'assistantSyncPassphrase'
+  'llmApiKey', 'llmSearchApiKey', 'llmImageApiKey', 'assistantSyncGistToken', 'assistantSyncPassphrase'
 ];
 const PROFILE_SECRET_KEY_RE = /(?:api[-_ ]?key|token|secret|passphrase|password|authorization|credential|cookie)/i;
 const PROFILE_SETTING_KEYS = new Set([
@@ -429,7 +429,7 @@ function closeModal(modalOrId, restoreFocus = true) {
   if (modal.id === 'projectsModal') void flushProjectAutosave();
   if (modal.id === 'settingsModal') {
     flushSettingsAutosaves();
-    if (dirtySettingsTabs.size && !confirm('Discard unsaved ' + Array.from(dirtySettingsTabs, tab => tab === 'api' ? 'API' : 'Tools').join(' and ') + ' changes? Choose Cancel to keep editing, then use Save.')) return;
+    if (dirtySettingsTabs.size && !confirm('Discard unsaved ' + Array.from(dirtySettingsTabs, tab => tab === 'api' ? 'API' : tab === 'images' ? 'Images' : 'Tools').join(' and ') + ' changes? Choose Cancel to keep editing, then use Save.')) return;
     dirtySettingsTabs.clear();
     updateSettingsFooter();
   }
@@ -550,7 +550,7 @@ function sanitizeErrorDetail(error, secrets = []) {
   if (error == null || String(error?.message || error || '').trim() === '') return '';
   let text = String(error?.message || error);
   const known = [...secrets, getStoredApiCredential().value,
-    ...['llmSearchApiKey', 'assistantSyncGistToken', 'assistantSyncPassphrase'].map(key => localStorage.getItem(key))];
+    ...['llmSearchApiKey', 'llmImageApiKey', 'assistantSyncGistToken', 'assistantSyncPassphrase'].map(key => localStorage.getItem(key))];
   known.filter(value => typeof value === 'string' && value).forEach(value => {
     for (const encoded of [JSON.stringify(value).slice(1, -1), value]) text = text.split(encoded).join('[redacted]');
   });
@@ -839,6 +839,8 @@ function normalizeConversationRecord(raw) {
       });
       if (message.images) message.images = message.images.map(value => safeMediaUrl(text(value))).filter(Boolean);
       if (message.swipeImages) message.swipeImages = message.swipeImages.map(images => (Array.isArray(images) ? images.map(value => safeMediaUrl(text(value))).filter(Boolean) : []));
+      if ('attachments' in message) message.attachments = normalizeMessageAttachments(message.attachments);
+      if ('swipeAttachments' in message) message.swipeAttachments = Array.isArray(message.swipeAttachments) ? message.swipeAttachments.map(normalizeMessageAttachments) : [];
       if (message.swipeThinking) message.swipeThinking = message.swipeThinking.map(text);
       if (message.swipeSources) message.swipeSources = message.swipeSources.map(sources);
       if (message.swipeToolUse) message.swipeToolUse = message.swipeToolUse.map(blocks => (Array.isArray(blocks) ? blocks : []).filter(object).map(block => ({
@@ -871,6 +873,11 @@ function normalizeConversationRecord(raw) {
         if (!Number.isInteger(message.swipeIndex)) message.swipeIndex = 0;
         message.swipeIndex = Math.max(0, Math.min(message.swipes.length - 1, message.swipeIndex));
         message.content = message.swipes[message.swipeIndex];
+        if (!message.swipeAttachments && message.attachments?.length) {
+          message.swipeAttachments = [];
+          message.swipeAttachments[message.swipeIndex] = message.attachments;
+        }
+        if (message.swipeAttachments) message.attachments = message.swipeAttachments[message.swipeIndex] || [];
       } else delete message.comparison;
       if (message.includeInContext !== false) message.includeInContext = true;
       if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(String(message.id || ''))) {
@@ -931,13 +938,14 @@ function getGlobalToolPolicy() {
 }
 
 function getToolPolicy(conv = getActiveConv()) {
-  if (conv && conv.toolPolicy) return normalizeToolPolicy(conv.toolPolicy);
-  return getGlobalToolPolicy();
+  const policy = conv?.toolPolicy ? normalizeToolPolicy(conv.toolPolicy) : getGlobalToolPolicy();
+  // Imported or synced conversation policies can never grant paid image access.
+  return { ...policy, generateImage: localStorage.getItem('llmImageEnabled') === 'true' };
 }
 
 function canUseTool(toolName, conv = getActiveConv()) {
   const policy = getToolPolicy(conv);
-  return toolName === 'web_search' ? policy.webSearch : toolName === 'url_fetch' ? policy.urlFetch : false;
+  return toolName === 'web_search' ? policy.webSearch : toolName === 'url_fetch' ? policy.urlFetch : toolName === 'generate_image' ? policy.generateImage : false;
 }
 
 function saveConversationImmediately() {
@@ -2507,6 +2515,7 @@ function selectAssistantSwipe(message, swipeIndex) {
   message.swipeIndex = next;
   message.content = message.swipes[next];
   message.images = message.swipeImages?.[next] || [];
+  message.attachments = message.swipeAttachments?.[next] || [];
   const llm = message.swipeLlms?.[next];
   if (llm) {
     message.llm = llm;
@@ -2519,13 +2528,17 @@ function selectAssistantSwipe(message, swipeIndex) {
 function addAssistantSwipe(message, copyIndex = null) {
   if (!message.swipes?.length) message.swipes = [String(message.content || '')];
   message.swipeImages = message.swipeImages || [];
+  message.swipeAttachments = message.swipeAttachments || [];
+  if (!message.swipeAttachments[message.swipeIndex || 0] && message.attachments?.length) {
+    message.swipeAttachments[message.swipeIndex || 0] = structuredClone(message.attachments);
+  }
   if (!message.swipeImages[message.swipeIndex || 0] && message.images?.length) {
     message.swipeImages[message.swipeIndex || 0] = message.images.slice();
   }
   const index = message.swipes.length;
   message.swipes.push(copyIndex === null ? '' : message.swipes[copyIndex]);
   if (copyIndex !== null) {
-    ['swipeThinking', 'swipeToolUse', 'swipeImages', 'swipeSources', 'swipeLlms'].forEach(key => {
+    ['swipeThinking', 'swipeToolUse', 'swipeImages', 'swipeAttachments', 'swipeSources', 'swipeLlms'].forEach(key => {
       if (message[key]?.[copyIndex] !== undefined) message[key][index] = structuredClone(message[key][copyIndex]);
     });
   }
@@ -3852,11 +3865,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   ['input', 'change'].forEach(type => {
     document.getElementById('settingsModal')?.addEventListener(type, event => {
       const tab = event.target.closest('.settings-tab-content')?.id.replace('settingsTab-', '');
-      if (!['api', 'tools'].includes(tab)) return;
+      if (!['api', 'tools', 'images'].includes(tab)) return;
       dirtySettingsTabs.add(tab);
       updateProviderOptions();
       updateSettingsFooter();
     });
+  });
+  document.getElementById('messagesArea')?.addEventListener('click', event => {
+    const retry = event.target.closest('[data-image-retry]');
+    if (retry) void retryGeneratedImage(Number(retry.closest('.msg-wrapper')?.dataset.msgIdx), retry.dataset.imageRetry);
+    if (event.target.closest('[data-image-cancel]') && !readOnlyShare) abortController?.abort();
   });
   document.getElementById('setupProvider')?.addEventListener('change', updateProviderOptions);
   renderLocalUpdateStatus();
@@ -4015,7 +4033,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         e.preventDefault();
         return;
       }
-      if (streaming && abortController) abortController.abort();
+      if ((sending || streaming) && abortController) abortController.abort();
     }
     if (openModalStack.length) return;
     // Ctrl+N - new conversation
@@ -4221,6 +4239,43 @@ document.addEventListener('DOMContentLoaded', async () => {
 // ============================================
 // Markdown Renderer
 // ============================================
+function normalizeMessageAttachments(value) {
+  const seen = new Set();
+  return (Array.isArray(value) ? value : []).filter(item => {
+    if (!item || typeof item.id !== 'string' || !/^img_[A-Za-z0-9_-]{1,100}$/.test(item.id) || seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  }).map(item => {
+    const dataUrl = typeof item.dataUrl === 'string' && /^data:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/i.test(item.dataUrl) ? item.dataUrl : '';
+    const interrupted = item.status === 'pending';
+    return { id: item.id, type: 'image', dataUrl, alt: typeof item.alt === 'string' ? item.alt.slice(0, 500) : 'Generated image',
+      prompt: typeof item.prompt === 'string' && item.prompt.length <= 16000 ? item.prompt : '',
+      status: dataUrl ? 'ready' : interrupted ? 'failed' : ['failed', 'denied', 'stopped'].includes(item.status) ? item.status : 'unavailable',
+      error: interrupted ? 'Image request interrupted. It may already have been billed; retry only if you want another request.' : sanitizeErrorDetail(typeof item.error === 'string' ? item.error : '') };
+  });
+}
+
+function messageAttachments(message, index = message?.swipeIndex || 0) {
+  return message?.swipeAttachments ? message.swipeAttachments[index] || [] : message?.attachments || [];
+}
+
+function renderImageAttachment(item, alt = item?.alt || 'Generated image') {
+  if (!item) return '<span class="image-attachment-status" role="status">Image unavailable</span>';
+  const url = safeMediaUrl(item.dataUrl);
+  if (url) return '<img src="' + escapeHTML(url) + '" alt="' + escapeHTML(alt) + '" class="chat-inline-img chat-gen-img" loading="lazy" referrerpolicy="no-referrer">';
+  const pending = item.status === 'pending';
+  const label = pending ? 'Generating image…' : item.error || 'Image unavailable';
+  const control = readOnlyShare ? '' : pending ? ' <button type="button" class="btn btn-secondary" data-image-cancel>Cancel</button>'
+    : item.prompt ? ' <button type="button" class="btn btn-secondary" data-image-retry="' + escapeHTML(item.id) + '">Retry image</button>' : '';
+  return '<span class="image-attachment-status" role="status" aria-live="polite">' + escapeHTML(label) + control + '</span>';
+}
+
+function renderAssistantContent(text, attachments = [], legacyImages = []) {
+  const referenced = new Set();
+  const html = renderMarkdown(text, attachments, referenced);
+  return html + attachments.filter(item => !referenced.has(item.id)).map(item => renderImageAttachment(item)).join('') + renderGenImages(legacyImages);
+}
+
 function renderGenImages(images) {
   if (!images || !images.length) return '';
   return images.map(url => safeMediaUrl(url)).filter(Boolean)
@@ -4308,7 +4363,7 @@ function extractImages(msg) {
   return { text, images: [...new Set(images.map(safeMediaUrl).filter(Boolean))] };
 }
 
-function renderMarkdown(text) {
+function renderMarkdown(text, attachments = [], referenced = new Set()) {
   if (!text) return '';
 
   // NUL is reserved for internal tokens, never for model-supplied content.
@@ -4428,7 +4483,14 @@ function renderMarkdown(text) {
 
   function renderInline(input) {
     let out = input.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (source, alt, url) => {
-      const safeUrl = safeMediaUrl(decodeBasicEntities(literalSource(url)));
+      const target = decodeBasicEntities(literalSource(url));
+      if (target.startsWith('attachment:')) {
+        const id = target.slice('attachment:'.length);
+        const item = attachments.find(item => item.id === id);
+        if (item) referenced.add(id);
+        return protectBlock({ type: 'inline-html', source, html: renderImageAttachment(item, literalSource(alt)) });
+      }
+      const safeUrl = safeMediaUrl(target);
       const safeAlt = escapeHTML(literalSource(alt));
       const html = safeUrl ? '<img src="' + escapeHTML(safeUrl) + '" alt="' + safeAlt + '" class="chat-inline-img chat-gen-img" loading="lazy" referrerpolicy="no-referrer">' : safeAlt;
       return protectBlock({ type: 'inline-html', source, html });
@@ -7416,6 +7478,7 @@ function updateSettingsFooter(tabName = activeSettingsTab) {
   const button = document.getElementById('settingsSaveBtn');
   const labels = {
     api: 'Save API settings',
+    images: 'Save image settings',
     tools: 'Save tool settings'
   };
   if (button) {
@@ -7433,7 +7496,7 @@ function updateSettingsFooter(tabName = activeSettingsTab) {
 function setSettingsSaveStatus(message = '') {
   const status = document.getElementById('settingsSaveStatus');
   if (!status) return;
-  const names = Array.from(dirtySettingsTabs, tab => tab === 'api' ? 'API' : 'Tools');
+  const names = Array.from(dirtySettingsTabs, tab => tab === 'api' ? 'API' : tab === 'images' ? 'Images' : 'Tools');
   status.classList.toggle('unsaved', names.length > 0);
   status.textContent = [message, names.length ? 'Unsaved ' + names.join(' and ') + ' changes. Use Save in each tab.' : ''].filter(Boolean).join(' ');
 }
@@ -7511,6 +7574,11 @@ function openSettings() {
   document.getElementById('setToolConfirm').checked = localStorage.getItem('llmToolConfirm') !== 'false';
   document.getElementById('setSearchApiUrl').value = localStorage.getItem('llmSearchApiUrl') || '';
   document.getElementById('setSearchApiKey').value = localStorage.getItem('llmSearchApiKey') || '';
+  document.getElementById('setImageBaseUrl').value = localStorage.getItem('llmImageBaseUrl') || '';
+  document.getElementById('setImageModel').value = localStorage.getItem('llmImageModel') || '';
+  document.getElementById('setImageApiKey').value = localStorage.getItem('llmImageApiKey') || '';
+  document.getElementById('setImageEnabled').checked = localStorage.getItem('llmImageEnabled') === 'true';
+  document.getElementById('setImageAutoApprove').checked = localStorage.getItem('llmImageAutoApprove') === 'true';
   document.getElementById('setCorsProxy').value = getCorsProxyUrl();
   document.getElementById('setMemory').checked = isMemoryEnabled();
   document.getElementById('setHoldScreenshot').checked = localStorage.getItem('llmHoldScreenshot') === 'true';
@@ -7944,17 +8012,36 @@ function saveToolSettings() {
   return true;
 }
 
+function saveImageSettings() {
+  const baseUrl = document.getElementById('setImageBaseUrl').value.trim().replace(/\/+$/, '');
+  const model = document.getElementById('setImageModel').value.trim();
+  const enabled = document.getElementById('setImageEnabled').checked;
+  if ((baseUrl && !validImageApiBase(baseUrl)) || (enabled && (!baseUrl || !model))) {
+    showToast('Enter an HTTP(S) base URL without credentials, query, or fragment, and an image model.', 'error');
+    return false;
+  }
+  localStorage.setItem('llmImageBaseUrl', baseUrl);
+  localStorage.setItem('llmImageModel', model);
+  localStorage.setItem('llmImageApiKey', document.getElementById('setImageApiKey').value.trim());
+  localStorage.setItem('llmImageEnabled', String(enabled));
+  localStorage.setItem('llmImageAutoApprove', String(document.getElementById('setImageAutoApprove').checked));
+  setSettingsSaveStatus('Image settings saved.');
+  announce('Image settings saved.');
+  return true;
+}
+
 function saveSettingsTab() {
   const saves = {
     api: saveApiSettings,
     prompts: savePromptSettings,
     appearance: saveAppearanceSettings,
-    tools: saveToolSettings
+    tools: saveToolSettings,
+    images: saveImageSettings
   };
   const saved = saves[activeSettingsTab]?.() || false;
   if (saved && dirtySettingsTabs.delete(activeSettingsTab)) {
     updateSettingsFooter();
-    setSettingsSaveStatus(activeSettingsTab === 'api' ? 'API settings saved.' : 'Tool settings saved.');
+    setSettingsSaveStatus(activeSettingsTab === 'api' ? 'API settings saved.' : activeSettingsTab === 'images' ? 'Image settings saved.' : 'Tool settings saved.');
   }
   return saved;
 }
@@ -9016,7 +9103,7 @@ function renderMessages({ preserveScroll = false } = {}) {
       const imgData = msg.swipeImages && msg.swipeImages[msg.swipeIndex];
       const _h = stripThinkTags(msg.content);
       const _hThink = _h.thinking ? (thinkData || '') + _h.thinking : (thinkData || '');
-      setBubbleHTML(bubble, _hThink, renderToolBlocksHTML(toolData || []) + renderMarkdown(_h.content) + renderGenImages(imgData));
+      setBubbleHTML(bubble, _hThink, renderToolBlocksHTML(toolData || []) + renderAssistantContent(_h.content, messageAttachments(msg), imgData || msg.images || []));
       postRenderProcessing(bubble);
     } else {
       bubble.textContent = msg.content;
@@ -9102,7 +9189,7 @@ function renderMessages({ preserveScroll = false } = {}) {
           invalidateConversationContext(getActiveConv(), idx);
           const swipeIndex = msg.swipeIndex;
           msg.swipes.splice(swipeIndex, 1);
-          ['swipeThinking', 'swipeToolUse', 'swipeImages', 'swipeSources', 'swipeLlms', 'swipeRequests', 'swipeTokenEstimates'].forEach(key => {
+          ['swipeThinking', 'swipeToolUse', 'swipeImages', 'swipeAttachments', 'swipeSources', 'swipeLlms', 'swipeRequests', 'swipeTokenEstimates'].forEach(key => {
             if (Array.isArray(msg[key])) msg[key].splice(swipeIndex, 1);
           });
           selectAssistantSwipe(msg, Math.min(swipeIndex, msg.swipes.length - 1));
@@ -9568,11 +9655,180 @@ function extractWebSearchQueryFromArgs(args) {
   return '';
 }
 
+const OPENAI_GENERATE_IMAGE_TOOL = {
+  type: 'function',
+  function: {
+    name: 'generate_image',
+    description: 'Generate one image from a text prompt using the separately configured image model. Synapse inserts the image at this tool-call position. Do not write attachment references, image URLs, or base64 yourself. Never automatically retry a failed or denied generation; the user has an explicit Retry image button.',
+    parameters: { type: 'object', properties: {
+      prompt: { type: 'string', description: 'A complete description of the image to generate' },
+      alt: { type: 'string', description: 'A short accessible image description' }
+    }, required: ['prompt'], additionalProperties: false }
+  }
+};
+const ANTHROPIC_GENERATE_IMAGE_TOOL = {
+  name: 'generate_image', description: OPENAI_GENERATE_IMAGE_TOOL.function.description,
+  input_schema: OPENAI_GENERATE_IMAGE_TOOL.function.parameters
+};
+const IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+
+function validImageApiBase(value) {
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash;
+  } catch { return false; }
+}
+
+async function readImageResponseBytes(response, limit) {
+  if (Number(response.headers.get('content-length')) > limit) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error('Image response is too large. Maximum image size is 10 MiB.');
+  }
+  if (!response.body) throw new Error('Image API returned an empty response.');
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > limit) throw new Error('Image response is too large. Maximum image size is 10 MiB.');
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally { reader.releaseLock(); }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  chunks.forEach(chunk => { bytes.set(chunk, offset); offset += chunk.length; });
+  return bytes;
+}
+
+async function validatedImageDataUrl(bytes, signal) {
+  if (!bytes.length || bytes.length > IMAGE_MAX_BYTES) throw new Error('Empty or oversized image. Maximum size is 10 MiB.');
+  const starts = values => values.every((value, index) => bytes[index] === value);
+  const mime = starts([137,80,78,71,13,10,26,10]) ? 'image/png'
+    : starts([255,216,255]) ? 'image/jpeg'
+    : starts([71,73,70,56]) ? 'image/gif'
+    : starts([82,73,70,70]) && String.fromCharCode(...bytes.slice(8,12)) === 'WEBP' ? 'image/webp' : '';
+  if (!mime) throw new Error('Unsupported image response. Expected PNG, JPEG, WebP, or GIF.');
+  const blob = new Blob([bytes], { type: mime });
+  const bitmap = await createImageBitmap(blob);
+  bitmap.close();
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('Could not save the generated image.'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function executeGenerateImage(prompt, signal, settings = getToolRequestSettings()) {
+  const image = settings.image;
+  if (!image?.enabled || localStorage.getItem('llmImageEnabled') !== 'true') throw new Error('Image generation is disabled on this device.');
+  if (!validImageApiBase(image.baseUrl) || !image.model) throw new Error('Configure an image base URL and model in Settings > Images.');
+  const url = image.baseUrl.replace(/\/+$/, '') + '/images/generations';
+  const options = { method: 'POST', headers: { 'Content-Type': 'application/json', ...(image.apiKey ? { Authorization: 'Bearer ' + image.apiKey } : {}) },
+    body: JSON.stringify({ model: image.model, prompt, n: 1 }), signal, credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error' };
+  // A paid POST must be sent only once. The chat transport's proxy fallback can
+  // resend requests after ambiguous network failures, so do not use it here.
+  let destination = url;
+  if (isHttpApiBase(url) && !isLocalUrl(url) && location.protocol === 'https:') {
+    if (!canUseCorsProxy(url, options, settings.corsProxy, true)) throw new Error('Use HTTPS or a trusted CORS proxy for this image API.');
+    destination = settings.corsProxy + encodeURIComponent(url);
+  }
+  const response = await fetch(destination, options);
+  if (!response.ok) throw new Error('Image API returned HTTP ' + response.status + '. No automatic retry was made.');
+  const raw = await readImageResponseBytes(response, Math.ceil(IMAGE_MAX_BYTES * 4 / 3) + 1024 * 1024);
+  const data = JSON.parse(new TextDecoder().decode(raw));
+  const result = data?.data?.[0];
+  let bytes;
+  if (typeof result?.b64_json === 'string' && result.b64_json) {
+    const decoded = atob(result.b64_json);
+    bytes = Uint8Array.from(decoded, char => char.charCodeAt(0));
+  } else if (typeof result?.url === 'string') {
+    // Unlike stored display URLs, temporary signed URLs must retain token/query
+    // parameters until downloaded. They are never logged or persisted.
+    let parsed;
+    try { parsed = new URL(result.url); } catch { throw new Error('The image API returned an invalid download URL.'); }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password ||
+        (isLocalUrl(parsed.href) && parsed.origin !== new URL(image.baseUrl).origin)) throw new Error('The image API returned an invalid or private download URL.');
+    const downloadUrl = parsed.href;
+    // No API authorization, cookies, referrer, or public proxy for signed URLs.
+    const download = await fetch(downloadUrl, { signal, credentials: 'omit', referrerPolicy: 'no-referrer' });
+    if (!download.ok) throw new Error('Could not download the generated image (HTTP ' + download.status + ').');
+    bytes = await readImageResponseBytes(download, IMAGE_MAX_BYTES);
+  } else throw new Error('The image API returned no image data or download URL.');
+  return validatedImageDataUrl(bytes, signal);
+}
+
+async function fillGeneratedAttachment(item, conv, signal, authorization) {
+  item.status = 'pending';
+  item.error = '';
+  try {
+    const result = await executeAuthorizedTool('generate_image', { prompt: item.prompt }, conv, signal, authorization);
+    signal?.throwIfAborted();
+    if (result.error) {
+      item.status = result.denied ? 'denied' : 'failed';
+      item.error = result.error;
+    } else {
+      item.dataUrl = result.dataUrl;
+      item.status = 'ready';
+    }
+    return result;
+  } catch (error) {
+    item.status = error.name === 'AbortError' ? 'stopped' : 'failed';
+    item.error = error.name === 'AbortError' ? 'Image request stopped. The service may still finish and bill it.' : sanitizeErrorDetail(error, [authorization?.settings?.image?.apiKey]);
+    if (error.name === 'AbortError') throw error;
+    return { error: item.error };
+  }
+}
+
+async function retryGeneratedImage(index, id) {
+  if (readOnlyShare || !beginSendingAction()) return;
+  const conv = getActiveConv();
+  const messageList = messages;
+  const message = messages[index];
+  const swipe = message?.swipeIndex || 0;
+  const item = messageAttachments(message, swipe).find(item => item.id === id);
+  try {
+    if (!item?.prompt || item.dataUrl || item.status === 'pending') return;
+    const signal = abortController.signal;
+    const authorization = { settings: getToolRequestSettings() };
+    item.status = 'pending';
+    renderMessages({ preserveScroll: true });
+    await fillGeneratedAttachment(item, conv, signal, authorization);
+    assertRequestOwner(conv, messageList, message, signal);
+  } catch (error) {
+    if (error.name !== 'AbortError') showToast(sanitizeErrorDetail(error), 'error');
+  } finally {
+    try {
+      if (item && conv?.messages === messageList && messageList.includes(message)) {
+        invalidateConversationContext(conv, index);
+        conv.updatedAt = Date.now();
+        await saveConversationImmediately();
+        if (getActiveConv() === conv) renderMessages({ preserveScroll: true });
+      }
+    } catch (error) {
+      showToast(sanitizeErrorDetail(error), 'error');
+    } finally { endSendingAction(); }
+  }
+}
+
 function getToolRequestSettings() {
   return {
     searchUrl: (localStorage.getItem('llmSearchApiUrl') || 'https://purasearx.duckdns.org/search?format=json').trim(),
     searchKey: (localStorage.getItem('llmSearchApiKey') || '').trim(),
-    corsProxy: getCorsProxyUrl()
+    corsProxy: getCorsProxyUrl(),
+    image: {
+      enabled: localStorage.getItem('llmImageEnabled') === 'true',
+      baseUrl: (localStorage.getItem('llmImageBaseUrl') || '').trim(),
+      model: (localStorage.getItem('llmImageModel') || '').trim(),
+      apiKey: (localStorage.getItem('llmImageApiKey') || '').trim()
+    }
   };
 }
 
@@ -9732,7 +9988,7 @@ const ANTHROPIC_WEB_SEARCH_TOOL = {
   }
 };
 
-const HANDLED_TOOLS = new Set(['web_search', 'url_fetch']);
+const HANDLED_TOOLS = new Set(['web_search', 'url_fetch', 'generate_image']);
 const TOOL_FINAL_ANSWER_NUDGE = 'You have already used tools and received their results above. Do not call any more tools. Produce the final assistant answer now in plain text, using the tool results to address the user\'s original question.';
 
 // Text tools must be standalone explicit invocations, never quoted JSON examples.
@@ -9952,6 +10208,15 @@ function finishRequestMetadata(request, status, error = '', httpStatus = null) {
 }
 
 async function authorizeExternalTool(toolName, args, conv, authorization) {
+  if (toolName === 'generate_image') {
+    const image = authorization?.settings?.image || getToolRequestSettings().image;
+    if (!image.enabled || localStorage.getItem('llmImageEnabled') !== 'true') return false;
+    if (!validImageApiBase(image.baseUrl) || !image.model) throw new Error('Configure the connection in Settings > Images.');
+    const prompt = typeof args?.prompt === 'string' ? args.prompt.trim() : '';
+    if (!prompt || prompt.length > 16000) throw new Error('Image prompt must contain 1–16,000 characters.');
+    if (localStorage.getItem('llmImageAutoApprove') === 'true') return true;
+    return window.confirm('Generate one image using ' + image.model + ' at ' + new URL(image.baseUrl).host + '?\n\n' + prompt + '\n\nThis may cost money. A previous failed or cancelled request may already have been billed. Allow this image request?');
+  }
   const policy = authorization?.policy || getToolPolicy(conv);
   if (!(toolName === 'web_search' ? policy.webSearch : toolName === 'url_fetch' && policy.urlFetch)) return false;
   if (!policy.confirm) return true;
@@ -9970,6 +10235,7 @@ async function executeAuthorizedTool(toolName, args, conv, signal, authorization
   }
   signal?.throwIfAborted();
   if (toolName === 'web_search') return executeWebSearch(extractWebSearchQueryFromArgs(args), signal, authorization?.settings);
+  if (toolName === 'generate_image') return { dataUrl: await executeGenerateImage(args.prompt.trim(), signal, authorization?.settings) };
   return executeUrlFetch(args?.url || '', signal, authorization?.settings);
 }
 
@@ -10072,6 +10338,8 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
   let lastRender = 0;
   const toolBlocks = prefixText ? structuredClone(assistantMsg.swipeToolUse?.[swipeIdx] || []) : [];
   const responseImages = prefixText ? (assistantMsg.swipeImages?.[swipeIdx] || []).slice() : [];
+  const responseAttachments = prefixText ? structuredClone(messageAttachments(assistantMsg, swipeIdx)) : [];
+  let imageGenerationFailed = responseAttachments.some(item => ['failed', 'denied', 'stopped'].includes(item.status));
   let responseStatus = null;
 
   const renderProgress = (force = false) => {
@@ -10079,6 +10347,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     (assistantMsg.swipeThinking ||= [])[swipeIdx] = thinkingText;
     (assistantMsg.swipeToolUse ||= [])[swipeIdx] = toolBlocks;
     (assistantMsg.swipeImages ||= [])[swipeIdx] = responseImages;
+    (assistantMsg.swipeAttachments ||= [])[swipeIdx] = responseAttachments;
     if (assistantMsg.swipeIndex === swipeIdx) selectAssistantSwipe(assistantMsg, swipeIdx);
     if (getActiveConv() !== requestConv || messages !== messageList || assistantMsg.swipeIndex !== swipeIdx) return;
     if (!force && Date.now() - lastRender < 80) return;
@@ -10089,7 +10358,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     const openTools = Array.from(bubbleEl.querySelectorAll('details.tool-use-block')).map(block => block.open);
     const stripped = stripThinkTags(fullText);
     _suppressScrollFlag = true;
-    setBubbleHTML(bubbleEl, thinkingText + stripped.thinking, renderToolBlocksHTML(toolBlocks) + renderMarkdown(stripped.content) + renderGenImages(responseImages));
+    setBubbleHTML(bubbleEl, thinkingText + stripped.thinking, renderToolBlocksHTML(toolBlocks) + renderAssistantContent(stripped.content, responseAttachments, responseImages));
     bubbleEl.querySelectorAll('details.tool-use-block').forEach((block, index) => { block.open = openTools[index] === true; });
     area.scrollTop = savedScroll === null ? area.scrollHeight : savedScroll;
     _suppressScrollFlag = false;
@@ -10131,10 +10400,11 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
         ...(thinkingOn ? { thinking: { type: 'adaptive', display: 'summarized' } } : {}),
         ...(thinkingEffort ? { output_config: { effort: thinkingEffort } } : {})
       };
-      if (toolPolicy.webSearch || toolPolicy.urlFetch) {
+      if (toolPolicy.webSearch || toolPolicy.urlFetch || toolPolicy.generateImage) {
         body.tools = (body.tools || []).concat([
           ...(toolPolicy.webSearch ? [toolPolicy.confirm ? ANTHROPIC_WEB_SEARCH_TOOL : { type: 'web_search_20250305', name: 'web_search', max_uses: 20 }] : []),
-          ...(toolPolicy.urlFetch ? [ANTHROPIC_URL_FETCH_TOOL] : [])
+          ...(toolPolicy.urlFetch ? [ANTHROPIC_URL_FETCH_TOOL] : []),
+          ...(toolPolicy.generateImage ? [ANTHROPIC_GENERATE_IMAGE_TOOL] : [])
         ]);
         if (toolPolicy.webSearch && target.forceSearch) {
           body.tool_choice = { type: 'any' };
@@ -10159,10 +10429,11 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
         body[tokenKey] = configuredMaxTokens;
       }
       // Inject web search tool for OpenAI-compatible models
-      if (toolPolicy.webSearch || toolPolicy.urlFetch) {
+      if (toolPolicy.webSearch || toolPolicy.urlFetch || toolPolicy.generateImage) {
         body.tools = (body.tools || []).concat([
           ...(toolPolicy.webSearch ? [OPENAI_WEB_SEARCH_TOOL] : []),
-          ...(toolPolicy.urlFetch ? [OPENAI_URL_FETCH_TOOL] : [])
+          ...(toolPolicy.urlFetch ? [OPENAI_URL_FETCH_TOOL] : []),
+          ...(toolPolicy.generateImage ? [OPENAI_GENERATE_IMAGE_TOOL] : [])
         ]);
         if (toolPolicy.webSearch && target.forceSearch) {
           body.tool_choice = 'required';
@@ -10214,6 +10485,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       let roundThinking = '';
       let hasRoundImages = false;
       let stopReason = null;
+      const toolTextOffsets = new Map();
       const addImages = images => {
         for (const image of images.map(safeMediaUrl).filter(Boolean)) {
           hasRoundImages = true;
@@ -10306,6 +10578,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
               for (const call of delta.tool_calls || []) {
                 const calls = reply.tool_calls ||= [];
                 const index = call.index ?? 0;
+                if (!toolTextOffsets.has(index)) toolTextOffsets.set(index, roundText.length);
                 const current = calls[index] ||= { id: '', type: 'function', function: { name: '', arguments: '' } };
                 const previous = current.function;
                 Object.assign(current, call);
@@ -10372,16 +10645,16 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       }
       let calls = format === 'anthropic'
         ? (reply.content || []).filter(block => block.type === 'tool_use').map(block => ({ id: block.id, name: block.name, input: block.input }))
-        : (reply.tool_calls || []).filter(Boolean).map(call => ({ id: call.id, name: call.function?.name, arguments: call.function?.arguments }));
+        : (reply.tool_calls || []).map((call, index) => call && ({ id: call.id, name: call.function?.name, arguments: call.function?.arguments, textOffset: toolTextOffsets.get(index) ?? roundText.length })).filter(Boolean);
       let textTools = false;
-      if (!calls.length && format !== 'anthropic' && (toolPolicy.webSearch || toolPolicy.urlFetch)) {
+      if (!calls.length && format !== 'anthropic' && (toolPolicy.webSearch || toolPolicy.urlFetch || toolPolicy.generateImage)) {
         calls = parseTextToolCalls(roundText);
         textTools = calls.length > 0;
       }
-      const enabledCalls = calls.filter(call => call.name === 'web_search' ? toolPolicy.webSearch : call.name === 'url_fetch' && toolPolicy.urlFetch);
+      const enabledCalls = calls.filter(call => call.name === 'web_search' ? toolPolicy.webSearch : call.name === 'url_fetch' ? toolPolicy.urlFetch : call.name === 'generate_image' && toolPolicy.generateImage);
       const nativeContinuation = format === 'anthropic' && stopReason === 'pause_turn' && toolPolicy.webSearch;
       if (!enabledCalls.length && !nativeContinuation) {
-        if (!stripThinkTags(roundText).content.trim() && !hasRoundImages) throw new Error('The provider returned no final answer.');
+        if (!stripThinkTags(roundText).content.trim() && !hasRoundImages && !responseAttachments.length) throw new Error('The provider returned no final answer.');
         finishRequestMetadata(request, 'complete', '', responseStatus);
         break;
       }
@@ -10389,9 +10662,49 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       if (toolRound === 20) throw new Error('The tool round limit was reached without a final answer.');
       if (textTools) fullText = textBeforeRound + stripTextToolCalls(roundText);
       const results = [];
+      const roundImageReferences = new Map();
       for (const call of enabledCalls) {
         const args = call.input ?? JSON.parse(call.arguments || '{}');
         if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('The provider returned invalid tool arguments.');
+        if (call.name === 'generate_image') {
+          const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+          if (imageGenerationFailed) {
+            const content = 'Image generation was denied, stopped, or failed earlier in this response. Do not retry. The user can use Retry image explicitly.';
+            results.push(format === 'anthropic' ? { type: 'tool_result', tool_use_id: call.id, content, is_error: true } : { role: 'tool', tool_call_id: call.id, content });
+            continue;
+          }
+          const item = { id: 'img_' + (window.crypto?.randomUUID?.().replace(/-/g, '') || genId()), type: 'image', prompt,
+            alt: typeof args.alt === 'string' ? args.alt.slice(0, 500) : 'Generated image', dataUrl: '', status: 'pending', error: '' };
+          responseAttachments.push(item);
+          // IDs are owned by Synapse, and the reference survives every later text round.
+          const alt = item.alt.replace(/[\[\]\\\r\n]/g, ' ');
+          const reference = '\n\n![' + alt + '](attachment:' + item.id + ')\n\n';
+          roundImageReferences.set(call.id, reference);
+          if (format === 'anthropic') {
+            fullText = textBeforeRound + reply.content.map(block => block.type === 'text' ? block.text || '' : roundImageReferences.get(block.id) || '').join('');
+          } else if (textTools) fullText += reference;
+          else {
+            let offset = 0;
+            fullText = textBeforeRound;
+            for (const placed of enabledCalls.filter(call => roundImageReferences.has(call.id)).sort((a, b) => a.textOffset - b.textOffset)) {
+              fullText += roundText.slice(offset, placed.textOffset) + roundImageReferences.get(placed.id);
+              offset = placed.textOffset;
+            }
+            fullText += roundText.slice(offset);
+          }
+          renderProgress(true);
+          await saveConversationImmediately();
+          assertRequestOwner(requestConv, messageList, assistantMsg, controller.signal);
+          const result = await fillGeneratedAttachment(item, requestConv, controller.signal, authorization);
+          assertRequestOwner(requestConv, messageList, assistantMsg, controller.signal);
+          if (result.error) imageGenerationFailed = true;
+          const content = result.error ? 'Image generation failed or was denied: ' + result.error + ' Do not retry. The user has a Retry image button.'
+            : 'Image generated and inserted into the conversation by Synapse. Continue with any remaining text. Do not repeat the image, its attachment reference, or image data.';
+          results.push(format === 'anthropic' ? { type: 'tool_result', tool_use_id: call.id, content, ...(result.error ? { is_error: true } : {}) } : { role: 'tool', tool_call_id: call.id, content });
+          renderProgress(true);
+          await saveConversationImmediately();
+          continue;
+        }
         const tool = call.name === 'url_fetch'
           ? { type: 'url_fetch', url: args.url || '', content: '', searching: true }
           : { query: extractWebSearchQueryFromArgs(args), results: [], searching: true };
@@ -10436,6 +10749,12 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     fullText = stripped.content;
     toolBlocks.forEach(block => {
       if (block.searching) { block.searching = false; block.error = request.error || 'Tool request stopped.'; }
+    });
+    responseAttachments.forEach(item => {
+      if (item.status === 'pending') {
+        item.status = request.status === 'stopped' ? 'stopped' : 'failed';
+        item.error = 'Image request interrupted. It may already have been billed; retry only if you want another request.';
+      }
     });
     renderProgress(true);
     if (bubbleEl?.isConnected && getActiveConv() === requestConv) postRenderProcessing(bubbleEl);
@@ -11521,7 +11840,7 @@ async function clearDataCategory(category) {
     showToast('Stop the current response before clearing conversations.', 'info');
     return;
   }
-  const labels = { conversations: 'conversations', drafts: 'drafts', memories: 'memories', credentials: 'provider, search, and sync credentials' };
+  const labels = { conversations: 'conversations', drafts: 'drafts', memories: 'memories', credentials: 'provider, search, image, and sync credentials' };
   if (!labels[category] || !confirm('Clear ' + labels[category] + '? This cannot be undone.')) return;
   if (!beginLocalDataOperation()) return;
   try {
@@ -11548,9 +11867,9 @@ async function clearDataCategory(category) {
     syncRecordTombstones('memories', (await loadMemories()).map(memory => memory.id));
     await saveMemories([]);
   } else if (category === 'credentials') {
-    ['llmApiKey', 'llmSearchApiKey'].forEach(key => { localStorage.removeItem(key); sessionStorage.removeItem(key); });
+    ['llmApiKey', 'llmSearchApiKey', 'llmImageApiKey'].forEach(key => { localStorage.removeItem(key); sessionStorage.removeItem(key); });
     ['assistantSyncGistToken', 'assistantSyncPassphrase', 'assistantSyncGistId', 'assistantSyncSalt', 'assistantSyncLastHash', 'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, SYNC_STATE_GIST_KEY, SYNC_AUTO_PUSH_KEY, SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY, SYNC_INDEX_STATE_KEY].forEach(key => localStorage.removeItem(key));
-    ['setKey', 'setSearchApiKey', 'setupKey', 'setSyncToken', 'setSyncGistId', 'setSyncPassphrase', 'syncPairingText', 'syncPairingCode'].forEach(id => {
+    ['setKey', 'setSearchApiKey', 'setImageApiKey', 'setupKey', 'setSyncToken', 'setSyncGistId', 'setSyncPassphrase', 'syncPairingText', 'syncPairingCode'].forEach(id => {
       const input = document.getElementById(id);
       if (input) input.value = '';
     });
@@ -12455,6 +12774,8 @@ function syncStripHeavyBlobs(conv) {
     if (!message || typeof message !== 'object') return;
     if (Array.isArray(message.images)) message.images = message.images.map(syncStripBlobString);
     if (Array.isArray(message.swipeImages)) message.swipeImages = message.swipeImages.map(group => Array.isArray(group) ? group.map(syncStripBlobString) : group);
+    stripAttachmentBlobs(message.attachments);
+    (message.swipeAttachments || []).forEach(stripAttachmentBlobs);
     if (Array.isArray(message.content)) message.content.forEach(part => {
       if (!part || typeof part !== 'object') return;
       if (part.type === 'image_url' && part.image_url && typeof part.image_url.url === 'string') part.image_url.url = syncStripBlobString(part.image_url.url);
@@ -12468,6 +12789,18 @@ function syncStripHeavyBlobs(conv) {
 // them exactly. Anything without a local counterpart stays stripped.
 function syncRestoreMessageBlobs(mergedMessage, localMessage) {
   if (!mergedMessage || !localMessage || typeof mergedMessage !== 'object' || typeof localMessage !== 'object') return;
+  const restoreGenerated = (target, source) => {
+    (target || []).forEach(item => {
+      const saved = (source || []).find(candidate => candidate.id === item.id);
+      if (!item.dataUrl && syncIsBlobString(saved?.dataUrl)) {
+        item.dataUrl = saved.dataUrl;
+        item.status = 'ready';
+        item.error = '';
+      }
+    });
+  };
+  restoreGenerated(mergedMessage.attachments, localMessage.attachments);
+  (mergedMessage.swipeAttachments || []).forEach((group, index) => restoreGenerated(group, localMessage.swipeAttachments?.[index]));
   if (Array.isArray(localMessage.content) && Array.isArray(mergedMessage.content) && mergedMessage.id && mergedMessage.id === localMessage.id) {
     const rebuilt = [];
     let index = 0;

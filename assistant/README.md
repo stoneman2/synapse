@@ -43,6 +43,16 @@ API keys can be saved as **Remember on this device** (`localStorage`) or **This 
 - Text is extracted from supported document formats before sending.
 - Large text attachments are capped so one file does not flood the request.
 
+### Image Generation
+
+- **Settings → Images** has a custom OpenAI-compatible base URL, image model name, API key, and device-local enable switch. There is no image-provider catalogue. The chat model only needs tool calling.
+- The `generate_image` tool sends `POST <base URL>/images/generations` with `{ model, prompt, n: 1 }`. Each call needs its own spending approval unless **Auto-approve images** is checked in Settings → Images (off by default, saved only on this device). Auto-approval skips image confirmations and may incur charges; search/fetch confirmations are unchanged.
+- Base64 and downloadable URL responses are supported. Synapse downloads and validates PNG, JPEG, WebP, or GIF bytes (maximum 10 MiB), rather than saving expiring remote URLs. Returned URLs receive no API key or cookies and must support browser CORS.
+- Images are per-message, per-swipe attachments. Markdown such as `![Description](attachment:img_abc123)` places an attachment inline, with text before and after it. Synapse assigns the IDs and inserts references at tool-call positions. Referenced attachments are not duplicated at the bottom; unreferenced attachments fall back there, and missing ones show an unavailable placeholder.
+- Inline progress, Cancel, and Retry image controls retain the same attachment position. Stop cancels the local request, but the service may still finish and bill it. Synapse never automatically retries a paid image POST; Retry image asks for fresh approval unless image auto-approval is enabled and can incur a new charge.
+- Image connection settings, key, and permission stay on this device, outside profiles, exports, and sync. Browser storage is not an encrypted vault. Image bytes and references travel with JSON conversation exports and encrypted indexed backups, including alternate swipes. Public chat shares omit image bytes. Legacy backups can omit large images; use indexed backups for portability.
+- Use HTTPS or a local image API. Non-local HTTP APIs on an HTTPS page require a trusted CORS proxy configured under Tools; the paid POST is sent once, without fallback retries. Standalone-file browser restrictions still apply.
+
 ### Roleplay and Prompting
 
 - Import SillyTavern character cards from `.png` or `.json`.
