@@ -242,6 +242,6 @@ Synapse targets current Chrome, Firefox, Safari, and Edge. Some features depend 
 
 ## Credit
 
-Made by [purachina](https://platberlitz.github.io/).
+Forked by Stoneman from [purachina](https://platberlitz.github.io/).
 
 Claude, GPT and Gemini emotion sprites are from [N8python/claudesona](https://github.com/N8python/claudesona) under CC0 1.0 Universal. Cat, Butler, Maid and Calico Plushie are original artwork for Synapse. Zom's expression set is based on a supplied character reference and is separate from that CC0 collection.

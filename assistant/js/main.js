@@ -1,5 +1,5 @@
-import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261111064433';
-import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261111064433';
+import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261111071320';
+import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261111071320';
 // ============================================
 // State
 // ============================================
@@ -105,7 +105,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-11-11T06:44:33Z',
+  buildDate: '2026-11-11T07:13:20Z',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
