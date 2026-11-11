@@ -1,5 +1,5 @@
-import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261111071320';
-import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261111071320';
+import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261111073549';
+import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261111073549';
 // ============================================
 // State
 // ============================================
@@ -105,7 +105,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-11-11T07:13:20Z',
+  buildDate: '2026-11-11T07:35:49Z',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -9793,6 +9793,36 @@ async function readImageResponseBytes(response, limit) {
   return bytes;
 }
 
+async function readImageErrorDetail(response) {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  const limit = 4096;
+  try {
+    while (size < limit) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = value.subarray(0, limit - size);
+      chunks.push(chunk);
+      size += chunk.length;
+      if (chunk.length < value.length) break;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  const text = new TextDecoder().decode(chunks.length === 1 ? chunks[0] : chunks.reduce((all, chunk) => {
+    const next = new Uint8Array(all.length + chunk.length);
+    next.set(all); next.set(chunk, all.length); return next;
+  }, new Uint8Array()));
+  try {
+    const payload = JSON.parse(text);
+    const message = payload?.error?.message || payload?.message || payload?.error;
+    return typeof message === 'string' ? message : text;
+  } catch { return text; }
+}
+
 async function validatedImageDataUrl(bytes, signal) {
   if (!bytes.length || bytes.length > IMAGE_MAX_BYTES) throw new Error('Empty or oversized image. Maximum size is 10 MiB.');
   const starts = values => values.every((value, index) => bytes[index] === value);
@@ -9819,7 +9849,7 @@ async function executeGenerateImage(prompt, signal, settings = getToolRequestSet
   if (!validImageApiBase(image.baseUrl) || !image.model) throw new Error('Configure an image base URL and model in Settings > Images.');
   const url = image.baseUrl.replace(/\/+$/, '') + '/images/generations';
   const options = { method: 'POST', headers: { 'Content-Type': 'application/json', ...(image.apiKey ? { Authorization: 'Bearer ' + image.apiKey } : {}) },
-    body: JSON.stringify({ model: image.model, prompt, n: 1 }), signal, credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error' };
+    body: JSON.stringify({ model: image.model, prompt, size: '1024x1024', n: 1 }), signal, credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error' };
   // A paid POST must be sent only once. The chat transport's proxy fallback can
   // resend requests after ambiguous network failures, so do not use it here.
   let destination = url;
@@ -9828,7 +9858,10 @@ async function executeGenerateImage(prompt, signal, settings = getToolRequestSet
     destination = settings.corsProxy + encodeURIComponent(url);
   }
   const response = await fetch(destination, options);
-  if (!response.ok) throw new Error('Image API returned HTTP ' + response.status + '. No automatic retry was made.');
+  if (!response.ok) {
+    const detail = sanitizeErrorDetail(await readImageErrorDetail(response), [image.apiKey]);
+    throw new Error('Image API returned HTTP ' + response.status + (detail ? ': ' + detail : '') + '. No automatic retry was made.');
+  }
   const raw = await readImageResponseBytes(response, Math.ceil(IMAGE_MAX_BYTES * 4 / 3) + 1024 * 1024);
   const data = JSON.parse(new TextDecoder().decode(raw));
   const result = data?.data?.[0];

@@ -2,15 +2,15 @@
  *
  * Generated release stamps are kept in sync by build.py.
  */
-const CACHE_VERSION = 'synapse-20261111071320';
+const CACHE_VERSION = 'synapse-20261111073549';
 
 const PRECACHE = [
   './',
   './index.html',
-  './styles.css?v=20261111071320',
-  './js/main.js?v=20261111071320',
-  './js/lib/dom-utils.js?v=20261111071320',
-  './js/lib/text-utils.js?v=20261111071320',
+  './styles.css?v=20261111073549',
+  './js/main.js?v=20261111073549',
+  './js/lib/dom-utils.js?v=20261111073549',
+  './js/lib/text-utils.js?v=20261111073549',
   './manifest.json'
 ];
 
