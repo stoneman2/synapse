@@ -1334,6 +1334,14 @@ label.toggle-row {
   margin-left: auto;
   text-align: right;
 }
+#settingsTab-sync label.toggle-row {
+  flex-wrap: wrap;
+}
+#settingsTab-sync .toggle-hint {
+  flex-basis: 100%;
+  margin-left: 22px;
+  text-align: left;
+}
 .setting-hint {
   color: var(--text-secondary);
   font-size: 0.8em;

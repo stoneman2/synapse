@@ -125,6 +125,8 @@ const SYNC_TOMBSTONES_KEY = 'assistantSyncTombstones';
 const SYNC_SETTINGS_STATE_KEY = 'assistantSyncSettingsState';
 const SYNC_STATE_GIST_KEY = 'assistantSyncStateGistId';
 const SYNC_CONV_HASHES_KEY = 'assistantSyncConvHashes';
+const SYNC_SELECTION_KEY = 'assistantSyncSelection';
+const SYNC_CONVERSATION_SELECTION_KEY = 'assistantSyncConversationSelection';
 const SYNC_AUTO_PUSH_DELAY = 1200;
 const SYNC_SETTINGS_KEYS = [
   'llmStreaming', 'llmEnterSend', 'llmTemperature',
@@ -5559,6 +5561,7 @@ function refreshConversationStateAfterExternalChange() {
   armedFollowUpConversationIds.clear();
   if (!conversations.length) {
     const conv = { id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
+    syncInitializeNewConversation(conv);
     conversations.push(conv);
   }
   if (!conversations.some(conv => conv.id === activeConvId)) activeConvId = conversations[0].id;
@@ -5792,7 +5795,7 @@ function migratePersonaField(convs) {
 }
 
 function finishConversationLoad(preferredActiveId) {
-  if (!conversations.length) conversations.push({ id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() });
+  if (!conversations.length) conversations.push(syncInitializeNewConversation({ id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() }));
   activeConvId = conversations.some(conv => conv.id === preferredActiveId) ? preferredActiveId : conversations[0].id;
   messages = getActiveConv().messages;
   renderSidebar();
@@ -5883,6 +5886,7 @@ function prepareConversationTransition() {
 function createConversation(projectId) {
   if (!prepareConversationTransition()) return;
   const conv = { id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
+  syncInitializeNewConversation(conv);
   // Only ever set from the per-project "+" in the sidebar; index.html calls this with
   // no argument, and a click event must not be mistaken for a project id.
   if (typeof projectId === 'string' && getProject(projectId)) conv.projectId = projectId;
@@ -6302,6 +6306,7 @@ function duplicateConversation(id = activeConvId) {
   delete copy.forkedAt;
   copy.queuedFollowUps = [];
   if (isTemporaryConversation(source)) temporaryConversations.add(copy);
+  syncInitializeNewConversation(copy);
   conversations.unshift(copy);
   activeConvId = copy.id;
   messages = copy.messages;
@@ -6325,7 +6330,7 @@ function removeConversations(ids, showUndo = true) {
   ids.forEach(id => armedFollowUpConversationIds.delete(id));
   syncRecordTombstones('conversations', targets.filter(conv => !isTemporaryConversation(conv)).map(conv => conv.id));
   conversations = conversations.filter(c => !ids.includes(c.id));
-  if (!conversations.length) conversations.push({ id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() });
+  if (!conversations.length) conversations.push(syncInitializeNewConversation({ id: genId(), title: 'New Chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() }));
   if (!conversations.some(c => c.id === activeConvId)) activeConvId = conversations[0].id;
   messages = getActiveConv()?.messages || [];
   saveConversations();
@@ -6848,6 +6853,7 @@ function renderSidebar() {
     state.className = 'conv-state';
     const stateParts = [];
     if (isTemporaryConversation(c)) stateParts.push('Temporary');
+    else if (!syncReadSelection().conversations || !syncConversationIsEnabled(c)) stateParts.push('Sync off');
     if (c.archivedAt) stateParts.push('Archived');
     if (c.queuedFollowUps?.length) stateParts.push(c.queuedFollowUps.length + ' queued');
     state.textContent = stateParts.join(' · ');
@@ -6873,6 +6879,7 @@ function renderSidebar() {
       event.stopPropagation();
       openActionMenu(moreBtn, [
         { label: 'Rename', action: beginRename },
+        ...(!isTemporaryConversation(c) ? [{ label: syncConversationIsEnabled(c) ? 'Stop syncing on this device' : 'Sync this conversation', action: () => syncSetConversationEnabled(c.id, !syncConversationIsEnabled(c)) }] : []),
         { label: c.pinned ? 'Unpin' : 'Pin', action: () => { c.pinned = !c.pinned; c.updatedAt = Date.now(); saveConversations(); renderSidebar(); } },
         { label: 'Tag', action: () => showTagPicker(c, moreBtn) },
         { label: 'Move to project', action: () => showProjectPicker(c, moreBtn) },
@@ -9349,6 +9356,7 @@ function forkBranch(msgIdx) {
   delete newConv.shareUrl;
   delete newConv.shareId;
 
+  syncInitializeNewConversation(newConv);
   conversations.unshift(newConv);
   activeConvId = newConv.id;
   messages = newConv.messages;
@@ -11746,6 +11754,110 @@ function syncAutoPushIsConfigured(cfg) {
   return !!(cfg?.token && cfg?.passphrase && cfg?.gistId);
 }
 
+// These preferences belong to this browser, never to a conversation or settings payload.
+function syncReadSelection() {
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem(SYNC_SELECTION_KEY) || '{}') || {}; } catch (e) {}
+  return {
+    settings: stored.settings !== false, memories: stored.memories !== false,
+    projects: stored.projects !== false, conversations: stored.conversations !== false,
+    newConversations: stored.newConversations === true
+  };
+}
+
+function syncReadConversationSelection() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(SYNC_CONVERSATION_SELECTION_KEY) || '{}');
+    return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+  } catch (e) { return {}; }
+}
+
+function syncSelectionFingerprint() {
+  return JSON.stringify([localStorage.getItem(SYNC_SELECTION_KEY), localStorage.getItem(SYNC_CONVERSATION_SELECTION_KEY)]);
+}
+
+function syncConversationIsEnabled(record) {
+  const id = typeof record === 'string' ? record : record?.id;
+  if (!id || (typeof record === 'object' && isTemporaryConversation(record))) return false;
+  // Existing and newly pulled chats retain sync unless explicitly disabled on this device.
+  return syncReadConversationSelection()[id] !== false;
+}
+
+function syncInitializeNewConversation(record) {
+  if (!record || isTemporaryConversation(record) || readOnlyShare) return record;
+  const selected = syncReadConversationSelection();
+  selected[record.id] = syncReadSelection().newConversations;
+  localStorage.setItem(SYNC_CONVERSATION_SELECTION_KEY, JSON.stringify(selected));
+  localStorage.removeItem('assistantSyncLastEtag');
+  return record;
+}
+
+function syncChangeSelection(category, checked) {
+  if (_syncOperationInFlight || readOnlyShare) { syncRenderSelection(); return false; }
+  try {
+    const selected = syncReadSelection();
+    if (!Object.hasOwn(selected, category)) return false;
+    selected[category] = checked === true;
+    // A previously skipped category must be readable even if the Gist has not changed.
+    localStorage.removeItem('assistantSyncLastEtag');
+    localStorage.setItem(SYNC_SELECTION_KEY, JSON.stringify(selected));
+    syncScheduleAutoPush();
+    if (checked && category !== 'newConversations') {
+      syncSetStatus('dirty', 'Backup pending', 'The newly selected category has not been checked for backup yet. Push now uploads pending changes; Pull remains manual.', 'push');
+    }
+    syncRenderSelection();
+    renderSidebar();
+    return true;
+  } catch (error) {
+    syncRenderSelection();
+    showToast('Could not save sync selection. Free browser storage and retry.', 'error');
+    return false;
+  }
+}
+
+function syncSetConversationEnabled(id, checked) {
+  if (_syncOperationInFlight || readOnlyShare) { showToast('Wait for sync to finish.', 'info'); return false; }
+  const record = conversations.find(conv => conv.id === id);
+  if (!record || isTemporaryConversation(record)) return false;
+  try {
+    const selected = syncReadConversationSelection();
+    selected[id] = checked === true;
+    localStorage.removeItem('assistantSyncLastEtag');
+    localStorage.setItem(SYNC_CONVERSATION_SELECTION_KEY, JSON.stringify(selected));
+    syncScheduleAutoPush();
+    if (checked) {
+      syncSetStatus('dirty', 'Backup pending', syncReadSelection().conversations
+        ? 'This conversation is enabled. Push now uploads pending changes; Pull remains manual.'
+        : 'This conversation is selected, but the Conversations category is unchecked on the Sync page.', 'push');
+    }
+    renderSidebar();
+    showToast(checked ? 'Conversation enabled for sync on this device.' : 'Conversation sync stopped on this device. Existing backups were not deleted.', 'info');
+    return true;
+  } catch (error) {
+    showToast('Could not save conversation sync selection. Free browser storage and retry.', 'error');
+    return false;
+  }
+}
+
+function syncSelectData(data, selection = syncReadSelection()) {
+  const tombstones = syncNormalizeTombstones(data.tombstones);
+  if (!selection.conversations) {
+    tombstones.conversations = {};
+    tombstones.conversationVersions = {};
+    tombstones.conversationRoots = {};
+  }
+  if (!selection.memories) tombstones.memories = {};
+  if (!selection.projects) tombstones.projects = {};
+  return {
+    ...data, tombstones,
+    settingsState: selection.settings ? data.settingsState : { settings: {}, revisions: {} },
+    memories: selection.memories ? data.memories : [],
+    projects: selection.projects ? data.projects : [],
+    conversations: selection.conversations ? (data.conversations || []).filter(record =>
+      syncConversationIsEnabled(record) && (!record.conflictOf || syncConversationIsEnabled(record.conflictOf))) : []
+  };
+}
+
 function syncGetStoredConfig() {
   return {
     token: localStorage.getItem('assistantSyncGistToken') || '',
@@ -11771,7 +11883,7 @@ function syncGetConfigFromInputs() {
 
 function syncResetScopedState() {
   [SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, 'assistantSyncSalt', 'assistantSyncLastHash',
-    'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY]
+    'assistantSyncLastPushAt', 'assistantSyncLastPullAt', 'assistantSyncLastEtag', SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY]
     .forEach(key => localStorage.removeItem(key));
 }
 
@@ -11856,7 +11968,7 @@ function syncSaveSettings(showSavedToast = true, schedule = true) {
   };
   if ((scoped && scoped !== cfg.gistId) || (!scoped && previousGistId && previousGistId !== cfg.gistId)) {
     [SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, 'assistantSyncSalt', 'assistantSyncLastHash',
-      'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY].forEach(key => { values[key] = null; });
+      'assistantSyncLastPushAt', 'assistantSyncLastPullAt', 'assistantSyncLastEtag', SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY].forEach(key => { values[key] = null; });
   }
   if (!autoPush) values[SYNC_AUTO_PENDING_KEY] = null;
   Object.entries(values).sort((a, b) => Number(a[1] === null) - Number(b[1] === null)).forEach(([key, after]) => {
@@ -11952,6 +12064,14 @@ function setSyncBusy(busy) {
     const button = document.getElementById(id);
     if (button) button.disabled = busy;
   }
+  panel?.querySelectorAll('[data-sync-selection]').forEach(input => { input.disabled = busy; });
+}
+
+function syncRenderSelection() {
+  const selection = syncReadSelection();
+  document.querySelectorAll('[data-sync-selection]').forEach(input => {
+    input.checked = selection[input.dataset.syncSelection] === true;
+  });
 }
 
 function renderSyncSettings() {
@@ -11963,6 +12083,7 @@ function renderSyncSettings() {
   if (gistEl) gistEl.value = localStorage.getItem('assistantSyncGistId') || '';
   if (passEl) passEl.value = localStorage.getItem('assistantSyncPassphrase') || '';
   if (autoEl) autoEl.checked = localStorage.getItem(SYNC_AUTO_PUSH_KEY) === 'true';
+  syncRenderSelection();
   setSyncBusy(_syncOperationInFlight);
   _syncInputsLoaded = true;
 
@@ -12868,15 +12989,20 @@ async function syncPushToGist(options = {}) {
     if (auto || pendingAtStart) localStorage.removeItem(SYNC_AUTO_PENDING_KEY);
     cfg = auto ? syncGetStoredConfig() : syncSaveSettings(false, false);
     if (!cfg) throw new Error('Sync settings could not be saved. Free storage and retry.');
+    const selection = syncReadSelection();
+    if (!['settings', 'memories', 'projects', 'conversations'].some(key => selection[key])) {
+      if (!auto) syncSetStatus('unknown', 'Nothing selected', 'Choose at least one category on the Sync page. No data was uploaded.', 'push');
+      succeeded = true;
+      return true;
+    }
     syncValidateConfig(cfg, auto);
     persistDraftFromUI();
     if (_projectAutosaveTimer && !await flushProjectAutosave()) throw new Error('Project changes could not be saved. Retry before pushing.');
     if (!await saveProjects(true)) throw new Error('Project changes could not be saved. Retry before pushing.');
     await saveConversationImmediately();
     await loadMemories();
-    const settingsState = syncCollectSettingsState();
-    const local = await syncCapturePullSnapshot();
-    local.settingsState = settingsState;
+    const settingsState = selection.settings ? syncCollectSettingsState() : { settings: {}, revisions: {} };
+    const local = syncSelectData({ ...await syncCapturePullSnapshot(), settingsState }, selection);
     let storedSyncHashes = { conversations: {}, metadata: '' };
     try {
       const rawSyncHashes = JSON.parse(localStorage.getItem(SYNC_CONV_HASHES_KEY) || 'null');
@@ -13254,7 +13380,7 @@ async function syncCapturePullSnapshot() {
   const localProjects = serializeConversation(projects);
   const settingsValues = {};
   new Set([...SYNC_SETTINGS_KEYS, ...EXPORT_SETTING_ALLOWLIST, SYNC_SETTINGS_STATE_KEY, SYNC_TOMBSTONES_KEY,
-    SYNC_AUTO_PENDING_KEY, 'assistantSyncSalt', 'assistantActiveConvId', 'assistantSyncLastPullAt',
+    SYNC_SELECTION_KEY, SYNC_CONVERSATION_SELECTION_KEY, SYNC_AUTO_PENDING_KEY, 'assistantSyncSalt', 'assistantActiveConvId', 'assistantSyncLastPullAt',
     'assistantConversations', 'assistantMemories', 'assistantProjects']).forEach(key => { settingsValues[key] = localStorage.getItem(key); });
   const database = await new Promise((resolve, reject) => {
     const tx = db.transaction(['conversations', 'memories', 'meta'], 'readonly');
@@ -13297,6 +13423,12 @@ async function syncPullFromGist(options = {}) {
     flushSettingsAutosaves();
     const cfg = syncSaveSettings(false, false);
     if (!cfg) throw new Error('Sync settings could not be saved. Free storage and retry.');
+    const selection = syncReadSelection();
+    if (!['settings', 'memories', 'projects', 'conversations'].some(key => selection[key])) {
+      syncSetStatus('unknown', 'Nothing selected', 'Choose at least one category on the Sync page. No data was pulled.', 'pull');
+      return false;
+    }
+    const selectionFingerprint = syncSelectionFingerprint();
     syncValidateConfig(cfg, true);
     syncSetStatus('checking', 'Pulling…', 'Fetching and decrypting sync files.');
     const headers = {};
@@ -13309,7 +13441,7 @@ async function syncPullFromGist(options = {}) {
     }
     const gist = remoteResponse.data;
     const manifest = await syncReadManifest(gist, cfg.token);
-    const remote = await syncReadRemoteData(gist, manifest, cfg.passphrase);
+    const remote = syncSelectData(await syncReadRemoteData(gist, manifest, cfg.passphrase), selection);
     if (sending || streaming || queueingFollowUp || pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) {
       syncSetStatus('dirty', 'Pull cancelled', 'Local activity started. Press Pull now again when it finishes.');
       return false;
@@ -13320,7 +13452,19 @@ async function syncPullFromGist(options = {}) {
     await saveConversationImmediately();
     await loadMemories();
     const snapshot = await syncCapturePullSnapshot();
+    if (syncSelectionFingerprint() !== selectionFingerprint) {
+      throw new Error('Local data changed while this operation was being prepared. Sync selections changed; press Pull again.');
+    }
     const remoteTombstones = syncNormalizeTombstones(remote.tombstones);
+    // A local-only conversation must not receive remote edits or deletions, including forks.
+    for (const id of Object.keys(remoteTombstones.conversations)) {
+      const root = remoteTombstones.conversationRoots[id];
+      if (!syncConversationIsEnabled(id) || (root && !syncConversationIsEnabled(root))) {
+        delete remoteTombstones.conversations[id];
+        delete remoteTombstones.conversationVersions[id];
+        delete remoteTombstones.conversationRoots[id];
+      }
+    }
     const incomingDeletionCount = (records, category, timestampKey) => records.filter(record => {
       const remoteDeletedAt = Number(remoteTombstones[category]?.[record.id]) || 0;
       const localDeletedAt = Number(snapshot.tombstones[category]?.[record.id]) || 0;
@@ -13351,10 +13495,16 @@ async function syncPullFromGist(options = {}) {
     }
 
     const liveTombstones = syncMergeTombstones(snapshot.tombstones, remoteTombstones);
-    const liveSettingsState = syncMergeSettingsStates(syncCollectSettingsState(false, false), remote.settingsState);
-    const liveMemories = syncMergeMemoryLists(snapshot.memories, remote.memories, liveTombstones.memories);
-    const liveProjects = syncMergeProjectLists(snapshot.projects, remote.projects, liveTombstones.projects);
-    const liveMerged = await syncMergeConversationLists(snapshot.conversations, remote.conversations, liveTombstones.conversations, liveTombstones.conversationVersions, liveTombstones.conversationRoots);
+    const liveSettingsState = selection.settings ? syncMergeSettingsStates(syncCollectSettingsState(false, false), remote.settingsState) : null;
+    const liveMemories = selection.memories ? syncMergeMemoryLists(snapshot.memories, remote.memories, liveTombstones.memories) : snapshot.memories;
+    const liveProjects = selection.projects ? syncMergeProjectLists(snapshot.projects, remote.projects, liveTombstones.projects) : snapshot.projects;
+    const selectedLocal = syncSelectData(snapshot, selection).conversations;
+    const selectedIds = new Set(selectedLocal.map(record => record.id));
+    const untouched = snapshot.conversations.filter(record => !selectedIds.has(record.id));
+    const liveMerged = selection.conversations
+      ? await syncMergeConversationLists(selectedLocal, remote.conversations, liveTombstones.conversations, liveTombstones.conversationVersions, liveTombstones.conversationRoots)
+      : { conversations: [], added: 0, updated: 0 };
+    liveMerged.conversations.push(...untouched);
     // Stripped remote copies must never wipe local blobs: restore them before persist.
     const localConvById = new Map((snapshot.conversations || []).map(record => [record.id, record]));
     for (const record of liveMerged.conversations) {
@@ -13369,8 +13519,7 @@ async function syncPullFromGist(options = {}) {
       : (liveMerged.conversations[0]?.id || '');
 
     const settingsValues = {
-      ...liveSettingsState.settings,
-      [SYNC_SETTINGS_STATE_KEY]: JSON.stringify(liveSettingsState),
+      ...(liveSettingsState ? { ...liveSettingsState.settings, [SYNC_SETTINGS_STATE_KEY]: JSON.stringify(liveSettingsState) } : {}),
       [SYNC_TOMBSTONES_KEY]: JSON.stringify(liveTombstones),
       assistantSyncLastPullAt: String(Date.now())
     };
@@ -14886,6 +15035,7 @@ async function importCharacterCard(event) {
     }
 
     if (!prepareConversationTransition()) return;
+    syncInitializeNewConversation(conv);
     conversations.unshift(conv);
     activeConvId = conv.id;
     messages = conv.messages;
@@ -15290,6 +15440,8 @@ const __windowBridge = {
   syncScheduleAutoPush,
   syncRunAutoPush,
   syncToggleAutoPush,
+  syncChangeSelection,
+  syncSetConversationEnabled,
   renderSyncSettings,
   syncPushToGist,
   syncPullFromGist,

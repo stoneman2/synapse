@@ -582,7 +582,7 @@
 
     <div class="settings-tab-content" id="settingsTab-sync" role="tabpanel" aria-labelledby="settingsTabButton-sync" hidden>
       <div class="modal-section">GitHub Gist</div>
-      <div class="settings-note">Manual sync stores encrypted conversations, memories, presets, prompts, and font and message display settings in a private Gist. Theme selection, custom theme colors, API keys, provider URLs, search keys, and proxy settings stay on this device. Push now creates the Gist; Pull now remains manual.</div>
+      <div class="settings-note">Push backs up the selected data to an encrypted secret Gist. Pull applies the selected remote data only when clicked. Theme selection, custom theme colors, API keys, provider URLs, search keys, and proxy settings stay on this device.</div>
       <form class="password-field-form" onsubmit="return false">
         <input class="sr-only" type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true">
         <label for="setSyncToken">GitHub token</label>
@@ -603,6 +603,33 @@
       </div>
       <div class="settings-note" id="syncDetails">Add a GitHub token and passphrase, then push to create or update your private sync Gist.</div>
       <div class="settings-note" id="syncTimes"></div>
+      <div class="modal-section">What to sync on this device</div>
+      <label class="toggle-row">
+        <input type="checkbox" data-sync-selection="settings" onchange="syncChangeSelection('settings', this.checked)">
+        Settings
+        <span class="toggle-hint">Includes prompts, presets, and scrubbed profiles; excludes themes and credentials</span>
+      </label>
+      <label class="toggle-row">
+        <input type="checkbox" data-sync-selection="memories" onchange="syncChangeSelection('memories', this.checked)">
+        Memories
+      </label>
+      <label class="toggle-row">
+        <input type="checkbox" data-sync-selection="projects" onchange="syncChangeSelection('projects', this.checked)">
+        Projects
+        <span class="toggle-hint">Project names, shared instructions, and currently supported project file data</span>
+      </label>
+      <label class="toggle-row">
+        <input type="checkbox" data-sync-selection="conversations" onchange="syncChangeSelection('conversations', this.checked)">
+        Conversations
+        <span class="toggle-hint">Only chats enabled through their sidebar actions menu; Pull also discovers remote chats</span>
+      </label>
+      <label class="toggle-row">
+        <input type="checkbox" data-sync-selection="newConversations" onchange="syncChangeSelection('newConversations', this.checked)">
+        Automatically enable sync for new conversations
+        <span class="toggle-hint">Does not change existing chats; imported remote chats start enabled</span>
+      </label>
+      <div class="settings-note">These choices stay on this device and apply to Push, Pull, and automatic push. Unchecking does not delete existing data or backups. Conversation deletions remain pending until Conversations is enabled. Project instructions and files are not included when Projects is unchecked.</div>
+      <div class="settings-note">Storage is still using the existing archive format. Large embedded attachments may remain local; complete attachment backup and the new indexed format are not available yet.</div>
       <label class="toggle-row">
         <input type="checkbox" id="setSyncAutoPush" onchange="syncToggleAutoPush(this)">
         Automatically push local changes
