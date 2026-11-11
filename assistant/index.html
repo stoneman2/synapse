@@ -603,6 +603,7 @@
       </div>
       <div class="settings-note" id="syncDetails">Add a GitHub token and passphrase, then push to create or update your private sync Gist.</div>
       <div class="settings-note" id="syncTimes"></div>
+      <div class="settings-note" id="syncCapacity"></div>
       <div class="modal-section">What to sync on this device</div>
       <label class="toggle-row">
         <input type="checkbox" data-sync-selection="settings" onchange="syncChangeSelection('settings', this.checked)">
@@ -629,7 +630,8 @@
         <span class="toggle-hint">Does not change existing chats; imported remote chats start enabled</span>
       </label>
       <div class="settings-note">These choices stay on this device and apply to Push, Pull, and automatic push. Unchecking does not delete existing data or backups. Conversation deletions remain pending until Conversations is enabled. Project instructions and files are not included when Projects is unchecked.</div>
-      <div class="settings-note">Storage is still using the existing archive format. Large embedded attachments may remain local; complete attachment backup and the new indexed format are not available yet.</div>
+      <div class="settings-note">New Gists use indexed backups: large chats and embedded attachments are split into verified encrypted files. Existing Gists keep the older archive format and its attachment restrictions; clearing the Gist ID and pushing creates a fresh backup without deleting the old one. Do not use an indexed Gist with older app versions.</div>
+      <div class="settings-note">Indexed backups allow 250 published files, with reserved staging space up to 290 files. Publishing requires every part to verify. Superseded files are automatically removed only after the new index is verified; this keeps the current backup bounded, not a permanent edit history. Failed work stays queued for Retry. A secret Gist is unlisted, not access-controlled; the passphrase protects its contents.</div>
       <label class="toggle-row">
         <input type="checkbox" id="setSyncAutoPush" onchange="syncToggleAutoPush(this)">
         Automatically push local changes
@@ -638,6 +640,7 @@
       <div class="sync-actions">
         <button class="btn btn-primary" id="syncPushBtn" type="button" onclick="syncPushToGist()">Push now</button>
         <button class="btn btn-secondary" id="syncPullBtn" type="button" onclick="syncPullFromGist()">Pull now</button>
+        <button class="btn btn-secondary" id="syncRetryBtn" type="button" onclick="syncRetry()" hidden>Retry unfinished work</button>
       </div>
 
       <div class="modal-section">Pairing</div>

@@ -128,6 +128,14 @@ const SYNC_CONV_HASHES_KEY = 'assistantSyncConvHashes';
 const SYNC_SELECTION_KEY = 'assistantSyncSelection';
 const SYNC_CONVERSATION_SELECTION_KEY = 'assistantSyncConversationSelection';
 const SYNC_AUTO_PUSH_DELAY = 1200;
+const SYNC_INDEX_SCHEMA = 'gist-sync-index-v4';
+const SYNC_INDEX_FILE = 'synapse-index.json.enc';
+const SYNC_INDEX_PART_CHARS = 256 * 1024;
+const SYNC_INDEX_FILE_LIMIT = 250;
+const SYNC_INDEX_STAGE_LIMIT = 290;
+const SYNC_INDEX_MAX_BYTES = 512 * 1024 * 1024;
+const SYNC_INDEX_OBJECT_MAX_BYTES = 64 * 1024 * 1024;
+const SYNC_INDEX_STATE_KEY = 'assistantSyncIndexState';
 const SYNC_SETTINGS_KEYS = [
   'llmStreaming', 'llmEnterSend', 'llmTemperature',
   'llmMaxTokens', 'llmPromptCache', 'llmThinking', 'llmThinkingEffort',
@@ -5197,6 +5205,11 @@ function getConversationChanges() {
   const current = new Map();
   const changed = [];
   getPersistentConversations().forEach(record => {
+    const messageIds = new Set();
+    record.messages.forEach(message => {
+      if (!message.id || messageIds.has(message.id)) message.id = 'msg_' + (window.crypto?.randomUUID?.() || genId());
+      messageIds.add(message.id);
+    });
     syncEnsureMessageIds(record);
     if (!conversationBaseline.has(record.id) && record.conflictOf && !record.id.startsWith('conflict_')) {
       // Duplicating or forking a conflict copy creates an independent chat.
@@ -5217,6 +5230,10 @@ function conversationContent(conv) {
   const record = normalizeConversationRecord(conv);
   if (record.conflictTitle && record.title === record.conflictTitle + ' (conflict copy)') record.title = record.conflictTitle;
   ['id', 'createdAt', 'updatedAt', 'syncVersion', 'conflictOf', 'conflictTitle', 'shareGistId', 'shareUrl', 'shareId'].forEach(key => delete record[key]);
+  // Sync bookkeeping is not a content edit and must not replace a live request's
+  // conversation object during local persistence reconciliation.
+  delete record.messageDeletions;
+  record.messages.forEach(message => { delete message.editedAt; });
   delete record.draft.updatedAt;
   return serializeConversation(record);
 }
@@ -5391,6 +5408,7 @@ function persistConversationState(refresh = false) {
     const deletions = deletedIds.map(id => ({ id, deletedAt: Number(tombstones.conversations[id]) || now, baseline: conversationBaseline.get(id) }));
     for (const entry of changed) {
       const base = JSON.parse(entry.baseline || 'null') || entry.record;
+      syncTrackMessageChanges(entry.record, base, now);
       if (!conversationWriters.has(entry.record.id)) conversationWriters.set(entry.record.id, window.crypto?.randomUUID?.() || genId());
       const writerId = conversationWriters.get(entry.record.id);
       entry.record.syncVersion = { ...(entry.record.syncVersion || base.syncVersion) };
@@ -5463,6 +5481,12 @@ function persistConversationState(refresh = false) {
         reconciled = true;
       }
       local.syncVersion = record.syncVersion;
+      local.messageDeletions = record.messageDeletions;
+      const savedMessages = new Map(record.messages.map(message => [message.id, message]));
+      local.messages.forEach(message => {
+        const saved = savedMessages.get(message.id);
+        if (saved && syncMessageBody(message) === syncMessageBody(saved)) message.editedAt = saved.editedAt;
+      });
       local.updatedAt = Math.max(Number(local.updatedAt) || 0, Number(record.updatedAt) || 0);
     });
     const storedIds = new Set(result.records.map(record => record.id));
@@ -11525,7 +11549,7 @@ async function clearDataCategory(category) {
     await saveMemories([]);
   } else if (category === 'credentials') {
     ['llmApiKey', 'llmSearchApiKey'].forEach(key => { localStorage.removeItem(key); sessionStorage.removeItem(key); });
-    ['assistantSyncGistToken', 'assistantSyncPassphrase', 'assistantSyncGistId', 'assistantSyncSalt', 'assistantSyncLastHash', 'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, SYNC_STATE_GIST_KEY, SYNC_AUTO_PUSH_KEY, SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY].forEach(key => localStorage.removeItem(key));
+    ['assistantSyncGistToken', 'assistantSyncPassphrase', 'assistantSyncGistId', 'assistantSyncSalt', 'assistantSyncLastHash', 'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, SYNC_STATE_GIST_KEY, SYNC_AUTO_PUSH_KEY, SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY, SYNC_INDEX_STATE_KEY].forEach(key => localStorage.removeItem(key));
     ['setKey', 'setSearchApiKey', 'setupKey', 'setSyncToken', 'setSyncGistId', 'setSyncPassphrase', 'syncPairingText', 'syncPairingCode'].forEach(id => {
       const input = document.getElementById(id);
       if (input) input.value = '';
@@ -11883,7 +11907,7 @@ function syncGetConfigFromInputs() {
 
 function syncResetScopedState() {
   [SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, 'assistantSyncSalt', 'assistantSyncLastHash',
-    'assistantSyncLastPushAt', 'assistantSyncLastPullAt', 'assistantSyncLastEtag', SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY]
+    'assistantSyncLastPushAt', 'assistantSyncLastPullAt', 'assistantSyncLastEtag', SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY, SYNC_INDEX_STATE_KEY]
     .forEach(key => localStorage.removeItem(key));
 }
 
@@ -11968,7 +11992,7 @@ function syncSaveSettings(showSavedToast = true, schedule = true) {
   };
   if ((scoped && scoped !== cfg.gistId) || (!scoped && previousGistId && previousGistId !== cfg.gistId)) {
     [SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, 'assistantSyncSalt', 'assistantSyncLastHash',
-      'assistantSyncLastPushAt', 'assistantSyncLastPullAt', 'assistantSyncLastEtag', SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY].forEach(key => { values[key] = null; });
+      'assistantSyncLastPushAt', 'assistantSyncLastPullAt', 'assistantSyncLastEtag', SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY, SYNC_INDEX_STATE_KEY].forEach(key => { values[key] = null; });
   }
   if (!autoPush) values[SYNC_AUTO_PENDING_KEY] = null;
   Object.entries(values).sort((a, b) => Number(a[1] === null) - Number(b[1] === null)).forEach(([key, after]) => {
@@ -12060,7 +12084,7 @@ function syncRenderIndicator() {
 function setSyncBusy(busy) {
   const panel = document.getElementById('settingsTab-sync');
   if (panel) panel.setAttribute('aria-busy', String(busy));
-  for (const id of ['syncQuickButton', 'syncPullBtn', 'syncPushBtn']) {
+  for (const id of ['syncQuickButton', 'syncPullBtn', 'syncPushBtn', 'syncRetryBtn']) {
     const button = document.getElementById(id);
     if (button) button.disabled = busy;
   }
@@ -12093,6 +12117,13 @@ function renderSyncSettings() {
   const passphrase = localStorage.getItem('assistantSyncPassphrase') || '';
   const lastPush = Number(localStorage.getItem('assistantSyncLastPushAt') || 0);
   const lastPull = Number(localStorage.getItem('assistantSyncLastPullAt') || 0);
+  const indexState = syncIndexState();
+  const retry = document.getElementById('syncRetryBtn');
+  if (retry) retry.hidden = !(indexState.pending || indexState.cleanup?.length);
+  const capacity = document.getElementById('syncCapacity');
+  if (capacity) capacity.textContent = indexState.capacity
+    ? 'Last verified indexed backup: ' + indexState.capacity.files + '/250 published files; ' + formatCacheBytes(indexState.capacity.bytes) + ' encrypted.' +
+      (indexState.capacity.files >= 200 ? ' Capacity warning: at least 80% full.' : '') : '';
   const lastParts = [];
   if (lastPush) lastParts.push('last push ' + formatRelativeTime(lastPush));
   if (lastPull) lastParts.push('last pull ' + formatRelativeTime(lastPull));
@@ -12103,6 +12134,10 @@ function renderSyncSettings() {
     syncRenderStatus();
   } else if (!gistId) {
     syncSetStatus('unknown', 'Ready to create', 'Push now will create a private encrypted Gist.');
+  } else if (indexState.pending) {
+    syncSetStatus('dirty', indexState.pending === 'pull' ? 'Pull incomplete' : 'Backup incomplete', 'Unfinished work is saved on this device. Retry resumes verified parts. Pull runs only when clicked.', indexState.pending);
+  } else if (indexState.cleanup?.length) {
+    syncSetStatus('current', 'Backed up; cleanup pending', 'The complete backup is published. Retry removes superseded remote parts.', 'push');
   } else {
     syncSetStatus('unknown', 'Backup ready', 'Gist ' + gistId + (lastParts.length ? ' | ' + lastParts.join(' | ') : '') + '. Remote changes are applied only by Pull now.');
   }
@@ -12282,7 +12317,7 @@ async function syncReadManifest(gist, token) {
   const hasLegacyChats = Object.keys(gist?.files || {}).some(name => /^conv_.+\.json\.enc$/.test(name));
   if (gist?.files?.['manifest.json']) {
     const manifest = JSON.parse(await syncGetGistFileContent(gist, 'manifest.json', token));
-    if (manifest?.app === 'Synapse' && ['gist-sync-v1', 'gist-sync-v2', 'gist-sync-v3'].includes(manifest.schema)) return manifest;
+    if (manifest?.app === 'Synapse' && ['gist-sync-v1', 'gist-sync-v2', 'gist-sync-v3', SYNC_INDEX_SCHEMA].includes(manifest.schema)) return manifest;
     throw new Error('Unsupported sync format. Update Synapse on this device before syncing.');
   }
   if (hasLegacyChats) return { app: 'Synapse', schema: 'gist-sync-v1', version: 1 };
@@ -12323,6 +12358,28 @@ function syncEnsureMessageIds(conversation) {
     }
   });
   return conversation;
+}
+
+function syncMessageBody(message) {
+  const { editedAt, _editing, ...body } = message;
+  return serializeConversation(body);
+}
+
+function syncTrackMessageChanges(record, baseline, now) {
+  const previous = new Map((baseline.messages || []).map(message => [message.id, message]));
+  const present = new Set(record.messages.map(message => message.id));
+  record.messageDeletions = { ...(baseline.messageDeletions || {}), ...(record.messageDeletions || {}) };
+  for (const message of record.messages) {
+    const old = previous.get(message.id);
+    if (old && syncMessageBody(old) !== syncMessageBody(message)) {
+      message.editedAt = Math.max(now, (Number(old.editedAt) || 0) + 1);
+    } else if (!Number(message.editedAt)) {
+      message.editedAt = Number(old?.editedAt) || Number(message.timestamp) || Number(record.createdAt) || now;
+    }
+  }
+  for (const [id, message] of previous) {
+    if (!present.has(id)) record.messageDeletions[id] = Math.max(now, (Number(message.editedAt) || 0) + 1, Number(record.messageDeletions[id]) || 0);
+  }
 }
 
 function syncMergeConversationRecords(records) {
@@ -12370,7 +12427,7 @@ function syncNormalizeConversation(conv) {
   return normalizeConversationRecord(conv && typeof conv === 'object' ? syncCloneJson(conv) : {});
 }
 
-// Sync carries text, never raw pixels: data URLs larger than this stay on their
+// Legacy archive sync carries text: data URLs larger than this stay on their
 // device. Extracted file text still syncs, and every pull restores local blobs
 // over stripped copies, so a device never wipes its own images.
 const SYNC_INLINE_BLOB_MAX_BYTES = 256 * 1024;
@@ -12717,6 +12774,7 @@ async function syncReadRemoteConversations(gist, manifest, passphrase, keyCache 
 }
 
 async function syncReadRemoteData(gist, manifest, passphrase) {
+  if (manifest.schema === SYNC_INDEX_SCHEMA) return syncIndexRemoteData(gist, manifest, passphrase);
   if (syncGistSize(gist.files) > 2 * SYNC_ARCHIVE_MAX_BYTES) throw new Error('This sync archive exceeds the 64 MiB read limit. Keep it and its passphrase for recovery; no local data was changed.');
   const keyCache = {};
   const decryptFile = async filename => syncDecryptPayload(
@@ -12961,6 +13019,520 @@ async function syncBuildGistFiles(passphrase, existingManifest = null, merged = 
     conversationCount: payload.conversations.length, hash: await syncSha256Hex({ ...payload, updatedAt: 0 }) };
 }
 
+// Indexed backups use immutable, content-addressed parts. Only the encrypted index
+// is replaced. A failed stage therefore cannot invalidate the published backup.
+function syncIndexEmpty() {
+  return { app: 'Synapse', schema: SYNC_INDEX_SCHEMA, revision: '', conversations: {},
+    projects: {}, memories: {}, settings: null, assets: {}, nameKey: syncBytesToBase64(syncRandomBytes(32)), tombstones: syncNormalizeTombstones({}) };
+}
+
+function syncIndexState() {
+  try {
+    const state = JSON.parse(localStorage.getItem(SYNC_INDEX_STATE_KEY) || 'null');
+    if (state?.gistId === syncGetStoredConfig().gistId) return state;
+  } catch (e) {}
+  return { gistId: syncGetStoredConfig().gistId, receipts: {}, staged: [], cleanup: [], pending: '' };
+}
+
+function syncIndexSaveState(state) {
+  localStorage.setItem(SYNC_INDEX_STATE_KEY, JSON.stringify(state));
+}
+
+async function syncIndexLocalHash(record) {
+  const { syncVersion, ...content } = record;
+  return syncSha256Hex(JSON.parse(serializeConversation(content)));
+}
+
+function syncIndexReferences(index) {
+  const references = new Map();
+  const add = descriptor => {
+    if (!descriptor) return;
+    for (const part of descriptor.parts || []) references.set(part.name, part);
+  };
+  for (const category of ['conversations', 'projects', 'memories', 'assets']) Object.values(index[category] || {}).forEach(add);
+  add(index.settings);
+  return references;
+}
+
+function syncIndexValidate(index) {
+  const invalid = () => { throw new Error('Invalid encrypted backup index. No local data was changed.'); };
+  if (index?.app !== 'Synapse' || index.schema !== SYNC_INDEX_SCHEMA || typeof index.revision !== 'string' ||
+      typeof index.nameKey !== 'string' || !/^[A-Za-z0-9+/]{43}=$/.test(index.nameKey)) invalid();
+  const hash = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+  const descriptor = value => {
+    if (!value || !hash(value.hash) || !Array.isArray(value.parts) || !value.parts.length || value.parts.length > SYNC_INDEX_FILE_LIMIT) invalid();
+    for (const part of value.parts) {
+      if (!/^synapse-part-[a-f0-9]{64}\.json\.enc$/.test(part?.name || '') || !hash(part.hash) ||
+          !Number.isSafeInteger(part.bytes) || part.bytes < 1 || part.bytes > 1024 * 1024) invalid();
+    }
+    if (!Array.isArray(value.attachments || [])) invalid();
+    for (const attachment of value.attachments || []) {
+      if (!hash(attachment?.hash) || !Array.isArray(attachment.path) || !attachment.path.length ||
+          attachment.path.some(key => !(typeof key === 'string' || Number.isSafeInteger(key)) || ['__proto__', 'constructor', 'prototype'].includes(String(key))) ||
+          !Object.hasOwn(index.assets || {}, attachment.hash)) invalid();
+    }
+  };
+  for (const category of ['conversations', 'projects', 'memories', 'assets']) {
+    if (!index[category] || typeof index[category] !== 'object' || Array.isArray(index[category])) invalid();
+    for (const [id, value] of Object.entries(index[category])) {
+      if (!id || ['__proto__', 'constructor', 'prototype'].includes(id)) invalid();
+      descriptor(value);
+    }
+  }
+  if (index.settings) descriptor(index.settings);
+  const refs = syncIndexReferences(index);
+  if (refs.size + 2 > SYNC_INDEX_FILE_LIMIT || [...refs.values()].reduce((sum, part) => sum + part.bytes, 0) > SYNC_INDEX_MAX_BYTES) invalid();
+  return index;
+}
+
+async function syncIndexRead(gist, manifest, passphrase) {
+  if (gist.truncated || manifest.schema !== SYNC_INDEX_SCHEMA || syncGistSize(gist.files) > SYNC_INDEX_MAX_BYTES) {
+    throw new Error('The indexed backup is incomplete or exceeds its read safeguard. No data was changed.');
+  }
+  const content = await syncGetGistFileContent(gist, SYNC_INDEX_FILE);
+  if (new TextEncoder().encode(content).byteLength > 1024 * 1024) throw new Error('Backup index is too large. No data was changed.');
+  return syncIndexValidate(await syncDecryptPayload(content, passphrase));
+}
+
+async function syncIndexReadObject(descriptor, gist, passphrase, keyCache = {}, objects = new Map()) {
+  if (objects.has(descriptor.hash)) return syncCloneJson(objects.get(descriptor.hash));
+  let json = '';
+  let bytes = 0;
+  for (const part of descriptor.parts) {
+    const cacheKey = 'syncPart:' + gist.id + ':' + part.name;
+    let content = (await idbGet('meta', cacheKey))?.value;
+    if (!content || await syncSha256Hex(content) !== part.hash) {
+      content = await syncGetGistFileContent(gist, part.name);
+      if (new TextEncoder().encode(content).byteLength !== part.bytes || await syncSha256Hex(content) !== part.hash) {
+        throw new Error('Backup part failed integrity verification: ' + part.name + '. Retry; nothing was applied.');
+      }
+      await idbPut('meta', { key: cacheKey, value: content });
+    }
+    const payload = await syncDecryptPayload(content, passphrase, keyCache);
+    if (payload?.schema !== 'gist-sync-part-v4' || typeof payload.text !== 'string') throw new Error('Invalid backup part. Nothing was applied.');
+    bytes += new TextEncoder().encode(payload.text).byteLength;
+    if (bytes > SYNC_INDEX_OBJECT_MAX_BYTES) throw new Error('A backup object exceeds the 64 MiB read safeguard. Nothing was applied.');
+    json += payload.text;
+  }
+  const value = JSON.parse(json);
+  if (await syncSha256Hex(value) !== descriptor.hash) throw new Error('Backup object failed integrity verification. Nothing was applied.');
+  objects.set(descriptor.hash, value);
+  return syncCloneJson(value);
+}
+
+async function syncIndexHydrate(descriptor, index, gist, passphrase, keyCache = {}, objects = new Map()) {
+  const value = await syncIndexReadObject(descriptor, gist, passphrase, keyCache, objects);
+  for (const attachment of descriptor.attachments || []) {
+    let slot = value;
+    for (const key of attachment.path.slice(0, -1)) {
+      if (!slot || !Object.hasOwn(slot, key)) throw new Error('Invalid backup attachment path. Nothing was applied.');
+      slot = slot[key];
+    }
+    const key = attachment.path[attachment.path.length - 1];
+    if (!slot || !Object.hasOwn(slot, key) || slot[key] !== null) throw new Error('Invalid backup attachment slot. Nothing was applied.');
+    slot[key] = await syncIndexReadObject(index.assets[attachment.hash], gist, passphrase, keyCache, objects);
+    if (typeof slot[key] !== 'string' || !/^data:/i.test(slot[key])) throw new Error('Invalid backup attachment. Nothing was applied.');
+  }
+  return value;
+}
+
+async function syncIndexPack(value, context, files) {
+  const json = JSON.stringify(value);
+  if (new TextEncoder().encode(json).byteLength > SYNC_INDEX_OBJECT_MAX_BYTES) throw new Error('A backup object exceeds the 64 MiB safeguard. Its previous backup was retained.');
+  const parts = [];
+  for (let offset = 0; offset < json.length;) {
+    let length = Math.min(SYNC_INDEX_PART_CHARS, json.length - offset);
+    let text = json.slice(offset, offset + length);
+    while (new TextEncoder().encode(JSON.stringify({ text })).byteLength > 512 * 1024) {
+      length = Math.floor(length / 2);
+      text = json.slice(offset, offset + length);
+    }
+    const payload = { app: 'Synapse', schema: 'gist-sync-part-v4', text };
+    // The naming secret lives inside the encrypted index: public filenames do
+    // not expose plaintext hashes of familiar images or guessable short content.
+    const signature = await window.crypto.subtle.sign('HMAC', context.nameKey, new TextEncoder().encode(context.writer + ':' + await syncSha256Hex(payload)));
+    const name = 'synapse-part-' + Array.from(new Uint8Array(signature)).map(byte => byte.toString(16).padStart(2, '0')).join('') + '.json.enc';
+    if (!files.has(name)) files.set(name, { content: await syncEncryptPayloadWithKey(payload, context), payload });
+    const content = files.get(name).content;
+    parts.push({ name, hash: await syncSha256Hex(content), bytes: new TextEncoder().encode(content).byteLength });
+    offset += length;
+  }
+  return { hash: await syncSha256Hex(value), parts };
+}
+
+async function syncIndexEncode(record, index, context, files) {
+  const value = syncCloneJson(record);
+  const slots = [];
+  const visit = (item, path = []) => {
+    if (!item || typeof item !== 'object') return;
+    for (const key of Object.keys(item)) {
+      const next = [...path, Array.isArray(item) ? Number(key) : key];
+      if (typeof item[key] === 'string' && /^blob:/i.test(item[key])) {
+        throw new Error('A temporary attachment URL cannot be backed up. Reattach that file; the previous complete backup was retained.');
+      }
+      if (typeof item[key] === 'string' && /^data:/i.test(item[key])) {
+        slots.push({ path: next, value: item[key] });
+        item[key] = null;
+      } else visit(item[key], next);
+    }
+  };
+  visit(value);
+  const attachments = [];
+  for (const slot of slots) {
+    const hash = await syncSha256Hex(slot.value);
+    if (!Object.hasOwn(index.assets, hash)) index.assets[hash] = await syncIndexPack(slot.value, context, files);
+    attachments.push({ path: slot.path, hash });
+  }
+  return { ...await syncIndexPack(value, context, files), attachments };
+}
+
+function syncIndexMergeConversation(local, remote, metadata = local) {
+  const merged = syncCloneJson(metadata || local || remote);
+  const messages = new Map();
+  const deletions = {};
+  const versions = {};
+  // Remote first: retain known ordering for messages without timestamps.
+  for (const record of [remote, local].filter(Boolean)) {
+    for (const [id, count] of Object.entries(record.syncVersion || {})) versions[id] = Math.max(Number(versions[id]) || 0, Number(count) || 0);
+    for (const [id, time] of Object.entries(record.messageDeletions || {})) {
+      if (Number.isFinite(Number(time)) && Number(time) > 0) deletions[id] = Math.max(Number(deletions[id]) || 0, Number(time));
+    }
+    syncEnsureMessageIds(record);
+    for (const message of record.messages) {
+      const previous = messages.get(message.id);
+      const time = Number(message.editedAt) || Number(message.timestamp) || Number(record.createdAt) || 0;
+      const previousTime = Number(previous?.editedAt) || Number(previous?.timestamp) || 0;
+      if (!previous || time > previousTime || (time === previousTime && syncMessageBody(message) > syncMessageBody(previous))) {
+        messages.set(message.id, { ...syncCloneJson(message), editedAt: time });
+      }
+    }
+  }
+  merged.messages = [...messages.values()].filter(message => !Object.hasOwn(deletions, message.id) || Number(deletions[message.id]) < Number(message.editedAt))
+    .sort((a, b) => (Number(a.timestamp) || Number(a.editedAt) || 0) - (Number(b.timestamp) || Number(b.editedAt) || 0));
+  merged.messageDeletions = deletions;
+  merged.syncVersion = versions;
+  merged.updatedAt = Math.max(Number(local?.updatedAt) || 0, Number(remote?.updatedAt) || 0);
+  return merged;
+}
+
+async function syncIndexRemoteData(gist, manifest, passphrase) {
+  const index = await syncIndexRead(gist, manifest, passphrase);
+  const selection = syncReadSelection();
+  const keyCache = {};
+  const objects = new Map();
+  const data = { index, capacity: { files: syncIndexReferences(index).size + 2, bytes: syncGistSize(Object.fromEntries([...syncIndexReferences(index).keys(), SYNC_INDEX_FILE, 'manifest.json'].map(name => [name, gist.files[name]]))) },
+    tombstones: index.tombstones, settingsState: { settings: {}, revisions: {} }, conversations: [], projects: [], memories: [] };
+  const state = syncIndexState();
+  state.pullPending = true;
+  state.pending = 'pull';
+  syncIndexSaveState(state);
+  if (selection.settings && index.settings) data.settingsState = await syncIndexHydrate(index.settings, index, gist, passphrase, keyCache, objects);
+  for (const category of ['conversations', 'projects', 'memories']) {
+    if (!selection[category]) continue;
+    for (const [id, descriptor] of Object.entries(index[category])) {
+      if (category === 'conversations' && !syncConversationIsEnabled(id)) continue;
+      const record = await syncIndexHydrate(descriptor, index, gist, passphrase, keyCache, objects);
+      if (!record || record.id !== id || (category === 'conversations' && !Array.isArray(record.messages))) throw new Error('Backup record does not match its index. Nothing was applied.');
+      if (category === 'conversations' && (new Set(record.messages.map(message => message?.id)).size !== record.messages.length ||
+          record.messages.some(message => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(String(message?.id || ''))))) {
+        throw new Error('Backup contains invalid or duplicate message IDs. Nothing was applied.');
+      }
+      data[category].push(record);
+    }
+  }
+  return data;
+}
+
+async function syncIndexPruneCache(gistId, index) {
+  // Delete only disposable encrypted download caches, never conversations or
+  // attachment source data. A key cursor avoids loading large cached values.
+  const prefix = 'syncPart:' + gistId + ':';
+  const keep = syncIndexReferences(index);
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('meta', 'readwrite');
+      const store = tx.objectStore('meta');
+      const request = store.openKeyCursor();
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        const key = String(cursor.key);
+        if (key.startsWith('syncPart:') && (!key.startsWith(prefix) || !keep.has(key.slice(prefix.length)))) store.delete(cursor.key);
+        cursor.continue();
+      };
+      tx.oncomplete = resolve;
+      tx.onerror = tx.onabort = () => reject(tx.error || new Error('Download cache cleanup failed.'));
+    });
+  } catch (error) { console.warn('Backup saved; disposable download cache cleanup pending:', error); }
+}
+
+async function syncIndexCleanup(gist, index, cfg, state) {
+  const live = syncIndexReferences(index);
+  const candidates = (state.cleanup || []).filter(name => /^synapse-part-[a-f0-9]{64}\.json\.enc$/.test(name) && !live.has(name));
+  if (!candidates.length) { state.cleanup = []; syncIndexSaveState(state); return false; }
+  const url = SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId);
+  try {
+    const latest = await fetchGist(url, { cache: 'no-store' }, cfg.token);
+    const current = await syncIndexRead(latest, await syncReadManifest(latest, cfg.token), cfg.passphrase);
+    const protectedFiles = syncIndexReferences(current);
+    const removals = Object.fromEntries(candidates.filter(name => latest.files[name] && !protectedFiles.has(name)).map(name => [name, null]));
+    if (Object.keys(removals).length) {
+      await syncIndexWrite(url, { files: removals }, cfg.token);
+      const verified = await fetchGist(url, { cache: 'no-store' }, cfg.token);
+      if (Object.keys(removals).some(name => verified.files[name])) throw new Error('Old backup parts are still present.');
+    }
+    state.cleanup = [];
+    syncIndexSaveState(state);
+    return false;
+  } catch (error) {
+    console.warn('Indexed backup is complete; cleanup pending:', error);
+    syncIndexSaveState(state);
+    return true;
+  }
+}
+
+let _syncIndexLastWrite = 0;
+async function syncIndexWrite(url, body, token, method = 'PATCH') {
+  // Gist content writes have much tighter secondary limits than reads.
+  const delay = Math.max(0, 1200 - (Date.now() - _syncIndexLastWrite));
+  if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+  _syncIndexLastWrite = Date.now();
+  try {
+    return await fetchGist(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, token);
+  } catch (error) {
+    if (/rate limit|429|403/i.test(error.message || '')) throw new Error('GitHub paused backup writes. Wait a few minutes, then Retry; verified parts will be reused. ' + error.message);
+    throw error;
+  }
+}
+
+async function syncIndexPush(cfg, local, selection, auto, existingGist = null, existingManifest = null) {
+  let state = syncIndexState();
+  let gist = existingGist;
+  let manifest = existingManifest;
+  let index;
+  try {
+    syncSetStatus('checking', 'Backing up…', 'Preparing an indexed backup. Remote changes will not be applied locally.', 'push');
+    if (!gist) {
+      const context = await syncBuildCryptoContext(cfg.passphrase);
+      index = syncIndexEmpty();
+      index.revision = window.crypto.randomUUID();
+      manifest = { app: 'Synapse', schema: SYNC_INDEX_SCHEMA, version: 4, salt: context.saltBase64 };
+      gist = await syncIndexWrite(SYNC_GIST_API_URL, { description: 'Synapse encrypted indexed backup', public: false, files: {
+        'manifest.json': { content: JSON.stringify(manifest) },
+        [SYNC_INDEX_FILE]: { content: await syncEncryptPayloadWithKey(index, context) }
+      } }, cfg.token, 'POST');
+      cfg.gistId = gist.id;
+      if (!cfg.gistId) throw new Error('GitHub did not return the new backup ID.');
+      const gistEl = document.getElementById('setSyncGistId');
+      if (gistEl) gistEl.value = cfg.gistId;
+      localStorage.setItem('assistantSyncGistId', cfg.gistId);
+      localStorage.setItem(SYNC_STATE_GIST_KEY, cfg.gistId);
+      state = { gistId: cfg.gistId, receipts: {}, staged: [], cleanup: [], pending: 'push' };
+      syncIndexSaveState(state);
+      gist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+    }
+    index = await syncIndexRead(gist, manifest, cfg.passphrase);
+    if (state.cleanup?.length) {
+      await syncIndexCleanup(gist, index, cfg, state);
+      gist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+      index = await syncIndexRead(gist, manifest, cfg.passphrase);
+    }
+    const original = syncCloneJson(index);
+    const oldReferences = syncIndexReferences(original);
+    const context = await syncBuildCryptoContext(cfg.passphrase, manifest.salt);
+    context.nameKey = await window.crypto.subtle.importKey('raw', syncBase64ToBytes(index.nameKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    // Different devices must not stage different ciphertext under the same name.
+    // This ID survives reloads so this device can still resume its own stages.
+    state.writer = state.writer || window.crypto.randomUUID();
+    context.writer = state.writer;
+    const files = new Map();
+    const objects = new Map();
+    const keyCache = {};
+    const receipts = { ...(state.receipts || {}) };
+    let explicitlyDeleted = 0;
+    state.pushPending = true;
+    state.pending = 'push';
+    syncIndexSaveState(state);
+    index.tombstones = syncMergeTombstones(index.tombstones, local.tombstones);
+    for (const category of ['conversations', 'memories', 'projects']) {
+      if (!selection[category]) continue;
+      for (const id of Object.keys(index.tombstones[category])) delete index[category][id];
+      for (const record of local[category] || []) {
+        if (Object.hasOwn(index.tombstones[category], record.id)) { explicitlyDeleted++; continue; }
+        const receiptKey = category + ':' + record.id;
+        const hash = await syncIndexLocalHash(record);
+        if (receipts[receiptKey] === hash && index[category][record.id]) continue;
+        let outgoing = record;
+        if (category === 'conversations' && index[category][record.id]) {
+          const remote = await syncIndexHydrate(index[category][record.id], index, gist, cfg.passphrase, keyCache, objects);
+          const titleHash = await syncSha256Hex({ value: record.title });
+          const metadata = receipts['conversationTitle:' + record.id] === titleHash ? { ...record, title: remote.title } : record;
+          outgoing = syncIndexMergeConversation(record, remote, metadata);
+        }
+        index[category][record.id] = await syncIndexEncode(outgoing, index, context, files);
+        receipts[receiptKey] = hash;
+        if (category === 'conversations') receipts['conversationTitle:' + record.id] = await syncSha256Hex({ value: record.title });
+      }
+    }
+    if (selection.settings) {
+      const settings = index.settings ? await syncIndexHydrate(index.settings, index, gist, cfg.passphrase, keyCache, objects) : { settings: {}, revisions: {} };
+      let settingsChanged = !index.settings;
+      for (const key of SYNC_SETTINGS_KEYS) {
+        const value = Object.hasOwn(local.settingsState.settings, key) ? local.settingsState.settings[key] : null;
+        const hash = await syncSha256Hex({ value });
+        if (receipts['settings:' + key] === hash) continue;
+        // An unconfigured new device must not erase another device's preferences.
+        if (value === null && !Object.hasOwn(receipts, 'settings:' + key)) {
+          receipts['settings:' + key] = hash;
+          continue;
+        }
+        if (Object.hasOwn(settings.settings, key) && settings.settings[key] === value) {
+          receipts['settings:' + key] = hash;
+          continue;
+        }
+        settings.settings[key] = value;
+        settings.revisions[key] = Number(local.settingsState.revisions[key]) || 1;
+        receipts['settings:' + key] = hash;
+        settingsChanged = true;
+      }
+      if (settingsChanged) index.settings = await syncIndexEncode(settings, index, context, files);
+    }
+    const usedAssets = new Set();
+    for (const category of ['conversations', 'projects', 'memories']) {
+      Object.values(index[category]).forEach(descriptor => (descriptor.attachments || []).forEach(slot => usedAssets.add(slot.hash)));
+    }
+    (index.settings?.attachments || []).forEach(slot => usedAssets.add(slot.hash));
+    for (const hash of Object.keys(index.assets)) if (!usedAssets.has(hash)) delete index.assets[hash];
+    // Reuse earlier verified stages, including stages from an interrupted push.
+    for (const category of ['conversations', 'projects', 'memories', 'assets']) {
+      for (const descriptor of Object.values(index[category])) await syncIndexReuseParts(descriptor, gist, files, cfg.passphrase, keyCache);
+    }
+    if (index.settings) await syncIndexReuseParts(index.settings, gist, files, cfg.passphrase, keyCache);
+    const references = syncIndexReferences(index);
+    const unchanged = serializeConversation(index) === serializeConversation(original);
+    if (!unchanged) index.revision = window.crypto.randomUUID();
+    const indexContent = await syncEncryptPayloadWithKey(index, context);
+    const indexBytes = new TextEncoder().encode(indexContent).byteLength;
+    const manifestBytes = new TextEncoder().encode(await syncGetGistFileContent(gist, 'manifest.json')).byteLength;
+    const previousIndexBytes = Number(gist.files[SYNC_INDEX_FILE]?.size) || new TextEncoder().encode(await syncGetGistFileContent(gist, SYNC_INDEX_FILE)).byteLength;
+    const publishedBytes = [...references.values()].reduce((sum, part) => sum + part.bytes, 0) + indexBytes + manifestBytes;
+    const additions = [...references.keys()].filter(name => !gist.files[name]);
+    const stageBytes = additions.reduce((sum, name) => sum + references.get(name).bytes, 0);
+    const stagingBytes = syncGistSize(gist.files) + stageBytes + Math.max(0, indexBytes - previousIndexBytes);
+    if (references.size + 2 > SYNC_INDEX_FILE_LIMIT || indexBytes > 1024 * 1024 || publishedBytes > SYNC_INDEX_MAX_BYTES ||
+        Object.keys(gist.files).length + additions.length > SYNC_INDEX_STAGE_LIMIT || stagingBytes > SYNC_INDEX_MAX_BYTES) {
+      throw new Error('Backup capacity reached: ' + (references.size + 2) + '/250 published files; ' + (Object.keys(gist.files).length + additions.length) + '/290 staging files; ' +
+        formatCacheBytes(publishedBytes) + '/512 MiB published; ' + formatCacheBytes(stagingBytes) + '/512 MiB staging; ' + formatCacheBytes(indexBytes) + '/1 MiB index. No new version was published. Reduce selected data or start a fresh Gist; previous backups remain intact.');
+    }
+    syncIndexValidate(index);
+    const url = SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId);
+    state.staged = [...new Set([...(state.staged || []), ...additions])];
+    syncIndexSaveState(state);
+    for (let start = 0; start < additions.length; start += 6) {
+      const batch = additions.slice(start, start + 6);
+      syncSetStatus('checking', 'Backing up…', 'Uploading parts ' + (start + 1) + '–' + Math.min(start + 6, additions.length) + ' of ' + additions.length + '. Previous published data remains usable.', 'push');
+      await syncIndexWrite(url, { files: Object.fromEntries(batch.map(name => [name, { content: files.get(name).content }])) }, cfg.token);
+    }
+    let verified = await fetchGist(url, { cache: 'no-store' }, cfg.token);
+    for (const [name, part] of references) {
+      if (!verified.files[name]) throw new Error('A required backup part is missing. Retry to resume.');
+      const content = await syncGetGistFileContent(verified, name);
+      if (new TextEncoder().encode(content).byteLength !== part.bytes || await syncSha256Hex(content) !== part.hash) throw new Error('An uploaded part could not be verified. Retry to resume; the previous index is unchanged.');
+    }
+    const current = await syncIndexRead(verified, manifest, cfg.passphrase);
+    if (current.revision !== original.revision) throw new Error('Another device published during this push. Retry to merge with it; no local data was changed.');
+    const obsolete = [...oldReferences.keys(), ...(state.staged || [])].filter(name => !references.has(name));
+    state.cleanup = [...new Set([...(state.cleanup || []), ...obsolete])];
+    syncIndexSaveState(state);
+    if (!unchanged) {
+      await syncIndexWrite(url, { files: { [SYNC_INDEX_FILE]: { content: indexContent } } }, cfg.token);
+      verified = await fetchGist(url, { cache: 'no-store' }, cfg.token);
+      const published = await syncIndexRead(verified, manifest, cfg.passphrase);
+      if (serializeConversation(published) !== serializeConversation(index)) throw new Error('The published index could not be confirmed. Retry safely; keep this Gist ID.');
+    }
+    state.receipts = receipts;
+    state.staged = [];
+    state.pushPending = false;
+    state.pending = state.pullPending ? 'pull' : '';
+    state.capacity = { files: references.size + 2, bytes: publishedBytes };
+    syncIndexSaveState(state);
+    const cleanupPending = await syncIndexCleanup(verified, index, cfg, state);
+    if (!state.pullPending) await syncIndexPruneCache(cfg.gistId, index);
+    localStorage.setItem('assistantSyncLastPushAt', String(Date.now()));
+    localStorage.setItem('assistantSyncSalt', manifest.salt);
+    renderSyncSettings();
+    const pending = localStorage.getItem(SYNC_AUTO_PENDING_KEY) === 'true';
+    syncSetStatus(pending ? 'dirty' : 'current', pending ? 'Backup pending' : cleanupPending ? 'Backed up; cleanup pending' : 'Backed up',
+      (unchanged ? 'No changed content needed publishing. ' : 'Complete encrypted backup verified. ') +
+      (references.size + 2) + '/250 files, ' + formatCacheBytes(publishedBytes) + ' encrypted.' +
+      (references.size + 2 >= 200 ? ' Capacity warning: backup is at least 80% full.' : '') +
+      (cleanupPending ? ' Previous parts remain; Push now retries cleanup.' : '') +
+      (explicitlyDeleted ? ' ' + explicitlyDeleted + ' local records have explicit deletion records and were not republished.' : '') +
+      (pending ? ' Newer local changes are waiting.' : '') + ' Pull remains manual.', 'push');
+    if (!auto) showToast(cleanupPending ? 'Backup complete; cleanup will be retried.' : 'Sync push complete.', 'success');
+    return true;
+  } catch (error) {
+    state.pushPending = true;
+    state.pending = 'push';
+    try { syncIndexSaveState(state); } catch (storageError) { console.warn('Could not persist backup retry state:', storageError); }
+    const retry = document.getElementById('syncRetryBtn');
+    if (retry) retry.hidden = false;
+    syncSetStatus('dirty', 'Backup incomplete', (error.name === 'OperationError' ? 'Could not decrypt the indexed backup. Check the passphrase.' : error.message) + (cfg.gistId ? ' Gist ID: ' + cfg.gistId + '.' : '') + ' Push now retries unfinished work; no remote data was applied locally.', 'push');
+    if (!auto) showToast('Backup incomplete: ' + error.message, 'error', 6000);
+    return false;
+  }
+}
+
+async function syncIndexReuseParts(descriptor, gist, files, passphrase, keyCache) {
+  for (const part of descriptor.parts) {
+    if (!files.has(part.name) || !gist.files[part.name]) continue;
+    const content = await syncGetGistFileContent(gist, part.name);
+    const payload = await syncDecryptPayload(content, passphrase, keyCache);
+    if (await syncSha256Hex(payload) !== await syncSha256Hex(files.get(part.name).payload)) throw new Error('A staged part failed verification. Previous backup retained.');
+    part.hash = await syncSha256Hex(content);
+    part.bytes = new TextEncoder().encode(content).byteLength;
+    files.set(part.name, { content, payload });
+  }
+}
+
+function syncIndexMergeLists(localList, remoteList, tombstones, conversations = false) {
+  const byId = new Map((localList || []).map(record => [record.id, record]));
+  for (const record of remoteList || []) {
+    byId.set(record.id, conversations ? syncIndexMergeConversation(byId.get(record.id), record, record) : record);
+  }
+  for (const id of Object.keys(tombstones || {})) byId.delete(id);
+  return [...byId.values()];
+}
+
+async function syncIndexPullState(remote, selection, merged) {
+  const state = syncIndexState();
+  state.receipts = { ...(state.receipts || {}) };
+  for (const category of ['conversations', 'projects', 'memories']) {
+    if (!selection[category]) continue;
+    const saved = new Map(merged[category].map(record => [record.id, record]));
+    for (const record of remote[category] || []) {
+      const local = saved.get(record.id);
+      if (!local) continue;
+      if (category === 'conversations') state.receipts['conversationTitle:' + record.id] = await syncSha256Hex({ value: record.title });
+      // A merged local-only message is still pending upload after Pull.
+      const normalizedRemote = category === 'conversations' ? syncNormalizeConversation(syncIndexMergeConversation(null, record, record)) : record;
+      if (await syncIndexLocalHash(local) === await syncIndexLocalHash(normalizedRemote)) state.receipts[category + ':' + record.id] = await syncIndexLocalHash(local);
+    }
+  }
+  if (selection.settings) {
+    const settings = syncNormalizeSettingsPayload(remote.settingsState).settings;
+    for (const [key, value] of Object.entries(settings)) state.receipts['settings:' + key] = await syncSha256Hex({ value });
+  }
+  state.pullPending = false;
+  state.pending = state.pushPending ? 'push' : '';
+  if (remote.capacity) state.capacity = remote.capacity;
+  return state;
+}
+
+function syncRetry() {
+  return syncIndexState().pending === 'pull' ? syncPullFromGist({ force: true }) : syncPushToGist();
+}
+
 async function syncPushToGist(options = {}) {
   const auto = options.auto === true;
   if (readOnlyShare) return false;
@@ -13003,6 +13575,31 @@ async function syncPushToGist(options = {}) {
     await loadMemories();
     const settingsState = selection.settings ? syncCollectSettingsState() : { settings: {}, revisions: {} };
     const local = syncSelectData({ ...await syncCapturePullSnapshot(), settingsState }, selection);
+    let pairedGist = null;
+    let pairedManifest = null;
+    if (cfg.gistId) {
+      pairedGist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+      pairedManifest = await syncReadManifest(pairedGist, cfg.token);
+    }
+    if (!cfg.gistId || pairedManifest?.schema === SYNC_INDEX_SCHEMA) {
+      const run = async () => {
+        // Refresh inside the same-browser lock: a different tab may have finished
+        // publishing after the format check above. This never applies remote data.
+        const currentConfig = syncGetStoredConfig();
+        if (currentConfig.gistId !== cfg.gistId || currentConfig.passphrase !== cfg.passphrase) throw new Error('Sync pairing changed in another tab. Retry using the current pairing; nothing was uploaded.');
+        if (cfg.gistId) {
+          pairedGist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+          pairedManifest = await syncReadManifest(pairedGist, cfg.token);
+          if (pairedManifest.schema !== SYNC_INDEX_SCHEMA) throw new Error('The remote backup format changed. Nothing was uploaded.');
+        }
+        return syncIndexPush(cfg, local, selection, auto, pairedGist, pairedManifest);
+      };
+      succeeded = navigator.locks ? await navigator.locks.request('synapse-index-push:' + (cfg.gistId || 'new'), { ifAvailable: true }, lock => {
+        if (!lock) throw new Error('Another tab is backing up this Gist. Wait for it to finish, then retry.');
+        return run();
+      }) : await run();
+      return succeeded;
+    }
     let storedSyncHashes = { conversations: {}, metadata: '' };
     try {
       const rawSyncHashes = JSON.parse(localStorage.getItem(SYNC_CONV_HASHES_KEY) || 'null');
@@ -13049,8 +13646,8 @@ async function syncPushToGist(options = {}) {
     let checkpointRemoved = 0;
     if (cfg.gistId) {
       const url = SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId);
-      const gist = await fetchGist(url, { cache: 'no-store' }, cfg.token);
-      const existingManifest = await syncReadManifest(gist, cfg.token);
+      const gist = pairedGist;
+      const existingManifest = pairedManifest;
       const remote = await syncReadRemoteData(gist, existingManifest, cfg.passphrase);
       built = await syncBuildGistFiles(cfg.passphrase, existingManifest, local);
       unchanged = remote.archive.snapshotHashes.has(built.hash);
@@ -13140,21 +13737,6 @@ async function syncPushToGist(options = {}) {
         }
         }
       }
-    } else {
-      built = await syncBuildGistFiles(cfg.passphrase, null, local);
-      const gist = await fetchGist(SYNC_GIST_API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ description: 'Synapse encrypted sync data', public: false, files: built.files })
-      }, cfg.token);
-      cfg.gistId = gist.id;
-      uploaded = true;
-      const gistEl = document.getElementById('setSyncGistId');
-      if (gistEl) gistEl.value = cfg.gistId;
-      localStorage.setItem('assistantSyncGistId', cfg.gistId);
-      localStorage.setItem(SYNC_STATE_GIST_KEY, cfg.gistId);
-      const verified = await syncReadArchiveUpdates(await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token), cfg.passphrase);
-      if (verified.hashes.get(built.filename) !== await syncSha256Hex(built.payload)) throw new Error('The new sync Gist could not be verified. Keep its ID and retry.');
     }
 
     localStorage.setItem('assistantSyncSalt', built.manifest.salt);
@@ -13380,7 +13962,7 @@ async function syncCapturePullSnapshot() {
   const localProjects = serializeConversation(projects);
   const settingsValues = {};
   new Set([...SYNC_SETTINGS_KEYS, ...EXPORT_SETTING_ALLOWLIST, SYNC_SETTINGS_STATE_KEY, SYNC_TOMBSTONES_KEY,
-    SYNC_SELECTION_KEY, SYNC_CONVERSATION_SELECTION_KEY, SYNC_AUTO_PENDING_KEY, 'assistantSyncSalt', 'assistantActiveConvId', 'assistantSyncLastPullAt',
+    SYNC_SELECTION_KEY, SYNC_CONVERSATION_SELECTION_KEY, SYNC_INDEX_STATE_KEY, SYNC_AUTO_PENDING_KEY, 'assistantSyncSalt', 'assistantActiveConvId', 'assistantSyncLastPullAt',
     'assistantConversations', 'assistantMemories', 'assistantProjects']).forEach(key => { settingsValues[key] = localStorage.getItem(key); });
   const database = await new Promise((resolve, reject) => {
     const tx = db.transaction(['conversations', 'memories', 'meta'], 'readonly');
@@ -13441,6 +14023,7 @@ async function syncPullFromGist(options = {}) {
     }
     const gist = remoteResponse.data;
     const manifest = await syncReadManifest(gist, cfg.token);
+    const indexed = manifest.schema === SYNC_INDEX_SCHEMA;
     const remote = syncSelectData(await syncReadRemoteData(gist, manifest, cfg.passphrase), selection);
     if (sending || streaming || queueingFollowUp || pendingAttachmentReads > 0 || localDataOperationsInFlight > 0) {
       syncSetStatus('dirty', 'Pull cancelled', 'Local activity started. Press Pull now again when it finishes.');
@@ -13468,13 +14051,24 @@ async function syncPullFromGist(options = {}) {
     const incomingDeletionCount = (records, category, timestampKey) => records.filter(record => {
       const remoteDeletedAt = Number(remoteTombstones[category]?.[record.id]) || 0;
       const localDeletedAt = Number(snapshot.tombstones[category]?.[record.id]) || 0;
-      return remoteDeletedAt > localDeletedAt && remoteDeletedAt >= Number(record[timestampKey] || 0);
+      return indexed ? remoteDeletedAt > 0 : remoteDeletedAt > localDeletedAt && remoteDeletedAt >= Number(record[timestampKey] || 0);
     }).length;
+    const selectedLocal = syncSelectData(snapshot, selection).conversations;
+    const selectedIds = new Set(selectedLocal.map(record => record.id));
     const deletionCounts = {
       conversations: incomingDeletionCount(snapshot.conversations, 'conversations', 'updatedAt'),
       projects: incomingDeletionCount(snapshot.projects, 'projects', 'updatedAt'),
       memories: incomingDeletionCount(snapshot.memories, 'memories', 'createdAt')
     };
+    if (indexed) {
+      const remoteById = new Map(remote.conversations.map(record => [record.id, record]));
+      deletionCounts.messages = selectedLocal.reduce((sum, record) => {
+        const incoming = remoteById.get(record.id);
+        if (!incoming || remoteTombstones.conversations[record.id]) return sum;
+        const retained = new Set(syncIndexMergeConversation(record, incoming, incoming).messages.map(message => message.id));
+        return sum + record.messages.filter(message => !retained.has(message.id)).length;
+      }, 0);
+    }
     const totalDeletions = Object.values(deletionCounts).reduce((sum, count) => sum + count, 0);
     if (totalDeletions) {
       const detail = Object.entries(deletionCounts).filter(([, count]) => count).map(([name, count]) => count + ' ' + name).join(', ');
@@ -13495,21 +14089,26 @@ async function syncPullFromGist(options = {}) {
     }
 
     const liveTombstones = syncMergeTombstones(snapshot.tombstones, remoteTombstones);
-    const liveSettingsState = selection.settings ? syncMergeSettingsStates(syncCollectSettingsState(false, false), remote.settingsState) : null;
-    const liveMemories = selection.memories ? syncMergeMemoryLists(snapshot.memories, remote.memories, liveTombstones.memories) : snapshot.memories;
-    const liveProjects = selection.projects ? syncMergeProjectLists(snapshot.projects, remote.projects, liveTombstones.projects) : snapshot.projects;
-    const selectedLocal = syncSelectData(snapshot, selection).conversations;
-    const selectedIds = new Set(selectedLocal.map(record => record.id));
+    const liveSettingsState = selection.settings ? (indexed
+      ? syncNormalizeSettingsPayload({ settings: { ...syncCollectSettingsState(false, false).settings, ...remote.settingsState.settings }, revisions: remote.settingsState.revisions })
+      : syncMergeSettingsStates(syncCollectSettingsState(false, false), remote.settingsState)) : null;
+    const liveMemories = selection.memories ? (indexed ? syncIndexMergeLists(snapshot.memories, remote.memories, liveTombstones.memories) : syncMergeMemoryLists(snapshot.memories, remote.memories, liveTombstones.memories)) : snapshot.memories;
+    const liveProjects = selection.projects ? (indexed ? syncIndexMergeLists(snapshot.projects, remote.projects, liveTombstones.projects) : syncMergeProjectLists(snapshot.projects, remote.projects, liveTombstones.projects)) : snapshot.projects;
     const untouched = snapshot.conversations.filter(record => !selectedIds.has(record.id));
     const liveMerged = selection.conversations
-      ? await syncMergeConversationLists(selectedLocal, remote.conversations, liveTombstones.conversations, liveTombstones.conversationVersions, liveTombstones.conversationRoots)
+      ? (indexed ? { conversations: syncIndexMergeLists(selectedLocal, remote.conversations, liveTombstones.conversations, true), added: remote.conversations.filter(record => !selectedIds.has(record.id)).length, updated: 0 }
+        : await syncMergeConversationLists(selectedLocal, remote.conversations, liveTombstones.conversations, liveTombstones.conversationVersions, liveTombstones.conversationRoots))
       : { conversations: [], added: 0, updated: 0 };
     liveMerged.conversations.push(...untouched);
+    if (indexed) {
+      const localById = new Map(selectedLocal.map(record => [record.id, record]));
+      liveMerged.updated = liveMerged.conversations.filter(record => localById.has(record.id) && conversationContent(record) !== conversationContent(localById.get(record.id))).length;
+    }
     // Stripped remote copies must never wipe local blobs: restore them before persist.
     const localConvById = new Map((snapshot.conversations || []).map(record => [record.id, record]));
     for (const record of liveMerged.conversations) {
       const base = localConvById.get(record.id);
-      if (base) syncRestoreStrippedBlobs(record, base);
+      if (base && !indexed) syncRestoreStrippedBlobs(record, base);
     }
     const temporaryActive = conversations.find(conv => conv.id === snapshot.activeConvId && isTemporaryConversation(conv));
     const nextActiveId = temporaryActive?.id ||
@@ -13523,12 +14122,16 @@ async function syncPullFromGist(options = {}) {
       [SYNC_TOMBSTONES_KEY]: JSON.stringify(liveTombstones),
       assistantSyncLastPullAt: String(Date.now())
     };
+    if (indexed) {
+      settingsValues[SYNC_INDEX_STATE_KEY] = JSON.stringify(await syncIndexPullState(remote, selection, { conversations: liveMerged.conversations, projects: liveProjects, memories: liveMemories }));
+    }
     if (manifest.salt) settingsValues.assistantSyncSalt = manifest.salt;
     const saved = await syncPersistPullData({
       conversations: liveMerged.conversations, memories: liveMemories, projects: liveProjects,
       persistentActiveId: nextPersistentActiveId, settingsValues
     }, snapshot);
     committed = true;
+    if (indexed) await syncIndexPruneCache(cfg.gistId, remote.index);
     if (remoteResponse.etag) localStorage.setItem('assistantSyncLastEtag', remoteResponse.etag);
     projects = saved.projects;
     projectBaseline = new Map(projects.map(project => [project.id, serializeConversation(project)]));
@@ -13564,7 +14167,10 @@ async function syncPullFromGist(options = {}) {
       return false;
     }
     const message = err.name === 'OperationError' ? 'Could not decrypt sync data. Check the passphrase.' : (err.message || 'Unable to pull sync data.');
-    syncSetStatus('unknown', 'Pull failed', message);
+    const incomplete = syncIndexState().pending === 'pull';
+    const retry = document.getElementById('syncRetryBtn');
+    if (retry && incomplete) retry.hidden = false;
+    syncSetStatus('unknown', incomplete ? 'Pull incomplete' : 'Pull failed', message + (incomplete ? ' Retry resumes verified downloads; nothing was applied.' : ''), 'pull');
     showToast('Sync pull failed: ' + message, 'error', 6000);
     return false;
   } finally {
@@ -15444,6 +16050,7 @@ const __windowBridge = {
   syncSetConversationEnabled,
   renderSyncSettings,
   syncPushToGist,
+  syncRetry,
   syncPullFromGist,
   syncGeneratePassphrase,
   syncTogglePassphraseVisibility,
