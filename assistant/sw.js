@@ -1,16 +1,16 @@
 /* Synapse service worker.
  *
- * Bump CACHE_VERSION on every release.
+ * Generated release stamps are kept in sync by build.py.
  */
-const CACHE_VERSION = 'synapse-202609072200';
+const CACHE_VERSION = 'synapse-20261111064433';
 
 const PRECACHE = [
   './',
   './index.html',
-  './styles.css?v=202609072200',
-  './js/main.js?v=202609072200',
-  './js/lib/dom-utils.js',
-  './js/lib/text-utils.js',
+  './styles.css?v=20261111064433',
+  './js/main.js?v=20261111064433',
+  './js/lib/dom-utils.js?v=20261111064433',
+  './js/lib/text-utils.js?v=20261111064433',
   './manifest.json'
 ];
 
@@ -30,7 +30,7 @@ const SPRITE_PATH = new URL('./assets/emotion-sprites/', self.location).pathname
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_VERSION)
-      .then(cache => cache.addAll(PRECACHE))
+      .then(cache => cache.addAll(PRECACHE.map(path => new Request(path, { cache: 'reload' }))))
       .then(() => self.skipWaiting())
   );
 });
@@ -38,13 +38,12 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(k => k.startsWith('synapse-') && k !== CACHE_VERSION).map(k => caches.delete(k))))
+      .then(keys => Promise.all(keys.filter(k => /^synapse-\d+$/.test(k) && k !== CACHE_VERSION).map(k => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
 
 function isAlwaysFresh(url) {
-  if (url.pathname.endsWith('/version.json')) return true;
   if (url.pathname.endsWith('/index.html')) return true;
   return url.pathname.endsWith('/') && url.origin === self.location.origin;
 }
@@ -54,32 +53,49 @@ function isStaticAsset(url) {
     (STATIC_PATHS.has(url.pathname) || url.pathname.startsWith(SPRITE_PATH));
 }
 
+function appFileResponse(response) {
+  // The browser can separately memory-cache imported modules after the worker
+  // returns them. Do not forward a host's immutable/max-age policy for app code.
+  const headers = new Headers(response.headers);
+  headers.set('Cache-Control', 'no-store');
+  // fetch() exposes a decoded body, not the host's compressed wire bytes.
+  headers.delete('Content-Encoding');
+  headers.delete('Content-Length');
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
 async function networkFirst(request) {
+  const cache = await caches.open(CACHE_VERSION);
   try {
-    const response = await fetch(request);
+    // Bypass the HTTP cache too: a network request can otherwise return an old
+    // app file for months when a host sends a long max-age.
+    const response = await fetch(request, { cache: 'no-store' });
+    if (response.status >= 500) {
+      const cached = await cache.match(request, { ignoreSearch: request.mode === 'navigate' });
+      if (cached) return appFileResponse(cached);
+    }
     if (response && response.ok) {
       try {
-        const cache = await caches.open(CACHE_VERSION);
         await cache.put(request, response.clone());
       } catch (e) {
         console.warn('Synapse cache write failed:', e);
       }
     }
-    return response;
+    return appFileResponse(response);
   } catch (e) {
-    const cached = await caches.match(request);
-    if (cached) return cached;
+    const cached = await cache.match(request, { ignoreSearch: request.mode === 'navigate' });
+    if (cached) return appFileResponse(cached);
     throw e;
   }
 }
 
 async function cacheFirst(request) {
-  const cached = await caches.match(request);
+  const cache = await caches.open(CACHE_VERSION);
+  const cached = await cache.match(request);
   if (cached) return cached;
   const response = await fetch(request);
   if (response && response.ok) {
     try {
-      const cache = await caches.open(CACHE_VERSION);
       await cache.put(request, response.clone());
     } catch (e) {
       console.warn('Synapse cache write failed:', e);
@@ -100,7 +116,10 @@ self.addEventListener('fetch', (event) => {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
 
   if (url.origin === self.location.origin) {
-    if (isAlwaysFresh(url) || request.mode === 'navigate') {
+    // Version checks must fail honestly offline, not report cached metadata.
+    if (url.pathname.endsWith('/version.json')) {
+      event.respondWith(fetch(request, { cache: 'no-store' }));
+    } else if (isAlwaysFresh(url) || request.mode === 'navigate' || (isStaticAsset(url) && !url.pathname.startsWith(SPRITE_PATH))) {
       event.respondWith(networkFirst(request));
     } else if (isStaticAsset(url)) {
       event.respondWith(cacheFirst(request));

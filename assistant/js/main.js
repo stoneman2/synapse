@@ -1,5 +1,5 @@
-import { getFocusableElements, trapFocus } from './lib/dom-utils.js';
-import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js';
+import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261111064433';
+import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261111064433';
 // ============================================
 // State
 // ============================================
@@ -105,9 +105,93 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-09-07T22:00:00+08:00',
+  buildDate: '2026-11-11T06:44:33Z',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
+
+function registerAppServiceWorker() {
+  if (!('serviceWorker' in navigator) || !location.protocol.startsWith('http')) return;
+  navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' }).then(registration => {
+    // Hermit and other app wrappers can keep a page alive between visits.
+    // Check the worker again when returning, but never reload an active chat.
+    let lastCheck = Date.now();
+    const check = () => {
+      if (document.hidden || Date.now() - lastCheck < 60000) return;
+      lastCheck = Date.now();
+      registration.update().catch(() => {});
+    };
+    document.addEventListener('visibilitychange', check);
+    window.addEventListener('online', () => { lastCheck = 0; check(); });
+    registration.addEventListener('updatefound', () => {
+      const worker = registration.installing;
+      worker?.addEventListener('statechange', () => {
+        if (worker.state === 'installed' && navigator.serviceWorker.controller) {
+          showToast('App update ready. Refresh when you have finished your current work.', 'info', 12000,
+            { label: 'Refresh app files', onClick: refreshAppFiles });
+        }
+      });
+    });
+  }).catch(() => {});
+}
+
+async function refreshAppFiles() {
+  if (!location.protocol.startsWith('http')) {
+    showToast('This action is for hosted sites. Download a new standalone file to update this copy.', 'info');
+    return false;
+  }
+  if (navigator.onLine === false) {
+    showToast('Connect to the internet before refreshing app files. Offline files have been kept.', 'info');
+    return false;
+  }
+  if (sending || streaming || queueingFollowUp || pendingAttachmentReads || localDataOperationsInFlight || _syncOperationInFlight || summaryJobs.size || voiceRec) {
+    showToast('Wait for generation, attachments, and sync to finish before refreshing app files.', 'info');
+    return false;
+  }
+  flushSettingsAutosaves();
+  if (dirtySettingsTabs.size || conversations.some(conv => conv.messages.some(message => message._editing) || Object.keys(contextDrafts.get(conv) || {}).length)) {
+    showToast('Save or discard your unfinished edits before refreshing app files.', 'info');
+    return false;
+  }
+  const temporaryWarning = conversations.some(isTemporaryConversation) ? '\n\nTemporary chats only exist in this tab and will be lost. Export them first if needed.' : '';
+  if (!window.confirm('Refresh downloaded app files and reload? Saved chats, drafts, settings, API keys, and images will be kept.' + temporaryWarning)) return false;
+  beginLocalDataOperation();
+  const button = document.getElementById('refreshAppFilesBtn');
+  if (button) button.disabled = true;
+  let reloading = false;
+  try {
+    // Verify a real network connection before removing the offline fallback.
+    const versionUrl = new URL('./version.json', location.href);
+    versionUrl.searchParams.set('refresh', Date.now());
+    const response = await fetch(versionUrl, { cache: 'no-store' });
+    if (!response.ok || !(await response.json()).buildDate) throw new Error('Could not reach the hosted app.');
+    const registration = await navigator.serviceWorker?.getRegistration('./');
+    if (registration) await registration.update();
+    if (!readOnlyShare) {
+      persistDraftFromUI();
+      clearTimeout(_saveDebounceTimer);
+      if (!(await flushProjectAutosave())) throw new Error('Could not save project edits.');
+      await saveConversationImmediately();
+    }
+    if ('caches' in window) {
+      const names = await caches.keys();
+      await Promise.all(names.filter(name => /^synapse-\d+$/.test(name)).map(name => caches.delete(name)));
+    }
+    // A unique navigation also bypasses a wrapper's HTTP document cache.
+    const url = new URL(location.href);
+    url.searchParams.set('_synapse_refresh', Date.now());
+    reloading = true;
+    location.replace(url.href);
+    return true;
+  } catch (error) {
+    showToast('App refresh failed: ' + sanitizeErrorDetail(error) + ' Saved data was not cleared.', 'error', 8000);
+    return false;
+  } finally {
+    if (!reloading) {
+      if (button) button.disabled = false;
+      endLocalDataOperation();
+    }
+  }
+}
 
 const SYNC_GIST_API_URL = 'https://api.github.com/gists';
 const SYNC_KDF_ITERATIONS = 120000;
@@ -3785,8 +3869,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Service worker: installability + offline. The protocol guard matters because
   // synapse.html is shipped as a standalone single file and gets opened over file://,
   // where registration throws.
-  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  registerAppServiceWorker();
+  if (new URL(location.href).searchParams.has('_synapse_refresh')) {
+    const url = new URL(location.href);
+    url.searchParams.delete('_synapse_refresh');
+    history.replaceState(history.state, '', url.href);
   }
 
   // Skipped entirely in share view. Opening the DB and leaving `conversations` empty is
@@ -16370,6 +16457,7 @@ const __windowBridge = {
   updateImportStrategyUI,
   applyImport,
   renderStorageSummary,
+  refreshAppFiles,
   clearDataCategory,
   synapseSelfTest,
   closeCommandDropdown,

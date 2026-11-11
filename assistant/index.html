@@ -15,7 +15,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="./styles.css?v=202609072200">
+<link rel="stylesheet" href="./styles.css?v=20261111064433">
 </head>
 <body>
 
@@ -689,6 +689,11 @@
         <button type="button" class="btn btn-secondary" onclick="exportAllConversations()">Export backup</button>
         <button type="button" class="btn btn-secondary" onclick="document.getElementById('importInput').click()">Import data</button>
       </div>
+      <div class="modal-section">App files</div>
+      <div class="settings-note">Stuck on an old version? Refresh only the downloaded website files, then reload. Saved chats, drafts, settings, API keys, and generated images are kept. Requires internet; temporary chats do not survive a reload.</div>
+      <div class="data-actions">
+        <button type="button" class="btn btn-secondary" id="refreshAppFilesBtn" onclick="refreshAppFiles()">Refresh app files</button>
+      </div>
       <div class="modal-section">Local data</div>
       <div class="settings-note">Approximate sizes only. Clearing local data does not revoke public share links.</div>
       <div class="storage-summary" id="storageSummary">Loading storage estimate...</div>
@@ -819,6 +824,6 @@
   </div>
 </div>
 
-<script type="module" src="./js/main.js?v=202609072200"></script>
+<script type="module" src="./js/main.js?v=20261111064433"></script>
 </body>
 </html>

@@ -189,6 +189,16 @@ The Data tab reports approximate storage usage, provides confirmed clear actions
 
 Import and encrypted sync require a working browser database. Local fallback storage supports editing and exporting, but not the same cross-tab protections. Failed imports leave the database unchanged and restore settings still owned by that attempt. A browser or device crash between database and settings writes isn't an all-or-nothing operation across both stores, so keep backups. If another tab reports a storage upgrade, reload it before editing.
 
+## Building and updating the hosted site
+
+Run `python assistant/build.py` from the repository root before publishing. It stamps the HTML, JavaScript imports, service-worker cache, and version metadata together, and rebuilds `synapse.html` with its embedded sprites. Deploy the generated files together; do not update just the standalone file when hosting `index.html`.
+
+Hosted app code is fetched fresh online, bypassing the browser's HTTP cache, with cached files used offline or during server errors. Fonts, rendering libraries, and sprites remain cache-first. Service-worker updates bypass HTTP caching and are checked again when returning to a long-lived app window. Updates never automatically reload a chat or interrupt generation.
+
+For a stuck hosted copy, use **Settings → Data → Refresh app files** while online. It saves the current draft, removes only Synapse's app-file caches, then reloads the same site. It does not clear IndexedDB, localStorage, credentials, or generated images. Save/discard unfinished edits and wait for generation or sync to finish first. Temporary chats are tab-only and will be lost on reload; the confirmation warns about them. If the network check fails, the offline cache is kept.
+
+On the first deployment of this cache fix, an already-open old build may need a reload to install the new worker and another reload to use it. If the wrapper still serves old HTML, open the same address with a fresh query string (for example `?update=cache-fix`) without changing its host or path. This preserves the site's saved data. No site-data wipe is needed. These rules cannot override a stale hosting/CDN deployment; serve `sw.js`, HTML, and `version.json` with revalidation rather than long-lived immutable caching where the host allows it.
+
 ## Checks
 
 With Node, Playwright Core and its matching Chromium already available, run from the repository root:
@@ -199,13 +209,14 @@ node assistant/tests/run.cjs --standalone
 node assistant/tests/run.cjs release
 ```
 
-Set `PLAYWRIGHT_MODULE` to an installed Playwright Core module path if Node can't resolve it. The checks use disposable browser storage and mocked providers, with nonlocal requests blocked. They don't exercise real accounts, microphones or physical touch devices. Rebuild `synapse.html` using the root project notes after changing source files, and update the cache URLs and build date together.
+Set `PLAYWRIGHT_MODULE` to an installed Playwright Core module path if Node can't resolve it. The checks use disposable browser storage and mocked providers, with nonlocal requests blocked. They don't exercise real accounts, microphones or physical touch devices. These suites block service workers; cache/update behavior also needs testing with an actual controlling service worker and a previously cached build. Run `python assistant/build.py` after changing source files.
 
 ## Project Files
 
 ```text
 assistant/
   index.html          App shell and modals
+  build.py            Release stamps and standalone build, including sprites
   styles.css          Styles, themes, and responsive layout
   synapse.html        Standalone build with CSS and JS inlined
   version.json        Build metadata for local update checks
