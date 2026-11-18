@@ -1,5 +1,5 @@
-import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261111073549';
-import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261111073549';
+import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261118110630';
+import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261118110630';
 // ============================================
 // State
 // ============================================
@@ -105,7 +105,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-11-11T07:35:49Z',
+  buildDate: '2026-11-18T11:06:30Z',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -205,6 +205,7 @@ const SYNC_ROUTINE_CHECKPOINT_FILES = 150;
 const SYNC_UPDATE_FILE = /^synapse-update-[A-Za-z0-9_-]+\.json\.enc$/;
 const SYNC_AUTO_PUSH_KEY = 'assistantSyncAutoPush';
 const SYNC_AUTO_PENDING_KEY = 'assistantSyncAutoPushPending';
+const SYNC_AUTO_BLOCKED_KEY = 'assistantSyncAutoPushBlocked';
 const SYNC_TOMBSTONES_KEY = 'assistantSyncTombstones';
 const SYNC_SETTINGS_STATE_KEY = 'assistantSyncSettingsState';
 const SYNC_STATE_GIST_KEY = 'assistantSyncStateGistId';
@@ -9423,12 +9424,22 @@ function renderEditMode(area, msg, idx) {
     if (readOnlyShare || sending || streaming || messages[idx] !== msg) return;
     const editedText = ta.value;
     if (!editedText.trim() && !(Array.isArray(msg.content) && msg.content.some(part => part.type === 'file' || part.type === 'image_url'))) return;
+    const conv = getActiveConv();
+    if (!conv || conv.messages !== messages) return;
+    const laterCount = messages.length - idx - 1;
+    if (laterCount && !confirm('Save and resend this edit? This will permanently remove ' + laterCount +
+        ' later message' + (laterCount === 1 ? '' : 's') + ' from this conversation. To keep them, cancel and use “Fork from here” first.')) return;
+    const previous = {
+      messages: structuredClone(messages), summary: conv.summary,
+      summaryUpdatedAt: conv.summaryUpdatedAt,
+      summaryCoverage: conv.summaryCoverage ? structuredClone(conv.summaryCoverage) : undefined,
+      updatedAt: conv.updatedAt
+    };
+    const messageList = messages;
+    saveBtn.disabled = true;
     delete msg._editing;
-    const source = getActiveConv();
-    const forked = forkBranch(idx);
-    if (!forked) return;
-    contextRevisions.set(source, (contextRevisions.get(source) || 0) + 1);
-    invalidateConversationContext(forked, idx);
+    invalidateConversationContext(conv, idx);
+    messages.splice(idx + 1);
     const editedMessage = messages[idx];
     editedMessage.includeInContext = true;
     delete editedMessage.autoCompacted;
@@ -9444,9 +9455,24 @@ function renderEditMode(area, msg, idx) {
       editedMessage.content = editedText;
     }
     updateMessageTokenMetadata(editedMessage);
-    forked.updatedAt = Date.now();
-    saveConversations();
+    conv.updatedAt = Date.now();
+    try {
+      await saveConversationImmediately();
+    } catch (error) {
+      messageList.splice(0, messageList.length, ...previous.messages);
+      conv.messages = messageList;
+      conv.summary = previous.summary;
+      conv.summaryUpdatedAt = previous.summaryUpdatedAt;
+      if (previous.summaryCoverage === undefined) delete conv.summaryCoverage;
+      else conv.summaryCoverage = previous.summaryCoverage;
+      conv.updatedAt = previous.updatedAt;
+      if (getActiveConv() === conv) renderMessages();
+      showToast('Could not save the edit; the conversation was restored: ' + sanitizeErrorDetail(error), 'error');
+      return;
+    }
+    if (getActiveConv() !== conv || messages !== messageList || sending || streaming) return;
     renderMessages();
+    updateTokenInfo();
     await resendAfterEdit();
   };
 
@@ -10635,6 +10661,17 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
         if (!reader) throw new Error('The provider returned no response body.');
         const decoder = new TextDecoder();
         const inputJson = {};
+        // Metadata is opaque: merge nested fields, but never concatenate signatures
+        // or erase an earlier value with an empty placeholder from a later chunk.
+        const mergeStreamMetadata = (previous, value) => {
+          if (value == null || value === '') return previous ?? value;
+          if (typeof value === 'object' && !Array.isArray(value)) {
+            const merged = previous && typeof previous === 'object' && !Array.isArray(previous) ? { ...previous } : {};
+            for (const [key, field] of Object.entries(value)) merged[key] = mergeStreamMetadata(merged[key], field);
+            return merged;
+          }
+          return value;
+        };
         let buffer = '';
         let eventData = [];
         let complete = false;
@@ -10670,7 +10707,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
             if (choice?.message) readMessage(choice.message);
             else {
               for (const [key, value] of Object.entries(delta)) {
-                if (!['content', 'images', 'tool_calls', 'reasoning_content', 'reasoning', 'reasoning_details'].includes(key)) reply[key] = value;
+                if (!['content', 'images', 'tool_calls', 'reasoning_content', 'reasoning', 'reasoning_details'].includes(key)) reply[key] = mergeStreamMetadata(reply[key], value);
               }
               if (typeof delta.content === 'string') {
                 roundText += delta.content;
@@ -10695,16 +10732,21 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
                 } else details.push({ ...detail });
                 if (detail.type === 'reasoning.text') roundThinking += detail.text || '';
               }
-              for (const call of delta.tool_calls || []) {
+              for (const [position, call] of (delta.tool_calls || []).entries()) {
                 const calls = reply.tool_calls ||= [];
-                const index = call.index ?? 0;
+                // Some OpenAI-compatible streams omit indices. Prefer call IDs;
+                // otherwise use batch position, or the latest call for a lone delta.
+                const knownIndex = call.id ? calls.findIndex(item => item?.id === call.id) : -1;
+                const index = call.index ?? (knownIndex >= 0 ? knownIndex : call.id ? calls.length : delta.tool_calls.length > 1 ? position : Math.max(0, calls.length - 1));
                 if (!toolTextOffsets.has(index)) toolTextOffsets.set(index, roundText.length);
                 const current = calls[index] ||= { id: '', type: 'function', function: { name: '', arguments: '' } };
                 const previous = current.function;
-                Object.assign(current, call);
+                for (const [key, value] of Object.entries(call)) {
+                  if (key !== 'function') current[key] = mergeStreamMetadata(current[key], value);
+                }
                 delete current.index;
                 current.function = {
-                  ...previous, ...call.function,
+                  ...mergeStreamMetadata(previous, call.function),
                   name: previous.name + (call.function?.name || ''),
                   arguments: previous.arguments + (call.function?.arguments || '')
                 };
@@ -11988,7 +12030,7 @@ async function clearDataCategory(category) {
     await saveMemories([]);
   } else if (category === 'credentials') {
     ['llmApiKey', 'llmSearchApiKey', 'llmImageApiKey'].forEach(key => { localStorage.removeItem(key); sessionStorage.removeItem(key); });
-    ['assistantSyncGistToken', 'assistantSyncPassphrase', 'assistantSyncGistId', 'assistantSyncSalt', 'assistantSyncLastHash', 'assistantSyncLastPushAt', 'assistantSyncLastPullAt', SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, SYNC_STATE_GIST_KEY, SYNC_AUTO_PUSH_KEY, SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY, SYNC_INDEX_STATE_KEY].forEach(key => localStorage.removeItem(key));
+    ['assistantSyncGistToken', 'assistantSyncPassphrase', 'assistantSyncGistId', 'assistantSyncSalt', 'assistantSyncLastHash', 'assistantSyncLastPushAt', 'assistantSyncLastPullAt', 'assistantSyncLastEtag', SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, SYNC_STATE_GIST_KEY, SYNC_AUTO_PUSH_KEY, SYNC_AUTO_PENDING_KEY, SYNC_AUTO_BLOCKED_KEY, SYNC_CONV_HASHES_KEY, SYNC_INDEX_STATE_KEY].forEach(key => localStorage.removeItem(key));
     ['setKey', 'setSearchApiKey', 'setImageApiKey', 'setupKey', 'setSyncToken', 'setSyncGistId', 'setSyncPassphrase', 'syncPairingText', 'syncPairingCode'].forEach(id => {
       const input = document.getElementById(id);
       if (input) input.value = '';
@@ -12346,7 +12388,7 @@ function syncGetConfigFromInputs() {
 
 function syncResetScopedState() {
   [SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, 'assistantSyncSalt', 'assistantSyncLastHash',
-    'assistantSyncLastPushAt', 'assistantSyncLastPullAt', 'assistantSyncLastEtag', SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY, SYNC_INDEX_STATE_KEY]
+    'assistantSyncLastPushAt', 'assistantSyncLastPullAt', 'assistantSyncLastEtag', SYNC_AUTO_PENDING_KEY, SYNC_AUTO_BLOCKED_KEY, SYNC_CONV_HASHES_KEY, SYNC_INDEX_STATE_KEY]
     .forEach(key => localStorage.removeItem(key));
 }
 
@@ -12362,6 +12404,7 @@ function syncScheduleAutoPush() {
   try {
     if (readOnlyShare || localStorage.getItem(SYNC_AUTO_PUSH_KEY) !== 'true') return;
     localStorage.setItem(SYNC_AUTO_PENDING_KEY, 'true');
+    if (localStorage.getItem(SYNC_AUTO_BLOCKED_KEY) === 'true') return;
     clearTimeout(_syncAutoPushTimer);
     _syncAutoPushTimer = setTimeout(syncRunAutoPush, SYNC_AUTO_PUSH_DELAY);
   } catch (error) {
@@ -12374,7 +12417,7 @@ async function syncRunAutoPush() {
   clearTimeout(_syncAutoPushTimer);
   _syncAutoPushTimer = null;
   try {
-  if (readOnlyShare || localStorage.getItem(SYNC_AUTO_PUSH_KEY) !== 'true' ||
+  if (readOnlyShare || localStorage.getItem(SYNC_AUTO_PUSH_KEY) !== 'true' || localStorage.getItem(SYNC_AUTO_BLOCKED_KEY) === 'true' ||
       localStorage.getItem(SYNC_AUTO_PENDING_KEY) !== 'true' || navigator.onLine === false) return false;
   if (_syncOperationInFlight) return false;
   // Never snapshot mid-generation: a push would upload a half-streamed reply.
@@ -12431,7 +12474,7 @@ function syncSaveSettings(showSavedToast = true, schedule = true) {
   };
   if ((scoped && scoped !== cfg.gistId) || (!scoped && previousGistId && previousGistId !== cfg.gistId)) {
     [SYNC_TOMBSTONES_KEY, SYNC_SETTINGS_STATE_KEY, 'assistantSyncSalt', 'assistantSyncLastHash',
-      'assistantSyncLastPushAt', 'assistantSyncLastPullAt', 'assistantSyncLastEtag', SYNC_AUTO_PENDING_KEY, SYNC_CONV_HASHES_KEY, SYNC_INDEX_STATE_KEY].forEach(key => { values[key] = null; });
+      'assistantSyncLastPushAt', 'assistantSyncLastPullAt', 'assistantSyncLastEtag', SYNC_AUTO_PENDING_KEY, SYNC_AUTO_BLOCKED_KEY, SYNC_CONV_HASHES_KEY, SYNC_INDEX_STATE_KEY].forEach(key => { values[key] = null; });
   }
   if (!autoPush) values[SYNC_AUTO_PENDING_KEY] = null;
   Object.entries(values).sort((a, b) => Number(a[1] === null) - Number(b[1] === null)).forEach(([key, after]) => {
@@ -12573,6 +12616,8 @@ function renderSyncSettings() {
     syncRenderStatus();
   } else if (!gistId) {
     syncSetStatus('unknown', 'Ready to create', 'Push now will create a private encrypted Gist.');
+  } else if (localStorage.getItem(SYNC_AUTO_BLOCKED_KEY) === 'true') {
+    syncSetStatus('dirty', 'Pull required before auto-push', 'Auto-push is paused until Pull now checks and applies the latest backup.');
   } else if (indexState.pending) {
     syncSetStatus('dirty', indexState.pending === 'pull' ? 'Pull incomplete' : 'Backup incomplete', 'Unfinished work is saved on this device. Retry resumes verified parts. Pull runs only when clicked.', indexState.pending);
   } else if (indexState.cleanup?.length) {
@@ -13358,7 +13403,7 @@ function syncCheckpointCovers(later, earlier) {
 // Last-resort rewrite for archives packing cannot save: one checkpoint update
 // covering the full merged state, then delete only files proven covered, with a
 // re-read loop so a concurrent writer's files are absorbed, never removed.
-async function syncCheckpointArchive(url, cfg, manifest, remote, source) {
+async function syncCheckpointArchive(url, cfg, manifest, remote, source, auto = false, expectedEtag = '') {
   const context = await syncBuildCryptoContext(cfg.passphrase, manifest?.salt || localStorage.getItem('assistantSyncSalt') || null);
   const initialSources = new Set(remote.archive.sourceFiles);
   const checkpoints = [];
@@ -13378,7 +13423,9 @@ async function syncCheckpointArchive(url, cfg, manifest, remote, source) {
     if (current.archive.snapshotHashes.has(unionHash)) {
       // The exact full state is already archived: nothing to upload, so succeed
       // as a no-op instead of stacking duplicate checkpoints.
-      const measured = await fetchGist(url, { cache: 'no-store' }, cfg.token).catch(() => null);
+      const measuredResponse = await fetchGistResponse(url, { cache: 'no-store' }, cfg.token).catch(() => null);
+      if (auto && (!measuredResponse?.etag || measuredResponse.etag !== expectedEtag)) throw syncAutoPushBlockedError();
+      const measured = measuredResponse?.data || null;
       const conversationHashes = {};
       for (const conv of merged.conversations) {
         conversationHashes[conv.id] = await syncSha256Hex(syncStripHeavyBlobs(syncNormalizeConversation(conv)));
@@ -13387,15 +13434,17 @@ async function syncCheckpointArchive(url, cfg, manifest, remote, source) {
       return {
         manifest, filename: '', conversationCount: merged.conversations.length,
         hash: unionHash, conversationHashes, removed: 0,
-        beforeBytes: size, afterBytes: size, alreadyArchived: true
+        beforeBytes: size, afterBytes: size, alreadyArchived: true, etag: measuredResponse?.etag || ''
       };
     }
     const filename = 'synapse-update-checkpoint-' + syncBytesToBase64Url(syncRandomBytes(18)) + '.json.enc';
     const builtFiles = await syncBuildUpdateFiles(payload, context, filename, manifest);
-    await fetchGistResponse(url, {
+    if (auto) await syncRequireUnchangedRemote(cfg, expectedEtag);
+    const publishedResponse = await fetchGistResponse(url, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ files: builtFiles.files })
     }, cfg.token);
+    if (auto && publishedResponse.etag) expectedEtag = publishedResponse.etag;
     const verified = await fetchGist(url, { cache: 'no-store' }, cfg.token);
     const recovered = await syncReadArchiveUpdates(verified, cfg.passphrase);
     const checkpointHash = await syncSha256Hex(payload);
@@ -13409,9 +13458,13 @@ async function syncCheckpointArchive(url, cfg, manifest, remote, source) {
         .filter(name => !isCheckpointFile(name) && name !== 'manifest.json' && !syncIsLegacySyncFile(name) && verified.files?.[name])
         .map(name => [name, null]));
       if (Object.keys(removals).length) {
-        await fetchGistResponse(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: removals }) }, cfg.token);
+        if (auto) await syncRequireUnchangedRemote(cfg, expectedEtag);
+        const removalResponse = await fetchGistResponse(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: removals }) }, cfg.token);
+        if (auto && removalResponse.etag) expectedEtag = removalResponse.etag;
       }
-      const finalGist = await fetchGist(url, { cache: 'no-store' }, cfg.token);
+      const finalResponse = await fetchGistResponse(url, { cache: 'no-store' }, cfg.token);
+      if (auto && (!finalResponse.etag || finalResponse.etag !== expectedEtag)) throw syncAutoPushBlockedError();
+      const finalGist = finalResponse.data;
       const after = await syncReadRemoteData(finalGist, await syncReadManifest(finalGist, cfg.token), cfg.passphrase);
       if (!syncCheckpointCovers(after, before)) throw new Error('The archive rewrite could not be verified. The checkpoint still holds every conversation; retry the push.');
       const conversationHashes = {};
@@ -13421,7 +13474,7 @@ async function syncCheckpointArchive(url, cfg, manifest, remote, source) {
       return {
         manifest: builtFiles.manifest, filename, conversationCount: merged.conversations.length,
         hash: checkpointHash, conversationHashes, removed: Object.keys(removals).length,
-        beforeBytes: syncGistSize(verified.files), afterBytes: syncGistSize(finalGist.files)
+        beforeBytes: syncGistSize(verified.files), afterBytes: syncGistSize(finalGist.files), etag: finalResponse.etag
       };
     }
     current = await syncReadRemoteData(verified, await syncReadManifest(verified, cfg.token), cfg.passphrase);
@@ -13485,6 +13538,24 @@ function syncIndexState() {
     if (state?.gistId === syncGetStoredConfig().gistId) return state;
   } catch (e) {}
   return { gistId: syncGetStoredConfig().gistId, receipts: {}, staged: [], cleanup: [], pending: '' };
+}
+
+function syncAutoPushBlockedError() {
+  const error = new Error('Auto-push paused because the remote backup has changed, or this device has not checked it yet. Use Pull now to merge the latest backup before pushing.');
+  error.autoPushBlocked = true;
+  return error;
+}
+
+function syncRequireCurrentRemote(etag) {
+  const checkedEtag = localStorage.getItem('assistantSyncLastEtag') || '';
+  if (!checkedEtag || !etag || checkedEtag !== etag) throw syncAutoPushBlockedError();
+}
+
+async function syncRequireUnchangedRemote(cfg, etag) {
+  if (!etag) throw syncAutoPushBlockedError();
+  const current = await fetchGistResponse(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+  if (!current.etag || current.etag !== etag) throw syncAutoPushBlockedError();
+  return current;
 }
 
 function syncIndexSaveState(state) {
@@ -13763,9 +13834,12 @@ async function syncIndexPush(cfg, local, selection, auto, existingGist = null, e
   let gist = existingGist;
   let manifest = existingManifest;
   let index;
+  let createdNewGist = false;
+  let baselineCurrent = false;
   try {
     syncSetStatus('checking', 'Backing up…', 'Preparing an indexed backup. Remote changes will not be applied locally.', 'push');
     if (!gist) {
+      createdNewGist = true;
       const context = await syncBuildCryptoContext(cfg.passphrase);
       index = syncIndexEmpty();
       index.revision = window.crypto.randomUUID();
@@ -13785,10 +13859,13 @@ async function syncIndexPush(cfg, local, selection, auto, existingGist = null, e
       gist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
     }
     index = await syncIndexRead(gist, manifest, cfg.passphrase);
+    baselineCurrent = createdNewGist || Boolean(state.remoteRevision && state.remoteRevision === index.revision);
+    if (auto && !baselineCurrent) throw syncAutoPushBlockedError();
     if (state.cleanup?.length) {
       await syncIndexCleanup(gist, index, cfg, state);
       gist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
       index = await syncIndexRead(gist, manifest, cfg.passphrase);
+      if (auto && index.revision !== state.remoteRevision) throw syncAutoPushBlockedError();
     }
     const original = syncCloneJson(index);
     const oldReferences = syncIndexReferences(original);
@@ -13893,17 +13970,23 @@ async function syncIndexPush(cfg, local, selection, auto, existingGist = null, e
       if (new TextEncoder().encode(content).byteLength !== part.bytes || await syncSha256Hex(content) !== part.hash) throw new Error('An uploaded part could not be verified. Retry to resume; the previous index is unchanged.');
     }
     const current = await syncIndexRead(verified, manifest, cfg.passphrase);
-    if (current.revision !== original.revision) throw new Error('Another device published during this push. Retry to merge with it; no local data was changed.');
+    if (current.revision !== original.revision) {
+      if (auto) throw syncAutoPushBlockedError();
+      throw new Error('Another device published during this push. Retry to merge with it; no local data was changed.');
+    }
     const obsolete = [...oldReferences.keys(), ...(state.staged || [])].filter(name => !references.has(name));
     state.cleanup = [...new Set([...(state.cleanup || []), ...obsolete])];
     syncIndexSaveState(state);
+    let confirmedRevision = original.revision;
     if (!unchanged) {
       await syncIndexWrite(url, { files: { [SYNC_INDEX_FILE]: { content: indexContent } } }, cfg.token);
       verified = await fetchGist(url, { cache: 'no-store' }, cfg.token);
       const published = await syncIndexRead(verified, manifest, cfg.passphrase);
       if (serializeConversation(published) !== serializeConversation(index)) throw new Error('The published index could not be confirmed. Retry safely; keep this Gist ID.');
+      confirmedRevision = published.revision;
     }
     state.receipts = receipts;
+    if (baselineCurrent) state.remoteRevision = confirmedRevision;
     state.staged = [];
     state.pushPending = false;
     state.pending = state.pullPending ? 'pull' : '';
@@ -13925,12 +14008,19 @@ async function syncIndexPush(cfg, local, selection, auto, existingGist = null, e
     if (!auto) showToast(cleanupPending ? 'Backup complete; cleanup will be retried.' : 'Sync push complete.', 'success');
     return true;
   } catch (error) {
-    state.pushPending = true;
-    state.pending = 'push';
-    try { syncIndexSaveState(state); } catch (storageError) { console.warn('Could not persist backup retry state:', storageError); }
+    if (error.autoPushBlocked) {
+      try { localStorage.setItem(SYNC_AUTO_BLOCKED_KEY, 'true'); } catch (storageError) { console.warn('Could not pause automatic sync:', storageError); }
+    } else {
+      state.pushPending = true;
+      state.pending = 'push';
+      try { syncIndexSaveState(state); } catch (storageError) { console.warn('Could not persist backup retry state:', storageError); }
+    }
     const retry = document.getElementById('syncRetryBtn');
-    if (retry) retry.hidden = false;
-    syncSetStatus('dirty', 'Backup incomplete', (error.name === 'OperationError' ? 'Could not decrypt the indexed backup. Check the passphrase.' : error.message) + (cfg.gistId ? ' Gist ID: ' + cfg.gistId + '.' : '') + ' Push now retries unfinished work; no remote data was applied locally.', 'push');
+    if (retry) retry.hidden = !!error.autoPushBlocked && !state.pending;
+    syncSetStatus('dirty', error.autoPushBlocked ? 'Pull required before auto-push' : 'Backup incomplete',
+      (error.name === 'OperationError' ? 'Could not decrypt the indexed backup. Check the passphrase.' : error.message) +
+      (cfg.gistId ? ' Gist ID: ' + cfg.gistId + '.' : '') +
+      (error.autoPushBlocked ? ' No data was pushed.' : ' Push now retries unfinished work; no remote data was applied locally.'), 'push');
     if (!auto) showToast('Backup incomplete: ' + error.message, 'error', 6000);
     return false;
   }
@@ -13959,6 +14049,7 @@ function syncIndexMergeLists(localList, remoteList, tombstones, conversations = 
 
 async function syncIndexPullState(remote, selection, merged) {
   const state = syncIndexState();
+  state.remoteRevision = remote.index?.revision || state.remoteRevision || '';
   state.receipts = { ...(state.receipts || {}) };
   for (const category of ['conversations', 'projects', 'memories']) {
     if (!selection[category]) continue;
@@ -13989,6 +14080,7 @@ function syncRetry() {
 async function syncPushToGist(options = {}) {
   const auto = options.auto === true;
   if (readOnlyShare) return false;
+  if (auto && localStorage.getItem(SYNC_AUTO_BLOCKED_KEY) === 'true') return false;
   if (localDataOperationsInFlight > 0) {
     if (!auto) showToast('Wait for local data changes to finish.', 'info');
     return false;
@@ -14007,6 +14099,8 @@ async function syncPushToGist(options = {}) {
   let cfg;
   let succeeded = false;
   let uploaded = false;
+  let pairedEtag = '';
+  let legacyBaselineCurrent = false;
   try {
     if (!db) throw new Error('Encrypted sync needs a working browser database. Export a local backup and reload before syncing.');
     flushSettingsAutosaves();
@@ -14031,8 +14125,15 @@ async function syncPushToGist(options = {}) {
     let pairedGist = null;
     let pairedManifest = null;
     if (cfg.gistId) {
-      pairedGist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+      const pairedResponse = await fetchGistResponse(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+      pairedGist = pairedResponse.data;
+      pairedEtag = pairedResponse.etag;
       pairedManifest = await syncReadManifest(pairedGist, cfg.token);
+      if (pairedManifest.schema !== SYNC_INDEX_SCHEMA) {
+        const pulledEtag = localStorage.getItem('assistantSyncLastEtag') || '';
+        legacyBaselineCurrent = Boolean(pulledEtag && pairedEtag && pulledEtag === pairedEtag);
+        if (auto && !legacyBaselineCurrent) throw syncAutoPushBlockedError();
+      }
     }
     if (!cfg.gistId || pairedManifest?.schema === SYNC_INDEX_SCHEMA) {
       const run = async () => {
@@ -14041,7 +14142,9 @@ async function syncPushToGist(options = {}) {
         const currentConfig = syncGetStoredConfig();
         if (currentConfig.gistId !== cfg.gistId || currentConfig.passphrase !== cfg.passphrase) throw new Error('Sync pairing changed in another tab. Retry using the current pairing; nothing was uploaded.');
         if (cfg.gistId) {
-          pairedGist = await fetchGist(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+          const pairedResponse = await fetchGistResponse(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+          pairedGist = pairedResponse.data;
+          pairedEtag = pairedResponse.etag;
           pairedManifest = await syncReadManifest(pairedGist, cfg.token);
           if (pairedManifest.schema !== SYNC_INDEX_SCHEMA) throw new Error('The remote backup format changed. Nothing was uploaded.');
         }
@@ -14102,6 +14205,7 @@ async function syncPushToGist(options = {}) {
       const gist = pairedGist;
       const existingManifest = pairedManifest;
       const remote = await syncReadRemoteData(gist, existingManifest, cfg.passphrase);
+      if (auto) syncRequireCurrentRemote(pairedEtag);
       built = await syncBuildGistFiles(cfg.passphrase, existingManifest, local);
       unchanged = remote.archive.snapshotHashes.has(built.hash);
       const additions = unchanged ? {} : built.files;
@@ -14109,7 +14213,8 @@ async function syncPushToGist(options = {}) {
       const obsolete = new Set();
       const expectedHashes = new Map();
       const runCheckpoint = async () => {
-        const checkpoint = await syncCheckpointArchive(url, cfg, existingManifest, remote, { ...local, conversations: allLocalConversations });
+        const checkpoint = await syncCheckpointArchive(url, cfg, existingManifest, remote, { ...local, conversations: allLocalConversations }, auto, pairedEtag);
+        pairedEtag = checkpoint.etag || pairedEtag;
         built = { ...built, manifest: checkpoint.manifest, filename: checkpoint.filename, conversationCount: checkpoint.conversationCount, hash: checkpoint.hash };
         Object.assign(nextConvHashes, checkpoint.conversationHashes);
         uploaded = !checkpoint.alreadyArchived;
@@ -14151,7 +14256,8 @@ async function syncPushToGist(options = {}) {
         obsolete.forEach(name => delete resulting[name]);
         if (syncGistSize(resulting) > SYNC_ARCHIVE_MAX_BYTES || Object.keys(resulting).length >= 250 ||
             syncGistSize(staged) > 2 * SYNC_ARCHIVE_MAX_BYTES || Object.keys(staged).length >= 300) {
-          const checkpoint = await syncCheckpointArchive(url, cfg, existingManifest, remote, { ...local, conversations: allLocalConversations });
+          const checkpoint = await syncCheckpointArchive(url, cfg, existingManifest, remote, { ...local, conversations: allLocalConversations }, auto, pairedEtag);
+          pairedEtag = checkpoint.etag || pairedEtag;
           if (checkpoint.afterBytes > SYNC_ARCHIVE_MAX_BYTES && !checkpoint.removed) {
             throw new Error('The sync archive is still too large after consolidation. Export a backup before reducing stored data; the existing Gist was not changed.');
           }
@@ -14167,10 +14273,12 @@ async function syncPushToGist(options = {}) {
         }
         // Checkpoint path already uploaded and cleaned up; only stage real update files.
         if (Object.keys(built.files).length) {
-        await fetchGistResponse(url, {
+        if (auto) await syncRequireUnchangedRemote(cfg, pairedEtag);
+        const publishResponse = await fetchGistResponse(url, {
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ files: built.files })
         }, cfg.token);
+        if (auto && publishResponse.etag) pairedEtag = publishResponse.etag;
         uploaded = true;
         const verified = await fetchGist(url, { cache: 'no-store' }, cfg.token);
         // Verify the recoverable source union, even if a concurrent consolidation already absorbed ours.
@@ -14184,12 +14292,20 @@ async function syncPushToGist(options = {}) {
           const removals = Object.fromEntries([...obsolete].filter(name => verified.files?.[name]).map(name => [name, null]));
           if (Object.keys(removals).length) {
             try {
-              await fetchGistResponse(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: removals }) }, cfg.token);
+              if (auto) await syncRequireUnchangedRemote(cfg, pairedEtag);
+              const removalResponse = await fetchGistResponse(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: removals }) }, cfg.token);
+              if (auto && removalResponse.etag) pairedEtag = removalResponse.etag;
             } catch (error) { cleanupPending = true; console.warn('Sync saved; old update cleanup will be retried:', error); }
           }
         }
         }
       }
+    }
+
+    if (auto && cfg.gistId && legacyBaselineCurrent) {
+      const finalResponse = await fetchGistResponse(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store' }, cfg.token);
+      if (!pairedEtag || !finalResponse.etag || finalResponse.etag !== pairedEtag) throw syncAutoPushBlockedError();
+      localStorage.setItem('assistantSyncLastEtag', finalResponse.etag);
     }
 
     localStorage.setItem('assistantSyncSalt', built.manifest.salt);
@@ -14226,9 +14342,13 @@ async function syncPushToGist(options = {}) {
     return true;
   } catch (err) {
     console.error('Sync push failed:', err);
+    if (auto && err.autoPushBlocked) {
+      try { localStorage.setItem(SYNC_AUTO_BLOCKED_KEY, 'true'); } catch (storageError) { console.warn('Could not pause automatic sync:', storageError); }
+    }
     const message = err.name === 'OperationError' ? 'Could not decrypt the existing sync Gist. Check the passphrase.' :
       (uploaded ? 'An update was uploaded to Gist ' + cfg.gistId + ', but confirmation or local storage failed. Keep that Gist ID. ' : '') + (err.message || 'Unable to push sync data.');
-    syncSetStatus('unknown', 'Backup failed', message, 'push');
+    syncSetStatus(err.autoPushBlocked ? 'dirty' : 'unknown', err.autoPushBlocked ? 'Pull required before auto-push' : 'Backup failed',
+      message + (err.autoPushBlocked ? (uploaded ? ' Pull before retrying; an update may already be present.' : ' No data was pushed.') : ''), 'push');
     if (!auto) showToast('Sync push failed: ' + message, 'error', 6000);
     return false;
   } finally {
@@ -14468,9 +14588,11 @@ async function syncPullFromGist(options = {}) {
     syncSetStatus('checking', 'Pulling…', 'Fetching and decrypting sync files.');
     const headers = {};
     const lastEtag = localStorage.getItem('assistantSyncLastEtag') || '';
-    if (!options.force && lastEtag) headers['If-None-Match'] = lastEtag;
+    const indexedBaselineUnknown = !syncIndexState().remoteRevision;
+    if (!options.force && !indexedBaselineUnknown && localStorage.getItem(SYNC_AUTO_BLOCKED_KEY) !== 'true' && lastEtag) headers['If-None-Match'] = lastEtag;
     const remoteResponse = await fetchGistResponse(SYNC_GIST_API_URL + '/' + encodeURIComponent(cfg.gistId), { cache: 'no-store', headers }, cfg.token);
     if (remoteResponse.notModified) {
+      localStorage.removeItem(SYNC_AUTO_BLOCKED_KEY);
       syncSetStatus('current', 'No remote updates', 'The Gist has not changed since the last applied pull.', 'pull');
       return true;
     }
@@ -14586,6 +14708,7 @@ async function syncPullFromGist(options = {}) {
     committed = true;
     if (indexed) await syncIndexPruneCache(cfg.gistId, remote.index);
     if (remoteResponse.etag) localStorage.setItem('assistantSyncLastEtag', remoteResponse.etag);
+    localStorage.removeItem(SYNC_AUTO_BLOCKED_KEY);
     projects = saved.projects;
     projectBaseline = new Map(projects.map(project => [project.id, serializeConversation(project)]));
     armedFollowUpConversationIds.clear();

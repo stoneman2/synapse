@@ -15,7 +15,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
-<link rel="stylesheet" href="./styles.css?v=20261111073549">
+<link rel="stylesheet" href="./styles.css?v=20261118110630">
 </head>
 <body>
 
@@ -651,7 +651,7 @@
       <label class="toggle-row">
         <input type="checkbox" id="setSyncAutoPush" onchange="syncToggleAutoPush(this)">
         Automatically push local changes
-        <span class="toggle-hint">Encrypted, debounced push; needs an existing Gist</span>
+        <span class="toggle-hint">Pauses until Pull now if the remote changed or has not been pulled</span>
       </label>
       <div class="sync-actions">
         <button class="btn btn-primary" id="syncPushBtn" type="button" onclick="syncPushToGist()">Push now</button>
@@ -824,6 +824,6 @@
   </div>
 </div>
 
-<script type="module" src="./js/main.js?v=20261111073549"></script>
+<script type="module" src="./js/main.js?v=20261118110630"></script>
 </body>
 </html>
