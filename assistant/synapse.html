@@ -715,13 +715,18 @@ svg.icon {
 
 /* Message actions */
 .msg-actions {
-  display: none;
+  display: flex;
+  align-items: center;
   gap: 4px;
   margin-top: 4px;
+  min-height: 28px;
+  opacity: .78;
 }
-.msg-wrapper:hover .msg-actions { display: flex; }
+.msg-actions:hover, .msg-actions:focus-within { opacity: 1; }
 .msg-action-btn {
-  padding: 3px 8px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 3px 6px;
   font-size: 0.75em;
   font-family: inherit;
   background: var(--hover);
@@ -731,6 +736,7 @@ svg.icon {
   cursor: pointer;
   transition: all 0.2s;
 }
+.msg-action-icon { display: inline-grid; place-items: center; line-height: 1; font-size: 1em; }
 .msg-action-btn:hover { background: var(--overlay-10); color: var(--text-primary); }
 
 .msg-meta {
@@ -1210,7 +1216,6 @@ svg.icon {
 .modal-section:first-of-type { margin-top: 0; }
 
 @media (hover: none) {
-  .msg-wrapper .msg-actions { display: flex; }
   .code-block-wrapper .code-copy-btn { opacity: 1; }
   .code-block-wrapper .code-download-btn { opacity: 1; }
   .code-block-wrapper .code-preview-btn { opacity: 1; }
@@ -2114,7 +2119,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .command-item.active, .command-item:hover { background: var(--hover); }
 .msg-wrapper { outline: none; }
 .msg-wrapper:focus-visible { box-shadow: 0 0 0 2px var(--accent); border-radius: 10px; }
-.msg-wrapper:focus-visible .msg-actions, .msg-wrapper:focus-within .msg-actions { display: flex; }
 .msg-wrapper.excluded .msg-bubble { opacity: .62; }
 .msg-wrapper.excluded::before { content: 'Excluded from context'; align-self: flex-end; margin-bottom: 2px; color: var(--text-secondary); font-size: .68em; }
 .msg-actions { flex-wrap: wrap; }
@@ -3396,7 +3400,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-11-20T08:27:29Z',
+  buildDate: '2026-11-20T08:37:54Z',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -12499,14 +12503,22 @@ function renderMessages({ preserveScroll = false } = {}) {
     actions.setAttribute('aria-label', (msg.role === 'assistant' ? 'Assistant' : 'User') + ' message actions');
 
     const copyBtn = document.createElement('button');
-    copyBtn.className = 'msg-action-btn';
-    copyBtn.textContent = 'Copy';
+    copyBtn.className = 'msg-action-btn msg-action-icon';
+    copyBtn.textContent = '\u2398';
     copyBtn.setAttribute('aria-label', 'Copy message');
+    copyBtn.title = 'Copy message';
     copyBtn.onclick = async () => {
       try {
         await navigator.clipboard.writeText(getMsgText(msg));
-        copyBtn.textContent = 'Copied';
-        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+        copyBtn.textContent = '\u2713';
+        copyBtn.setAttribute('aria-label', 'Message copied');
+        copyBtn.title = 'Message copied';
+        setTimeout(() => {
+          if (!copyBtn.isConnected) return;
+          copyBtn.textContent = '\u2398';
+          copyBtn.setAttribute('aria-label', 'Copy message');
+          copyBtn.title = 'Copy message';
+        }, 1500);
       } catch (error) {
         showToast('Could not copy this message.', 'error');
       }
@@ -12517,14 +12529,18 @@ function renderMessages({ preserveScroll = false } = {}) {
     const isComparison = msg.role === 'assistant' && msg.comparison === true;
     if (!isComparison && request && ['failed', 'interrupted', 'stopped'].includes(request.status)) {
       const retryBtn = document.createElement('button');
-      retryBtn.className = 'msg-action-btn retry-btn';
-      retryBtn.textContent = 'Retry';
+      retryBtn.className = 'msg-action-btn msg-action-icon retry-btn';
+      retryBtn.textContent = '\u21BB';
+      retryBtn.setAttribute('aria-label', 'Retry request');
+      retryBtn.title = 'Retry request';
       retryBtn.onclick = () => retryRequest(idx);
       actions.appendChild(retryBtn);
     } else if (!isComparison && msg.role === 'assistant' && idx === messages.length - 1) {
       const regenerateBtn = document.createElement('button');
-      regenerateBtn.className = 'msg-action-btn';
-      regenerateBtn.textContent = 'Regenerate';
+      regenerateBtn.className = 'msg-action-btn msg-action-icon';
+      regenerateBtn.textContent = '\u21BB';
+      regenerateBtn.setAttribute('aria-label', 'Regenerate response');
+      regenerateBtn.title = 'Regenerate response';
       regenerateBtn.onclick = () => regenerate();
       actions.appendChild(regenerateBtn);
     }
@@ -12599,8 +12615,10 @@ function renderMessages({ preserveScroll = false } = {}) {
       }
     });
     const moreBtn = document.createElement('button');
-    moreBtn.className = 'msg-action-btn';
-    moreBtn.textContent = 'More';
+    moreBtn.className = 'msg-action-btn msg-action-icon';
+    moreBtn.textContent = '\u22EF';
+    moreBtn.setAttribute('aria-label', 'More message actions');
+    moreBtn.title = 'More message actions';
     moreBtn.setAttribute('aria-haspopup', 'menu');
     moreBtn.setAttribute('aria-expanded', 'false');
     moreBtn.onclick = () => openActionMenu(moreBtn, secondaryActions, 'Message actions');

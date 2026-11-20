@@ -698,13 +698,18 @@ svg.icon {
 
 /* Message actions */
 .msg-actions {
-  display: none;
+  display: flex;
+  align-items: center;
   gap: 4px;
   margin-top: 4px;
+  min-height: 28px;
+  opacity: .78;
 }
-.msg-wrapper:hover .msg-actions { display: flex; }
+.msg-actions:hover, .msg-actions:focus-within { opacity: 1; }
 .msg-action-btn {
-  padding: 3px 8px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 3px 6px;
   font-size: 0.75em;
   font-family: inherit;
   background: var(--hover);
@@ -714,6 +719,7 @@ svg.icon {
   cursor: pointer;
   transition: all 0.2s;
 }
+.msg-action-icon { display: inline-grid; place-items: center; line-height: 1; font-size: 1em; }
 .msg-action-btn:hover { background: var(--overlay-10); color: var(--text-primary); }
 
 .msg-meta {
@@ -1193,7 +1199,6 @@ svg.icon {
 .modal-section:first-of-type { margin-top: 0; }
 
 @media (hover: none) {
-  .msg-wrapper .msg-actions { display: flex; }
   .code-block-wrapper .code-copy-btn { opacity: 1; }
   .code-block-wrapper .code-download-btn { opacity: 1; }
   .code-block-wrapper .code-preview-btn { opacity: 1; }
@@ -2097,7 +2102,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .command-item.active, .command-item:hover { background: var(--hover); }
 .msg-wrapper { outline: none; }
 .msg-wrapper:focus-visible { box-shadow: 0 0 0 2px var(--accent); border-radius: 10px; }
-.msg-wrapper:focus-visible .msg-actions, .msg-wrapper:focus-within .msg-actions { display: flex; }
 .msg-wrapper.excluded .msg-bubble { opacity: .62; }
 .msg-wrapper.excluded::before { content: 'Excluded from context'; align-self: flex-end; margin-bottom: 2px; color: var(--text-secondary); font-size: .68em; }
 .msg-actions { flex-wrap: wrap; }

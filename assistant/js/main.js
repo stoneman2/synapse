@@ -1,5 +1,5 @@
-import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261120082729';
-import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261120082729';
+import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261120083754';
+import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261120083754';
 // ============================================
 // State
 // ============================================
@@ -105,7 +105,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-11-20T08:27:29Z',
+  buildDate: '2026-11-20T08:37:54Z',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -9208,14 +9208,22 @@ function renderMessages({ preserveScroll = false } = {}) {
     actions.setAttribute('aria-label', (msg.role === 'assistant' ? 'Assistant' : 'User') + ' message actions');
 
     const copyBtn = document.createElement('button');
-    copyBtn.className = 'msg-action-btn';
-    copyBtn.textContent = 'Copy';
+    copyBtn.className = 'msg-action-btn msg-action-icon';
+    copyBtn.textContent = '\u2398';
     copyBtn.setAttribute('aria-label', 'Copy message');
+    copyBtn.title = 'Copy message';
     copyBtn.onclick = async () => {
       try {
         await navigator.clipboard.writeText(getMsgText(msg));
-        copyBtn.textContent = 'Copied';
-        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+        copyBtn.textContent = '\u2713';
+        copyBtn.setAttribute('aria-label', 'Message copied');
+        copyBtn.title = 'Message copied';
+        setTimeout(() => {
+          if (!copyBtn.isConnected) return;
+          copyBtn.textContent = '\u2398';
+          copyBtn.setAttribute('aria-label', 'Copy message');
+          copyBtn.title = 'Copy message';
+        }, 1500);
       } catch (error) {
         showToast('Could not copy this message.', 'error');
       }
@@ -9226,14 +9234,18 @@ function renderMessages({ preserveScroll = false } = {}) {
     const isComparison = msg.role === 'assistant' && msg.comparison === true;
     if (!isComparison && request && ['failed', 'interrupted', 'stopped'].includes(request.status)) {
       const retryBtn = document.createElement('button');
-      retryBtn.className = 'msg-action-btn retry-btn';
-      retryBtn.textContent = 'Retry';
+      retryBtn.className = 'msg-action-btn msg-action-icon retry-btn';
+      retryBtn.textContent = '\u21BB';
+      retryBtn.setAttribute('aria-label', 'Retry request');
+      retryBtn.title = 'Retry request';
       retryBtn.onclick = () => retryRequest(idx);
       actions.appendChild(retryBtn);
     } else if (!isComparison && msg.role === 'assistant' && idx === messages.length - 1) {
       const regenerateBtn = document.createElement('button');
-      regenerateBtn.className = 'msg-action-btn';
-      regenerateBtn.textContent = 'Regenerate';
+      regenerateBtn.className = 'msg-action-btn msg-action-icon';
+      regenerateBtn.textContent = '\u21BB';
+      regenerateBtn.setAttribute('aria-label', 'Regenerate response');
+      regenerateBtn.title = 'Regenerate response';
       regenerateBtn.onclick = () => regenerate();
       actions.appendChild(regenerateBtn);
     }
@@ -9308,8 +9320,10 @@ function renderMessages({ preserveScroll = false } = {}) {
       }
     });
     const moreBtn = document.createElement('button');
-    moreBtn.className = 'msg-action-btn';
-    moreBtn.textContent = 'More';
+    moreBtn.className = 'msg-action-btn msg-action-icon';
+    moreBtn.textContent = '\u22EF';
+    moreBtn.setAttribute('aria-label', 'More message actions');
+    moreBtn.title = 'More message actions';
     moreBtn.setAttribute('aria-haspopup', 'menu');
     moreBtn.setAttribute('aria-expanded', 'false');
     moreBtn.onclick = () => openActionMenu(moreBtn, secondaryActions, 'Message actions');
