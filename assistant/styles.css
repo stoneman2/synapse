@@ -1085,6 +1085,19 @@ svg.icon {
   font-size: 0.72em;
   font-weight: 600;
 }
+
+/* Live request state stays inside the assistant response instead of becoming a
+   separate chat message. Completed responses hide it; active and failed ones
+   keep the current phase visible. */
+.response-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 8px; color: var(--text-secondary); font-size: .78em; }
+.response-status-label { display: inline-flex; align-items: center; gap: 5px; }
+.response-status-label::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
+.response-status.attention { color: var(--danger-color, #d66); }
+.response-status.attention .response-status-label::before { background: currentColor; box-shadow: none; }
+.response-status-error { flex-basis: 100%; color: var(--danger-color, #d66); white-space: pre-wrap; overflow-wrap: anywhere; }
+.request-activity { flex-basis: 100%; }
+.request-activity summary { cursor: pointer; color: var(--text-secondary); }
+.request-activity ul { margin: 4px 0 0; padding-left: 18px; }
 .sync-indicator[hidden] { display: none; }
 .sync-indicator-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--text-secondary); }
 .sync-indicator.current .sync-indicator-dot { background: var(--success-color); }

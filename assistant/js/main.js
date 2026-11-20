@@ -1,5 +1,5 @@
-import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261118110630';
-import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261118110630';
+import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261120081158';
+import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261120081158';
 // ============================================
 // State
 // ============================================
@@ -105,7 +105,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-11-18T11:06:30Z',
+  buildDate: '2026-11-20T08:11:58Z',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -9186,12 +9186,13 @@ function renderMessages({ preserveScroll = false } = {}) {
         bubble.textContent = msg.content;
       }
     } else if (msg.role === 'assistant') {
+      const responseRequest = getSwipeRequest(msg);
       const thinkData = msg.swipeThinking && msg.swipeThinking[msg.swipeIndex];
       const toolData = msg.swipeToolUse && msg.swipeToolUse[msg.swipeIndex];
       const imgData = msg.swipeImages && msg.swipeImages[msg.swipeIndex];
       const _h = stripThinkTags(msg.content);
       const _hThink = _h.thinking ? (thinkData || '') + _h.thinking : (thinkData || '');
-      setBubbleHTML(bubble, _hThink, renderToolBlocksHTML(toolData || []) + renderAssistantContent(_h.content, messageAttachments(msg), imgData || msg.images || []));
+      setBubbleHTML(bubble, _hThink, renderToolBlocksHTML(toolData || []) + renderAssistantContent(_h.content, messageAttachments(msg), imgData || msg.images || []), renderRequestStatusHTML(responseRequest));
       postRenderProcessing(bubble);
     } else {
       bubble.textContent = msg.content;
@@ -9608,13 +9609,13 @@ function renderThinkingHTML(text) {
 // <details> resets its scroll box and cancels any touch drag in progress, so on
 // a phone the reasoning could not be scrolled at all. Update it in place and
 // only follow the tail while it is already scrolled to the bottom.
-function setBubbleHTML(bubbleEl, thinkingText, restHTML) {
-  const block = bubbleEl.firstElementChild;
+function setBubbleHTML(bubbleEl, thinkingText, restHTML, statusHTML = '') {
+  const block = bubbleEl.querySelector(':scope > .thinking-block');
   const content = thinkingText && block && block.classList.contains('thinking-block')
     ? block.querySelector('.thinking-content')
     : null;
   if (!content) {
-    bubbleEl.innerHTML = renderThinkingHTML(thinkingText) + restHTML;
+    bubbleEl.innerHTML = statusHTML + renderThinkingHTML(thinkingText) + restHTML;
     return;
   }
   if (content.textContent !== thinkingText) {
@@ -9624,6 +9625,11 @@ function setBubbleHTML(bubbleEl, thinkingText, restHTML) {
   }
   while (block.nextSibling) block.nextSibling.remove();
   block.insertAdjacentHTML('afterend', restHTML);
+  const currentStatus = bubbleEl.querySelector(':scope > .response-status');
+  if (statusHTML) {
+    if (currentStatus) currentStatus.outerHTML = statusHTML;
+    else bubbleEl.insertAdjacentHTML('afterbegin', statusHTML);
+  } else currentStatus?.remove();
 }
 
 function stripThinkTags(text) {
@@ -10313,6 +10319,8 @@ function createRequestMetadata(assistantMsg, swipeIdx, metadata = {}) {
   const request = {
     requestId: 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
     status: 'pending',
+    phase: 'preparing',
+    events: [{ type: 'preparing', at: Date.now() }],
     startedAt: Date.now(),
     completedAt: null,
     durationMs: null,
@@ -10344,6 +10352,66 @@ function createRequestMetadata(assistantMsg, swipeIdx, metadata = {}) {
   return request;
 }
 
+const REQUEST_PHASE_LABELS = {
+  preparing: 'Getting ready',
+  context_prepared: 'Preparing request',
+  contacting: 'Contacting model',
+  waiting: 'Waiting for response',
+  generating: 'Generating',
+  tool_running: 'Working with a tool',
+  finishing: 'Finishing response',
+  complete: 'Complete',
+  stopped: 'Generation stopped',
+  failed: 'Response failed'
+};
+
+const REQUEST_EVENT_LABELS = {
+  preparing: 'Message accepted',
+  context_prepared: 'Context prepared',
+  contacting: 'Request sent',
+  waiting: 'Waiting for first response',
+  generating: 'Response started',
+  tool_running: 'Tool started',
+  tool_finished: 'Tool finished',
+  finishing: 'Response received',
+  complete: 'Response saved',
+  stopped: 'Generation stopped',
+  failed: 'Request failed'
+};
+
+function updateRequestPhase(request, phase, details = {}) {
+  if (!request || !phase) return;
+  const now = Date.now();
+  request.phase = phase;
+  request.events ||= [];
+  const last = request.events[request.events.length - 1];
+  if (!last || last.type !== phase || Object.keys(details).length) {
+    request.events.push({ type: phase, at: now, ...details });
+    request.events = request.events.slice(-20);
+  }
+  request.updatedAt = now;
+}
+
+function requestPhaseLabel(request) {
+  return REQUEST_PHASE_LABELS[request?.phase] || (request?.status === 'complete' ? 'Complete' : 'Working');
+}
+
+function requestElapsed(request) {
+  if (!request?.startedAt) return '';
+  const end = request.completedAt || Date.now();
+  return ' · ' + (Math.max(0, end - request.startedAt) / 1000).toFixed(1) + 's';
+}
+
+function renderRequestStatusHTML(request) {
+  if (!request || request.phase === 'complete' && !request.error) return '';
+  const label = escapeHTML(requestPhaseLabel(request));
+  const elapsed = escapeHTML(requestElapsed(request));
+  const failed = request.phase === 'failed' || request.status === 'failed' || request.status === 'stopped';
+  const events = (request.events || []).map(event => '<li>' + escapeHTML(REQUEST_EVENT_LABELS[event.type] || event.type) + '</li>').join('');
+  const details = events ? '<details class="request-activity"><summary>Request activity</summary><ul>' + events + '</ul></details>' : '';
+  return '<div class="response-status ' + (failed ? 'attention' : '') + '" role="status" aria-live="polite"><span class="response-status-label">' + label + elapsed + '</span>' + details + (request.error ? '<span class="response-status-error">' + escapeHTML(request.error) + '</span>' : '') + '</div>';
+}
+
 function finishRequestMetadata(request, status, error = '', httpStatus = null) {
   if (!request) return;
   request.status = status;
@@ -10351,6 +10419,7 @@ function finishRequestMetadata(request, status, error = '', httpStatus = null) {
   request.durationMs = request.startedAt ? Math.max(0, request.completedAt - request.startedAt) : null;
   request.httpStatus = httpStatus != null && Number.isFinite(Number(httpStatus)) ? Number(httpStatus) : request.httpStatus || null;
   request.error = sanitizeErrorDetail(error, [requestTargets.get(request)?.apiKey]);
+  updateRequestPhase(request, status === 'complete' ? 'complete' : status === 'stopped' ? 'stopped' : 'failed');
 }
 
 async function authorizeExternalTool(toolName, args, conv, authorization) {
@@ -10472,6 +10541,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
   abortController = controller;
   streaming = true;
   request.status = 'streaming';
+  updateRequestPhase(request, 'context_prepared');
   announce('Generating response.');
   userScrolledAway = false;
   const btn = document.getElementById('sendBtn');
@@ -10482,6 +10552,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
   let fullText = prefixText || '';
   let thinkingText = prefixText ? assistantMsg.swipeThinking?.[swipeIdx] || '' : '';
   let lastRender = 0;
+  let hasResponseActivity = false;
   const toolBlocks = prefixText ? structuredClone(assistantMsg.swipeToolUse?.[swipeIdx] || []) : [];
   const responseImages = prefixText ? (assistantMsg.swipeImages?.[swipeIdx] || []).slice() : [];
   const responseAttachments = prefixText ? structuredClone(messageAttachments(assistantMsg, swipeIdx)) : [];
@@ -10504,16 +10575,30 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     const openTools = Array.from(bubbleEl.querySelectorAll('details.tool-use-block')).map(block => block.open);
     const stripped = stripThinkTags(fullText);
     _suppressScrollFlag = true;
-    setBubbleHTML(bubbleEl, thinkingText + stripped.thinking, renderToolBlocksHTML(toolBlocks) + renderAssistantContent(stripped.content, responseAttachments, responseImages));
+    setBubbleHTML(bubbleEl, thinkingText + stripped.thinking, renderToolBlocksHTML(toolBlocks) + renderAssistantContent(stripped.content, responseAttachments, responseImages), renderRequestStatusHTML(request));
     bubbleEl.querySelectorAll('details.tool-use-block').forEach((block, index) => { block.open = openTools[index] === true; });
     area.scrollTop = savedScroll === null ? area.scrollHeight : savedScroll;
     _suppressScrollFlag = false;
     lastRender = Date.now();
   };
 
+  const refreshStatus = () => {
+    if (getActiveConv() !== requestConv || messages !== messageList || assistantMsg.swipeIndex !== swipeIdx) return;
+    const current = document.querySelector('.msg-wrapper[data-msg-idx="' + messageList.indexOf(assistantMsg) + '"] .response-status');
+    if (!current) return;
+    const html = renderRequestStatusHTML(request);
+    if (html) current.outerHTML = html;
+    else current.remove();
+  };
+
+  renderProgress(true);
+  const statusTimer = setInterval(refreshStatus, 1000);
+
   try {
     if (target.keyRequired && !apiKey) throw new Error('Enter an API key for ' + target.host + '.');
     await saveConversationImmediately();
+    updateRequestPhase(request, 'contacting');
+    renderProgress(true);
     assertRequestOwner(requestConv, messageList, assistantMsg, controller.signal);
     let url, headers, body;
     const useStream = target.stream !== false;
@@ -10616,6 +10701,9 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     // Each transport uses the same history, tool budget and completion rules.
     for (let toolRound = 0; toolRound <= 20; toolRound++) {
       let resp = await fetchResponse();
+      updateRequestPhase(request, 'waiting');
+      renderProgress(true);
+      updateRequestPhase(request, 'waiting');
       if (!resp.ok && resp.status === 400 && body.tool_choice) {
         delete body.tool_choice;
         resp = await fetchResponse();
@@ -10640,6 +10728,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       };
       const readMessage = message => {
         if (!message || typeof message !== 'object') throw new Error('The provider returned no assistant message.');
+        updateRequestPhase(request, 'generating');
         reply = { ...message, role: 'assistant' };
         const extracted = extractImages(reply);
         roundText = extracted.text;
@@ -10653,7 +10742,11 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       };
       if ((resp.headers.get('content-type') || '').includes('application/json')) {
         const data = await resp.json();
-        if (data.error || data.type === 'error') throw new Error(data.error?.message || 'The provider returned an error.');
+           if (data.error || data.type === 'error') throw new Error(data.error?.message || 'The provider returned an error.');
+           if (!hasResponseActivity) {
+             hasResponseActivity = true;
+             updateRequestPhase(request, 'generating');
+           }
         stopReason = data.stop_reason || data.choices?.[0]?.finish_reason;
         readMessage(format === 'anthropic' ? { role: 'assistant', content: data.content } : data.choices?.[0]?.message);
       } else {
@@ -10680,6 +10773,10 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
           if (payload === '[DONE]') { complete = true; return; }
           const data = JSON.parse(payload);
           if (data.error || data.type === 'error') throw new Error(data.error?.message || 'The provider returned an error.');
+          if (!hasResponseActivity) {
+            hasResponseActivity = true;
+            updateRequestPhase(request, 'generating');
+          }
           if (format === 'anthropic') {
             const index = data.index ?? 0;
             if (data.type === 'content_block_start') {
@@ -10817,6 +10914,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       const nativeContinuation = format === 'anthropic' && stopReason === 'pause_turn' && toolPolicy.webSearch;
       if (!enabledCalls.length && !nativeContinuation) {
         if (!stripThinkTags(roundText).content.trim() && !hasRoundImages && !responseAttachments.length) throw new Error('The provider returned no final answer.');
+        updateRequestPhase(request, 'finishing');
         finishRequestMetadata(request, 'complete', '', responseStatus);
         break;
       }
@@ -10871,6 +10969,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
           ? { type: 'url_fetch', url: args.url || '', content: '', searching: true }
           : { query: extractWebSearchQueryFromArgs(args), results: [], searching: true };
         toolBlocks.push(tool);
+        updateRequestPhase(request, 'tool_running', { tool: call.name });
         renderProgress(true);
         const result = await executeAuthorizedTool(call.name, args, requestConv, controller.signal, authorization);
         assertRequestOwner(requestConv, messageList, assistantMsg, controller.signal);
@@ -10882,6 +10981,7 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
           ? { type: 'tool_result', tool_use_id: call.id, content, ...(result.error ? { is_error: true } : {}) }
           : { role: 'tool', tool_call_id: call.id, content });
         renderProgress(true);
+        updateRequestPhase(request, 'generating');
       }
       // Replay the full assistant blocks, including signed thinking, in every exchange.
       body.messages = [...body.messages, reply];
@@ -10906,6 +11006,8 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
       announce('Request failed. Retry is available.');
     }
   } finally {
+    clearInterval(statusTimer);
+    if (request.status === 'streaming' && request.phase !== 'failed' && request.phase !== 'stopped') updateRequestPhase(request, 'finishing');
     const stripped = stripThinkTags(fullText);
     thinkingText += stripped.thinking;
     fullText = stripped.content;
