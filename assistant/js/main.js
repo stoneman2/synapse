@@ -1,5 +1,5 @@
-import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261120081158';
-import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261120081158';
+import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261120082729';
+import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261120082729';
 // ============================================
 // State
 // ============================================
@@ -105,7 +105,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-11-20T08:11:58Z',
+  buildDate: '2026-11-20T08:27:29Z',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -10558,8 +10558,12 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
   const responseAttachments = prefixText ? structuredClone(messageAttachments(assistantMsg, swipeIdx)) : [];
   let imageGenerationFailed = responseAttachments.some(item => ['failed', 'denied', 'stopped'].includes(item.status));
   let responseStatus = null;
+  let renderQueued = false;
+  let renderTimer = null;
+  let renderFrame = null;
+  const responseRenderInterval = 50;
 
-  const renderProgress = (force = false) => {
+  const paintProgress = () => {
     assistantMsg.swipes[swipeIdx] = fullText;
     (assistantMsg.swipeThinking ||= [])[swipeIdx] = thinkingText;
     (assistantMsg.swipeToolUse ||= [])[swipeIdx] = toolBlocks;
@@ -10567,7 +10571,6 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     (assistantMsg.swipeAttachments ||= [])[swipeIdx] = responseAttachments;
     if (assistantMsg.swipeIndex === swipeIdx) selectAssistantSwipe(assistantMsg, swipeIdx);
     if (getActiveConv() !== requestConv || messages !== messageList || assistantMsg.swipeIndex !== swipeIdx) return;
-    if (!force && Date.now() - lastRender < 80) return;
     bubbleEl = document.querySelector('.msg-wrapper[data-msg-idx="' + messageList.indexOf(assistantMsg) + '"] .msg-bubble') || (bubbleEl?.isConnected ? bubbleEl : null);
     if (!bubbleEl) return;
     const area = document.getElementById('messagesArea');
@@ -10580,6 +10583,36 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     area.scrollTop = savedScroll === null ? area.scrollHeight : savedScroll;
     _suppressScrollFlag = false;
     lastRender = Date.now();
+  };
+
+  const renderProgress = (force = false) => {
+    assistantMsg.swipes[swipeIdx] = fullText;
+    (assistantMsg.swipeThinking ||= [])[swipeIdx] = thinkingText;
+    (assistantMsg.swipeToolUse ||= [])[swipeIdx] = toolBlocks;
+    (assistantMsg.swipeImages ||= [])[swipeIdx] = responseImages;
+    (assistantMsg.swipeAttachments ||= [])[swipeIdx] = responseAttachments;
+    if (assistantMsg.swipeIndex === swipeIdx) selectAssistantSwipe(assistantMsg, swipeIdx);
+    if (getActiveConv() !== requestConv || messages !== messageList || assistantMsg.swipeIndex !== swipeIdx) return;
+    if (force) {
+      if (renderTimer) clearTimeout(renderTimer);
+      if (renderFrame) cancelAnimationFrame(renderFrame);
+      renderTimer = null;
+      renderFrame = null;
+      renderQueued = false;
+      paintProgress();
+      return;
+    }
+    if (renderQueued) return;
+    renderQueued = true;
+    const wait = Math.max(0, responseRenderInterval - (Date.now() - lastRender));
+    renderTimer = setTimeout(() => {
+      renderTimer = null;
+      renderFrame = requestAnimationFrame(() => {
+        renderFrame = null;
+        renderQueued = false;
+        paintProgress();
+      });
+    }, wait);
   };
 
   const refreshStatus = () => {
@@ -11007,6 +11040,11 @@ async function streamResponse(apiMessages, assistantMsg, swipeIdx, bubbleEl, ove
     }
   } finally {
     clearInterval(statusTimer);
+    if (renderTimer) clearTimeout(renderTimer);
+    if (renderFrame) cancelAnimationFrame(renderFrame);
+    renderTimer = null;
+    renderFrame = null;
+    renderQueued = false;
     if (request.status === 'streaming' && request.phase !== 'failed' && request.phase !== 'stopped') updateRequestPhase(request, 'finishing');
     const stripped = stripThinkTags(fullText);
     thinkingText += stripped.thinking;
