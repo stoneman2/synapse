@@ -1,5 +1,5 @@
-import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261120083754';
-import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261120083754';
+import { getFocusableElements, trapFocus } from './lib/dom-utils.js?v=20261120091204';
+import { escapeHTML, getContrastText, isLightColor } from './lib/text-utils.js?v=20261120091204';
 // ============================================
 // State
 // ============================================
@@ -105,7 +105,7 @@ function replacePersistentConversations(next, preserveTemporary = true) {
 
 const APP_VERSION = {
   name: 'Synapse',
-  buildDate: '2026-11-20T08:37:54Z',
+  buildDate: '2026-11-20T09:12:04Z',
   updateUrl: 'https://platberlitz.github.io/assistant/version.json'
 };
 
@@ -1040,6 +1040,7 @@ function saveConversationImmediately() {
 function scrollMessagesToBottom() {
   const area = document.getElementById('messagesArea');
   if (!area) return;
+  userScrolledAway = false;
   area.scrollTo({ top: area.scrollHeight, behavior: getScrollBehavior() });
 }
 
@@ -4230,7 +4231,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Anchor above the composer, which changes height as the textarea grows.
     if (inputArea) scrollFab.style.bottom = (inputArea.offsetHeight + 12) + 'px';
     scrollFab.classList.toggle('visible', distanceFromBottom >= 100);
-    if (streaming && !_suppressScrollFlag) {
+    if (!_suppressScrollFlag) {
       userScrolledAway = distanceFromBottom > 4;
     }
   });
@@ -9109,7 +9110,7 @@ function renderMessages({ preserveScroll = false } = {}) {
   renderFollowUpQueue();
   const area = document.getElementById('messagesArea');
   const wasAtBottom = area.scrollHeight - area.scrollTop - area.clientHeight <= 4;
-  const savedScrollTop = preserveScroll && !wasAtBottom ? area.scrollTop : null;
+  const savedScrollTop = (!wasAtBottom && (preserveScroll || userScrolledAway)) ? area.scrollTop : null;
   area.innerHTML = '';
   if (isTemporaryConversation(getActiveConv())) {
     const notice = document.createElement('div');

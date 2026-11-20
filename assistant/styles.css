@@ -580,6 +580,7 @@ svg.icon {
 .messages-area {
   flex: 1;
   overflow-y: auto;
+  overflow-anchor: none;
   padding: 20px;
   display: flex;
   flex-direction: column;
